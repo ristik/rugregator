@@ -6,9 +6,9 @@
 use num_bigint::BigUint;
 use num_traits::Zero;
 
-use super::path::{bit_at, calculate_common_path, path_to_decimal, rsh, SmtPath};
-use super::tree::{calc_branch_hash, calc_node_hash, SmtError, SparseMerkleTree};
-use super::types::{Branch, NodeBranch};
+use crate::path::{bit_at, calculate_common_path, path_to_decimal, rsh, SmtPath};
+use crate::tree::{calc_branch_hash, calc_node_hash, SmtError, SparseMerkleTree};
+use crate::types::{Branch, NodeBranch};
 
 // ─── Proof types ─────────────────────────────────────────────────────────────
 
@@ -248,9 +248,9 @@ pub fn merkle_path_from_cbor(data: &[u8]) -> Result<MerkleTreePath, anyhow::Erro
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::smt::path::state_id_to_smt_path;
-    use crate::smt::tree::SparseMerkleTree;
+    use crate::*;
+    use crate::path::state_id_to_smt_path;
+    use crate::tree::SparseMerkleTree;
 
     fn id(byte: u8) -> SmtPath {
         let mut arr = [0u8; 32];

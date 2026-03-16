@@ -2650,6 +2650,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsmt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "hex",
+ "num-bigint",
+ "num-traits",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rtnetlink"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3390,6 +3403,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "rand 0.8.5",
+ "rsmt",
  "secp256k1",
  "serde",
  "serde_bytes",

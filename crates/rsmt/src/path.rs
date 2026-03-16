@@ -119,7 +119,8 @@ pub fn rsh(n: &SmtPath, shift: usize) -> SmtPath {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
+    use num_traits::{One, Zero};
 
     #[test]
     fn state_id_all_zeros_gives_272_bit_path() {

@@ -1,7 +1,7 @@
 //! SMT branch types: `LeafBranch`, `NodeBranch`, and the `Branch` enum.
 
 use num_bigint::BigUint;
-use super::path::SmtPath;
+use crate::path::SmtPath;
 
 // ─── Branch enum ─────────────────────────────────────────────────────────────
 
@@ -38,15 +38,22 @@ pub struct LeafBranch {
     pub is_child: bool,
     /// Cached raw SHA-256 digest (32 bytes).  None = not yet computed.
     pub hash_cache: Option<[u8; 32]>,
+    /// Full original key (before path compression).  Used for consistency proofs.
+    pub original_path: SmtPath,
 }
 
 impl LeafBranch {
     pub fn new(path: SmtPath, value: Vec<u8>) -> Self {
-        Self { path, value, is_child: false, hash_cache: None }
+        Self { original_path: path.clone(), path, value, is_child: false, hash_cache: None }
+    }
+
+    pub fn new_keyed(path: SmtPath, value: Vec<u8>, original_path: SmtPath) -> Self {
+        Self { path, value, original_path, is_child: false, hash_cache: None }
     }
 
     pub fn new_child(path: SmtPath, value: Option<Vec<u8>>) -> Self {
         Self {
+            original_path: path.clone(),
             path,
             value: value.unwrap_or_default(),
             is_child: true,
@@ -82,8 +89,8 @@ impl NodeBranch {
 
 // ─── Helpers for building boxed branches ─────────────────────────────────────
 
-pub fn leaf(path: SmtPath, value: Vec<u8>) -> Box<Branch> {
-    Box::new(Branch::Leaf(LeafBranch::new(path, value)))
+pub fn leaf(path: SmtPath, value: Vec<u8>, original_path: SmtPath) -> Box<Branch> {
+    Box::new(Branch::Leaf(LeafBranch::new_keyed(path, value, original_path)))
 }
 
 pub fn node(path: SmtPath, left: Option<Box<Branch>>, right: Option<Box<Branch>>) -> Box<Branch> {

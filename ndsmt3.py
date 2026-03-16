@@ -1,6 +1,6 @@
 # Radix Sparse Merkle Tree (RSMT) with Consistency Proofs
 #
-# This module implements an add-only, path compressed Patricia / radix
+# This experiment implements an add-only, path compressed Patricia / radix
 # Merkle trie for highly sparse, like 256-bit keys, supporting efficint
 # batch insertions and cryptographically secure consistency proofs
 
@@ -58,6 +58,24 @@
 # The consistency proof is valid iff:
 #   (1) Eval algorithm fully consumes both π and B without leftovers,
 #   (2) The computed root tuple (r_0, r_1) exactly equals (ρ_0, ρ_1).
+
+# Compatibility with the aggregator-go repository would need an extra opcode because
+# it calls hash_node() even if there is single child node.
+# So either: 1) Modify Go's NodeBranch.calculateHash
+#   // current: always SHA256(array(3), path, left_or_null, right_or_null)
+#   // proposed: if only one child, return that child's hash directly, like this:
+#   if leftHash == nil && rightHash != nil {
+#       copy(n.rawHash[:], rightHash)
+#       n.hashSet = true
+#       return n.rawHash[:]
+#   }
+#   if rightHash == nil && leftHash != nil {
+#       copy(n.rawHash[:], leftHash)
+#       n.hashSet = true
+#       return n.rawHash[:]
+#   }
+# or 2) have an extra opcode, let's call it 'Nx': just like 'N' but evaluated
+#   without the pass-through rule
 
 import hashlib
 import sys
@@ -238,7 +256,6 @@ class SparseMerkleTree:
             return False
         bit  = start_bit + n
         direction = (key >> bit) & 1
-        bit += 1
         if direction:
             found = self._collect_proof(node.right, key, bit, steps)
             sib   = node.left.get_hash()  if node.left  else None
@@ -266,7 +283,6 @@ class SparseMerkleTree:
                 return None
             bit += n
             direction = (key >> bit) & 1
-            bit += 1
             node = node.right if direction else node.left
         return None
 
@@ -326,12 +342,12 @@ class SparseMerkleTree:
         rb = [(k, v) for k, v in batch if      (k >> split) & 1 ]
 
         proof_out.extend(['N', cp])
-        ln = self._build_batch_proof(lb, split + 1, proof_out, border_old_paths)
-        rn = self._build_batch_proof(rb, split + 1, proof_out, border_old_paths)
+        ln = self._build_batch_proof(lb, split, proof_out, border_old_paths)
+        rn = self._build_batch_proof(rb, split, proof_out, border_old_paths)
         return NodeBranch(cp, ln, rn)
 
     # ------------------------------------------------------------------
-    # Internal: insert batch into existing subtree, returning proof
+    # Internal: insert batch into existing subtree, returning consistency proof
     # ------------------------------------------------------------------
 
     def _insert_proof(self, node, batch, start_bit, proof_out):
@@ -381,8 +397,8 @@ class SparseMerkleTree:
         batch_right = [(k, v) for k, v in batch if      (k >> split) & 1 ]
 
         proof_out.extend(['N', node.path])
-        new_left  = self._insert_proof(node.left,  batch_left,  split + 1, proof_out)
-        new_right = self._insert_proof(node.right, batch_right, split + 1, proof_out)
+        new_left  = self._insert_proof(node.left,  batch_left,  split, proof_out)
+        new_right = self._insert_proof(node.right, batch_right, split, proof_out)
 
         node.left  = new_left
         node.right = new_right
@@ -404,7 +420,7 @@ class SparseMerkleTree:
         lh = node.left.get_hash() if node.left else None
         rh = node.right.get_hash() if node.right else None
 
-        new_path = node.path >> (n_common + 1)
+        new_path = node.path >> n_common
         if new_path == 0:
             new_path = 1
         node.path  = new_path
@@ -416,12 +432,12 @@ class SparseMerkleTree:
         proof_out.extend(['N', new_cp])
         if old_dir == 0:
             proof_out.extend(['BNS', old_path, new_path, lh, rh])
-            new_left =  self._insert_proof(node,  batch_left,  new_split + 1, proof_out)
-            new_right = self._insert_proof(None,  batch_right, new_split + 1, proof_out)
+            new_left =  self._insert_proof(node,  batch_left,  new_split, proof_out)
+            new_right = self._insert_proof(None,  batch_right, new_split, proof_out)
         else:
-            new_left =  self._insert_proof(None,  batch_left,  new_split + 1, proof_out)
+            new_left =  self._insert_proof(None,  batch_left,  new_split, proof_out)
             proof_out.extend(['BNS', old_path, new_path, lh, rh])
-            new_right = self._insert_proof(node,  batch_right, new_split + 1, proof_out)
+            new_right = self._insert_proof(node,  batch_right, new_split, proof_out)
 
         return NodeBranch(new_cp, new_left, new_right)
 
@@ -447,8 +463,8 @@ def synchronized_proof_eval(proof_iterator, depth, batch_dict, start_bit=0):
         cp = next(proof_iterator)
         n_common = cp.bit_length() - 1
         split = start_bit + n_common
-        lh0, lh1 = synchronized_proof_eval(proof_iterator, depth, batch_dict, split + 1)
-        rh0, rh1 = synchronized_proof_eval(proof_iterator, depth, batch_dict, split + 1)
+        lh0, lh1 = synchronized_proof_eval(proof_iterator, depth, batch_dict, split)
+        rh0, rh1 = synchronized_proof_eval(proof_iterator, depth, batch_dict, split)
 
         # Mode 0 pass-through
         if lh0 is None and rh0 is None: h0 = None
@@ -472,7 +488,7 @@ def synchronized_proof_eval(proof_iterator, depth, batch_dict, start_bit=0):
         h1 = hash_leaf(new_path, v)
         return h0, h1
 
-    if tag == 'BL':
+    if tag == 'BL':   # pre-existing Border Leaf
         old_path = next(proof_iterator)
         k = next(proof_iterator)
         v = next(proof_iterator)
@@ -501,7 +517,7 @@ def synchronized_proof_eval(proof_iterator, depth, batch_dict, start_bit=0):
 
         return hash_node(old_path, lh, rh), inner1
 
-    raise ValueError(f"Unknown tag encountered in flat proof stream: {tag}")
+    raise ValueError(f"Unknown tag encountered in proof stream: {tag}")
 
 
 # ---------------------------------------------------------------------------
@@ -565,8 +581,8 @@ def verify_proof(key, value, steps, root, depth):
 
     for node_path, sibling_hash in steps[1:]:
         n           = path_len(node_path)
-        routing_bit = (key >> (consumed - 1)) & 1
-        consumed   -= n + 1
+        routing_bit = (key >> consumed) & 1
+        consumed   -= n
         if routing_bit == 0:
             lh, rh = current_hash, sibling_hash
         else:

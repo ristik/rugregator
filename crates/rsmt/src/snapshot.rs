@@ -4,8 +4,8 @@
 //! The snapshot is an independent deep copy of the tree.  On success it
 //! replaces the main tree; on failure it is dropped.
 
-use super::tree::SparseMerkleTree;
-use super::path::SmtPath;
+use crate::tree::SparseMerkleTree;
+use crate::path::SmtPath;
 
 /// A speculative working copy of the SMT.
 pub struct SmtSnapshot {

@@ -10,7 +10,7 @@
 //! Algorithm ID 0 = SHA-256 (matching `api.SHA256 = 0` in Go).
 
 use sha2::{Digest, Sha256};
-use super::path::{SmtPath, path_as_bytes};
+use crate::path::{SmtPath, path_as_bytes};
 
 /// SHA-256 algorithm ID as stored in an imprint (0x0000).
 pub const ALGO_SHA256: u16 = 0;
@@ -124,7 +124,7 @@ pub fn hash_root(left: Option<&[u8; 32]>, right: Option<&[u8; 32]>) -> [u8; 32] 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
 
     #[test]
     fn cbor_array_headers() {

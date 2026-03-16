@@ -6,9 +6,9 @@
 use num_bigint::BigUint;
 use thiserror::Error;
 
-use super::hash::{build_imprint, hash_leaf, hash_node};
-use super::path::{bit_at, calculate_common_path, path_len, root_path, rsh, SmtPath};
-use super::types::{leaf, node, Branch, LeafBranch, NodeBranch};
+use crate::hash::{build_imprint, hash_leaf, hash_node};
+use crate::path::{bit_at, calculate_common_path, path_len, root_path, rsh, SmtPath};
+use crate::types::{leaf, node, Branch, LeafBranch, NodeBranch};
 
 /// Key length in bits for standalone (monolithic) mode.
 /// StateID is 32 bytes padded to 34 bytes + 1 sentinel byte → 272 data bits.
@@ -121,16 +121,16 @@ impl SparseMerkleTree {
         if is_right {
             let right = self.root.right.take();
             self.root.right = Some(if let Some(existing) = right {
-                build_tree(existing, shifted, value, self.parent_mode)?
+                build_tree(existing, shifted, value, path.clone(), self.parent_mode)?
             } else {
-                leaf(shifted, value)
+                leaf(shifted, value, path.clone())
             });
         } else {
             let left = self.root.left.take();
             self.root.left = Some(if let Some(existing) = left {
-                build_tree(existing, shifted, value, self.parent_mode)?
+                build_tree(existing, shifted, value, path.clone(), self.parent_mode)?
             } else {
-                leaf(shifted, value)
+                leaf(shifted, value, path.clone())
             });
         }
         Ok(())
@@ -173,6 +173,7 @@ fn build_tree(
     branch: Box<Branch>,
     remaining_path: SmtPath,
     value: Vec<u8>,
+    original_path: SmtPath,
     parent_mode: bool,
 ) -> Result<Box<Branch>, SmtError> {
     // ── Leaf collision ────────────────────────────────────────────────────────
@@ -180,7 +181,7 @@ fn build_tree(
         if l.path == remaining_path {
             if l.is_child {
                 // Parent-mode: overwrite child hash.
-                return Ok(leaf(l.path.clone(), value));
+                return Ok(leaf(l.path.clone(), value, original_path));
             } else {
                 // Add-only: leaf already exists at this path; skip regardless of value.
                 return Err(SmtError::DuplicateLeaf);
@@ -207,8 +208,8 @@ fn build_tree(
         }
         let old_path = rsh(&l.path, shift);
         let new_path = rsh(&remaining_path, shift);
-        let old_branch = leaf(old_path, l.value.clone());
-        let new_branch = leaf(new_path, value);
+        let old_branch = leaf(old_path, l.value.clone(), l.original_path.clone());
+        let new_branch = leaf(new_path, value, original_path);
         return Ok(if is_right {
             node(common_path, Some(old_branch), Some(new_branch))
         } else {
@@ -220,7 +221,7 @@ fn build_tree(
     if let Branch::Node(ref n) = *branch {
         if common_path.bits() < n.path.bits() {
             let new_leaf_path = rsh(&remaining_path, shift);
-            let new_leaf_branch = leaf(new_leaf_path, value);
+            let new_leaf_branch = leaf(new_leaf_path, value, original_path.clone());
             let old_node_path = rsh(&n.path, shift);
             let old_node = Box::new(Branch::Node(NodeBranch::new(
                 old_node_path,
@@ -243,16 +244,16 @@ fn build_tree(
             if is_right {
                 let right = n.right.take();
                 n.right = Some(if let Some(child) = right {
-                    build_tree(child, deeper, value, parent_mode)?
+                    build_tree(child, deeper, value, original_path, parent_mode)?
                 } else {
-                    leaf(deeper, value)
+                    leaf(deeper, value, original_path)
                 });
             } else {
                 let left = n.left.take();
                 n.left = Some(if let Some(child) = left {
-                    build_tree(child, deeper, value, parent_mode)?
+                    build_tree(child, deeper, value, original_path, parent_mode)?
                 } else {
-                    leaf(deeper, value)
+                    leaf(deeper, value, original_path)
                 });
             }
             Ok(Box::new(Branch::Node(n)))
@@ -375,8 +376,8 @@ fn find_leaf_in_branch_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::smt::path::state_id_to_smt_path;
+    use crate::*;
+    use crate::path::state_id_to_smt_path;
 
     fn make_path(byte: u8) -> SmtPath {
         let mut id = [0u8; 32];

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/aggregator",
+    "crates/rsmt",
 ]
 resolver = "2"
 
@@ -35,3 +36,4 @@ unsigned-varint = { version = "0.8", features = ["futures", "asynchronous-codec"
 serde_bytes  = "0.11"
 serde_tuple  = "0.5"
 rand         = "0.8"
+rsmt         = { path = "crates/rsmt" }
