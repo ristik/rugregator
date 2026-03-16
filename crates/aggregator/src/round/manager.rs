@@ -105,6 +105,17 @@ impl RoundManager {
         }
     }
 
+    pub fn new_with_smt(
+        config: RoundConfig,
+        request_rx: mpsc::Receiver<ValidatedRequest>,
+        state: Arc<AggregatorState>,
+        bft: Arc<dyn BftCommitter>,
+        mut smt: SparseMerkleTree,
+    ) -> Self {
+        let current_root = smt.root_hash_imprint();
+        Self { config, request_rx, pending: Vec::new(), smt, current_root, state, bft }
+    }
+
     /// Run the round manager event loop.  This task owns the SMT.
     pub async fn run(mut self) {
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
@@ -237,16 +248,12 @@ impl RoundManager {
             });
         }
 
-        // Store finalized records and block info.
-        self.state.finalize_records(finalized_records);
-        self.state.finalize_block(BlockInfo {
+        // Store finalized records and block info (persist if store configured).
+        self.state.finalize_round(BlockInfo {
             block_number,
             root_hash: new_root,
             uc_cbor,
-        });
-
-        // Advance block number.
-        self.state.increment_block_number().await;
+        }, finalized_records).await;
 
         info!(
             block = block_number,

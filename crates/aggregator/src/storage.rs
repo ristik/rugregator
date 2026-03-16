@@ -14,6 +14,26 @@ use tracing::debug;
 use crate::validation::ValidatedRequest;
 use crate::api::cbor::CertDataFields;
 
+// ─── Store trait ──────────────────────────────────────────────────────────────
+
+/// Persistence backend for finalized rounds.
+pub trait Store: Send + Sync {
+    fn persist_round(
+        &self,
+        block: &BlockInfo,
+        records: &[FinalizedRecord],
+        next_block_number: u64,
+    ) -> anyhow::Result<()>;
+}
+
+// ─── RecoveredState ───────────────────────────────────────────────────────────
+
+pub struct RecoveredState {
+    pub block_number: u64,
+    pub records: Vec<(String, RecordInfo)>,  // (state_id_hex, RecordInfo)
+    pub blocks: Vec<BlockInfo>,
+}
+
 // ─── Record info ─────────────────────────────────────────────────────────────
 
 /// Data stored for each finalized StateID.
@@ -59,15 +79,18 @@ pub struct AggregatorState {
     blocks: DashMap<u64, BlockInfo>,
     /// Channel to submit validated requests to the round manager.
     request_tx: mpsc::Sender<ValidatedRequest>,
+    /// Optional persistence backend.
+    store: Option<Arc<dyn Store>>,
 }
 
 impl AggregatorState {
-    pub fn new(request_tx: mpsc::Sender<ValidatedRequest>) -> Arc<Self> {
+    pub fn new(request_tx: mpsc::Sender<ValidatedRequest>, store: Option<Arc<dyn Store>>) -> Arc<Self> {
         Arc::new(Self {
             block_number: RwLock::new(1),
             records: DashMap::new(),
             blocks: DashMap::new(),
             request_tx,
+            store,
         })
     }
 
@@ -86,6 +109,18 @@ impl AggregatorState {
     /// Set the block number (used during initialization / recovery).
     pub async fn set_block_number(&self, n: u64) {
         *self.block_number.write().await = n;
+    }
+
+    // ── Recovery ──────────────────────────────────────────────────────────────
+
+    pub async fn apply_recovered(&self, state: RecoveredState) {
+        for (sid, record) in state.records {
+            self.records.insert(sid, record);
+        }
+        for block in state.blocks {
+            self.blocks.insert(block.block_number, block);
+        }
+        *self.block_number.write().await = state.block_number;
     }
 
     // ── Request submission ────────────────────────────────────────────────────
@@ -115,6 +150,21 @@ impl AggregatorState {
     pub fn finalize_block(&self, info: BlockInfo) {
         debug!(block = info.block_number, "finalizing block");
         self.blocks.insert(info.block_number, info);
+    }
+
+    /// Persist (if configured) and update in-memory state for a finalized round.
+    /// Called from RoundManager after snapshot commit and proof generation.
+    pub async fn finalize_round(&self, block: BlockInfo, records: Vec<FinalizedRecord>) {
+        if let Some(store) = &self.store {
+            let next = block.block_number + 1;
+            if let Err(e) = store.persist_round(&block, &records, next) {
+                tracing::error!(block = block.block_number, err = %e, "RocksDB persist_round failed");
+            }
+        }
+        self.finalize_records(records);
+        self.finalize_block(block);
+        let mut n = self.block_number.write().await;
+        *n += 1;
     }
 
     // ── Lookups ───────────────────────────────────────────────────────────────

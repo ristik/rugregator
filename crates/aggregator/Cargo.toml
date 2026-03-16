@@ -67,12 +67,15 @@ serde_bytes.workspace = true
 serde_tuple.workspace = true
 rand.workspace = true
 
+# RocksDB persistence (optional, enabled by feature flag)
+rocksdb = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default            = []
 consistency-proofs = []
-rocksdb-storage    = []
+rocksdb-storage    = ["dep:rocksdb"]
 parallel           = []
 blake3-hash        = []

@@ -48,6 +48,10 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_SIG_KEY", default_value = "")]
     pub sig_key_hex: String,
 
+    /// Path to RocksDB data directory.  Empty string = in-memory only.
+    #[arg(long, env = "AGGREGATOR_DB_PATH", default_value = "")]
+    pub db_path: String,
+
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,

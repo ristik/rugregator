@@ -24,7 +24,6 @@ async fn main() -> anyhow::Result<()> {
     info!(listen = %cfg.listen, round_ms = cfg.round_duration_ms, batch = cfg.batch_limit, mode = %cfg.bft_mode);
 
     let (req_tx, req_rx) = mpsc::channel(10_000);
-    let state = AggregatorState::new(req_tx);
 
     let bft: Arc<dyn BftCommitter> = match cfg.bft_mode.as_str() {
         "stub" | "test" => {
@@ -58,7 +57,50 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let round_cfg = RoundConfig::from(&cfg);
-    let round_manager = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
+
+    #[cfg(feature = "rocksdb-storage")]
+    let (state, round_manager) = if !cfg.db_path.is_empty() {
+        use uni_aggregator::storage_rocksdb::RocksDbStore;
+        use uni_aggregator::smt::{SparseMerkleTree, state_id_to_smt_path};
+        use uni_aggregator::validation::state_id::compute_cert_data_hash_imprint;
+
+        info!(path = %cfg.db_path, "opening RocksDB");
+        let store = Arc::new(RocksDbStore::open(&cfg.db_path)?);
+        let recovered = store.recover()?;
+        info!(records = recovered.records.len(), blocks = recovered.blocks.len(),
+              block_number = recovered.block_number, "recovered from RocksDB");
+
+        let mut smt = SparseMerkleTree::new();
+        for (state_id_hex, record_info) in &recovered.records {
+            let bytes = hex::decode(state_id_hex)?;
+            let path = state_id_to_smt_path(&bytes);
+            let leaf = compute_cert_data_hash_imprint(
+                &record_info.cert_data.predicate_cbor,
+                &record_info.cert_data.source_state_hash,
+                &record_info.cert_data.transaction_hash,
+                &record_info.cert_data.witness,
+            );
+            let _ = smt.add_leaf(path, leaf.to_vec());
+        }
+
+        let state = AggregatorState::new(req_tx, Some(store as Arc<dyn uni_aggregator::storage::Store>));
+        state.apply_recovered(recovered).await;
+
+        let rm = RoundManager::new_with_smt(round_cfg, req_rx, Arc::clone(&state), bft, smt);
+        (state, rm)
+    } else {
+        let state = AggregatorState::new(req_tx, None);
+        let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
+        (state, rm)
+    };
+
+    #[cfg(not(feature = "rocksdb-storage"))]
+    let (state, round_manager) = {
+        let state = AggregatorState::new(req_tx, None);
+        let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
+        (state, rm)
+    };
+
     tokio::spawn(async move { round_manager.run().await; });
 
     let router = build_router(Arc::clone(&state));

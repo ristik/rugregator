@@ -37,3 +37,4 @@ serde_bytes  = "0.11"
 serde_tuple  = "0.5"
 rand         = "0.8"
 rsmt         = { path = "crates/rsmt" }
+rocksdb      = { version = "0.22", features = ["multi-threaded-cf"] }

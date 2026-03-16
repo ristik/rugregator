@@ -13,4 +13,5 @@ pub mod config;
 pub mod round;
 pub mod smt;
 pub mod storage;
+pub mod storage_rocksdb;
 pub mod validation;
