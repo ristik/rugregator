@@ -1,0 +1,41 @@
+[package]
+name = "uni-bft-committer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# BFT Core integration
+ciborium.workspace = true
+libp2p.workspace = true
+secp256k1.workspace = true
+sha2.workspace = true
+
+# Ethrex dependencies
+ethrex-common.workspace = true
+ethrex-storage.workspace = true
+ethereum-types.workspace = true
+
+# Common utilities
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes = "0.11"
+thiserror.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+# For manual stream handling
+unsigned-varint = { version = "0.8", features = ["futures", "asynchronous-codec"] }
+void = "1.0"
+futures = "0.3"
+async-trait = "0.1"
+
+# For CBOR array serialization (matching BFT Core's toarray format)
+serde_tuple = "0.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

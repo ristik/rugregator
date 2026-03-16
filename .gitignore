@@ -1,0 +1,37 @@
+# Test setup
+e2e-data/
+
+# e2e test deps (separate git repository)
+aggregator-go/
+state-transition-sdk/
+bft-core/
+bft-go-base/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Configuration
+config.toml
+keys/
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+data/

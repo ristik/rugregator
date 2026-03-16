@@ -1,0 +1,75 @@
+[package]
+name        = "uni-aggregator"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+
+[[bin]]
+name = "aggregator"
+path = "src/main.rs"
+
+[[bin]]
+name = "perf-test"
+path = "src/bin/perf_test.rs"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# HTTP server
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# CBOR
+ciborium.workspace = true
+
+# Hash
+sha2.workspace = true
+
+# Crypto – secp256k1 with compact-recovery
+secp256k1.workspace = true
+
+# BigInt for SMT paths
+num-bigint.workspace = true
+num-traits.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Config
+clap.workspace = true
+
+# Concurrent map for record store
+dashmap.workspace = true
+
+# Async utils
+futures.workspace = true
+async-trait.workspace = true
+
+# BFT Core live connectivity (feature-gated)
+libp2p.workspace = true
+unsigned-varint.workspace = true
+serde_bytes.workspace = true
+serde_tuple.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default            = []
+consistency-proofs = []
+rocksdb-storage    = []
+parallel           = []
+blake3-hash        = []
