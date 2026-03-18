@@ -52,6 +52,10 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_DB_PATH", default_value = "")]
     pub db_path: String,
 
+    /// Disk-backed SMT node cache capacity (number of nodes).
+    #[arg(long, env = "AGGREGATOR_CACHE_CAPACITY", default_value_t = 500_000)]
+    pub cache_capacity: usize,
+
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,

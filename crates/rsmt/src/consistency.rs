@@ -150,6 +150,8 @@ fn run_batch(
     match *new_root_branch.expect("root must not disappear") {
         Branch::Node(n) => tree.root = n,
         Branch::Leaf(_) => panic!("tree root became a leaf — logic error"),
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(_) => panic!("tree root became a Stub — logic error"),
     }
 
     Ok((new_items, proof))
@@ -179,6 +181,10 @@ fn insert_node(
     };
 
     match *b {
+        // ── Stub: must have been materialized before reaching here ─────────────
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(_) => panic!("insert_node: encountered Stub — materialize from disk first"),
+
         // ── Existing leaf ─────────────────────────────────────────────────────
         Branch::Leaf(l) => {
             let filtered: Vec<_> = batch

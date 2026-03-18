@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let bft: Arc<dyn BftCommitter> = match cfg.bft_mode.as_str() {
         "stub" | "test" => {
             info!("BFT mode: stub");
-            Arc::new(BftCommitterStub)
+            Arc::new(BftCommitterStub::new())
         }
         "live" => {
             info!("BFT mode: live — connecting to BFT Core");
@@ -61,32 +61,23 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "rocksdb-storage")]
     let (state, round_manager) = if !cfg.db_path.is_empty() {
         use uni_aggregator::storage_rocksdb::RocksDbStore;
-        use uni_aggregator::smt::{SparseMerkleTree, state_id_to_smt_path};
-        use uni_aggregator::validation::state_id::compute_cert_data_hash_imprint;
+        use uni_aggregator::smt_disk::DiskBackedSmt;
 
         info!(path = %cfg.db_path, "opening RocksDB");
-        let store = Arc::new(RocksDbStore::open(&cfg.db_path)?);
+        let (store, arc_db) = RocksDbStore::open(&cfg.db_path)?;
+        let store = Arc::new(store);
+
         let recovered = store.recover()?;
         info!(records = recovered.records.len(), blocks = recovered.blocks.len(),
               block_number = recovered.block_number, "recovered from RocksDB");
 
-        let mut smt = SparseMerkleTree::new();
-        for (state_id_hex, record_info) in &recovered.records {
-            let bytes = hex::decode(state_id_hex)?;
-            let path = state_id_to_smt_path(&bytes);
-            let leaf = compute_cert_data_hash_imprint(
-                &record_info.cert_data.predicate_cbor,
-                &record_info.cert_data.source_state_hash,
-                &record_info.cert_data.transaction_hash,
-                &record_info.cert_data.witness,
-            );
-            let _ = smt.add_leaf(path, leaf.to_vec());
-        }
+        let disk_smt = DiskBackedSmt::open(arc_db, cfg.cache_capacity)?;
+        info!(root = %hex::encode(disk_smt.root_hash_imprint()), "disk-backed SMT ready");
 
         let state = AggregatorState::new(req_tx, Some(store as Arc<dyn uni_aggregator::storage::Store>));
         state.apply_recovered(recovered).await;
 
-        let rm = RoundManager::new_with_smt(round_cfg, req_rx, Arc::clone(&state), bft, smt);
+        let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt);
         (state, rm)
     } else {
         let state = AggregatorState::new(req_tx, None);

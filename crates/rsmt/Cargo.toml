@@ -13,4 +13,7 @@ ciborium.workspace   = true
 hex.workspace        = true
 anyhow.workspace     = true
 
+[features]
+disk-backed = []
+
 [dev-dependencies]

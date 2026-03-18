@@ -2,31 +2,49 @@
 //! RocksDB-backed persistence store.
 
 use std::sync::Arc;
-use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteBatch};
+use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType, Options, WriteBatch};
 
 use crate::api::cbor::CertDataFields;
 use crate::storage::{BlockInfo, FinalizedRecord, RecordInfo, RecoveredState, Store};
 
-const CF_RECORDS: &str = "records";
-const CF_BLOCKS: &str = "blocks";
-const CF_META: &str = "meta";
+// ─── Column families ──────────────────────────────────────────────────────────
+
+const CF_RECORDS:   &str = "records";
+const CF_BLOCKS:    &str = "blocks";
+const CF_META:      &str = "meta";
+/// SMT node storage — used by `smt_disk`.
+pub const CF_SMT_NODES: &str = "smt_nodes";
+/// SMT metadata (committed root hash) — used by `smt_disk`.
+pub const CF_SMT_META:  &str = "smt_meta";
+
 const KEY_BLOCK_NUMBER: &[u8] = b"block_number";
 
+// ─── RocksDbStore ─────────────────────────────────────────────────────────────
+
 pub struct RocksDbStore {
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl RocksDbStore {
-    pub fn open(path: &str) -> anyhow::Result<Self> {
+    /// Open (or create) the database at `path`, returning a `RocksDbStore`
+    /// and a shared `Arc<DB>` suitable for passing to `DiskBackedSmt`.
+    pub fn open(path: &str) -> anyhow::Result<(Self, Arc<DB>)> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let cfs = [CF_RECORDS, CF_BLOCKS, CF_META]
-            .iter()
-            .map(|&name| ColumnFamilyDescriptor::new(name, Options::default()))
-            .collect::<Vec<_>>();
-        let db = DB::open_cf_descriptors(&opts, path, cfs)?;
-        Ok(Self { db })
+
+        let mut node_opts = Options::default();
+        node_opts.set_compression_type(DBCompressionType::Lz4);
+
+        let cfs = [
+            ColumnFamilyDescriptor::new(CF_RECORDS,   Options::default()),
+            ColumnFamilyDescriptor::new(CF_BLOCKS,    Options::default()),
+            ColumnFamilyDescriptor::new(CF_META,      Options::default()),
+            ColumnFamilyDescriptor::new(CF_SMT_NODES, node_opts),
+            ColumnFamilyDescriptor::new(CF_SMT_META,  Options::default()),
+        ];
+        let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs.into_iter())?);
+        Ok((Self { db: Arc::clone(&db) }, db))
     }
 
     pub fn recover(&self) -> anyhow::Result<RecoveredState> {
@@ -119,7 +137,7 @@ fn decode_record(key: &[u8], val: &[u8]) -> anyhow::Result<(String, RecordInfo)>
     let state_id_hex = hex::encode(key);
     let mut p = 0usize;
 
-    let block_number = read_u64(val, &mut p)?;
+    let block_number      = read_u64(val, &mut p)?;
     let predicate_cbor    = read_var(val, &mut p)?;
     let source_state_hash = read_exact(val, &mut p, 32)?;
     let transaction_hash  = read_exact(val, &mut p, 32)?;

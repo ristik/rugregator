@@ -10,6 +10,10 @@ use crate::path::SmtPath;
 pub enum Branch {
     Leaf(LeafBranch),
     Node(NodeBranch),
+    /// Disk-backed: an on-disk subtree represented only by its hash.
+    /// Must be materialized (loaded from disk) before any traversal.
+    #[cfg(feature = "disk-backed")]
+    Stub([u8; 32]),
 }
 
 impl Branch {
@@ -21,6 +25,8 @@ impl Branch {
         match self {
             Branch::Leaf(l) => &l.path,
             Branch::Node(n) => &n.path,
+            #[cfg(feature = "disk-backed")]
+            Branch::Stub(_) => panic!("Branch::Stub::path() — must not navigate into a Stub; materialize first"),
         }
     }
 }

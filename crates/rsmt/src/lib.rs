@@ -2,6 +2,7 @@
 
 pub mod consistency;
 pub mod hash;
+pub mod node_serde;
 pub mod path;
 pub mod proof;
 pub mod snapshot;
@@ -17,4 +18,5 @@ pub use path::{calculate_common_path, path_as_bytes, path_len, root_path, state_
 pub use num_bigint::BigUint;
 pub use proof::{merkle_path_from_cbor, merkle_path_to_cbor, MerkleTreePath, MerkleTreeStep};
 pub use snapshot::SmtSnapshot;
-pub use tree::{SmtError, SparseMerkleTree, KEY_LENGTH};
+pub use tree::{SmtError, SparseMerkleTree, KEY_LENGTH, calc_leaf_hash, calc_node_hash};
+pub use types::{Branch, LeafBranch, NodeBranch};

@@ -506,7 +506,7 @@ async fn network_loop(
                             if let Ok(cbor) = cbor_handshake(&h) {
                                 swarm.behaviour_mut().hs.send_request(&peer_id, cbor);
                                 hs_sent = true;
-                                info!("Handshake sent — subscribed to UC feed");
+                                info!("Handshake sent, subscribed to UC feed");
                             }
                         }
                     }

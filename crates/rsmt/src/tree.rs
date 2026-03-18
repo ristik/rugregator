@@ -176,6 +176,11 @@ fn build_tree(
     original_path: SmtPath,
     parent_mode: bool,
 ) -> Result<Box<Branch>, SmtError> {
+    #[cfg(feature = "disk-backed")]
+    if matches!(*branch, Branch::Stub(_)) {
+        panic!("build_tree: encountered Stub — subtree must be materialized from disk first");
+    }
+
     // ── Leaf collision ────────────────────────────────────────────────────────
     if let Branch::Leaf(ref l) = *branch {
         if l.path == remaining_path {
@@ -259,6 +264,8 @@ fn build_tree(
             Ok(Box::new(Branch::Node(n)))
         }
         Branch::Leaf(_) => unreachable!("leaf handled above"),
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(_) => unreachable!("Stub handled by panic guard above"),
     }
 }
 
@@ -319,6 +326,8 @@ pub fn calc_branch_hash(b: &mut Branch) -> [u8; 32] {
     match b {
         Branch::Leaf(l) => calc_leaf_hash(l),
         Branch::Node(n) => calc_node_hash(n),
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(h) => *h,
     }
 }
 
@@ -328,6 +337,8 @@ fn clone_branch(b: &Branch) -> Box<Branch> {
     Box::new(match b {
         Branch::Leaf(l) => Branch::Leaf(l.clone()),
         Branch::Node(n) => Branch::Node(clone_node(n)),
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(h) => Branch::Stub(*h),
     })
 }
 
@@ -369,6 +380,8 @@ fn find_leaf_in_branch_ref<'a>(
                 find_leaf_in_branch_ref(&n.left, &shifted)
             }
         }
+        #[cfg(feature = "disk-backed")]
+        Branch::Stub(_) => Err(SmtError::LeafNotFound),
     }
 }
 

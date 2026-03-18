@@ -70,12 +70,16 @@ rand.workspace = true
 # RocksDB persistence (optional, enabled by feature flag)
 rocksdb = { workspace = true, optional = true }
 
+# LRU cache for disk-backed SMT nodes
+lru = { version = "0.12", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
 
 [features]
 default            = []
 consistency-proofs = []
-rocksdb-storage    = ["dep:rocksdb"]
+rocksdb-storage    = ["dep:rocksdb", "dep:lru", "rsmt/disk-backed"]
 parallel           = []
 blake3-hash        = []
