@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         use smt_store::mem::PersistMode;
 
         info!(path = %cfg.db_path, "opening RocksDB");
-        let (store, arc_db) = RocksDbStore::open(&cfg.db_path)?;
+        let (store, arc_db) = RocksDbStore::open(&cfg.db_path, cfg.cache_capacity)?;
         let store = Arc::new(store);
 
         let recovered = store.recover()?;

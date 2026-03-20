@@ -1,7 +1,7 @@
 //! Disk-backed speculative snapshot for one round.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use rocksdb::DB;
 use rsmt::path::SmtPath;
 use rsmt::tree::SmtError;
@@ -11,14 +11,12 @@ use rsmt::consistency::batch_insert;
 
 use super::store::DiskSmt;
 use super::overlay::Overlay;
-use super::cache::NodeCache;
 use super::materializer::materialize_for_batch;
-use super::persister::persist_tree;
+use super::persister::persist_modified;
 
 /// Speculative working copy of the disk-backed SMT for one round.
 pub struct DiskSmtSnapshot {
     db:             Arc<DB>,
-    cache:          Arc<Mutex<NodeCache>>,
     key_length:     usize,
     own_overlay:    Overlay,
     parent_overlay: Option<Arc<Overlay>>,
@@ -32,7 +30,6 @@ impl DiskSmtSnapshot {
     pub fn create(store: &DiskSmt) -> Self {
         Self {
             db:             Arc::clone(&store.db),
-            cache:          Arc::clone(&store.cache),
             key_length:     store.key_length,
             own_overlay:    Overlay::new(),
             parent_overlay: None,
@@ -67,7 +64,6 @@ impl DiskSmtSnapshot {
         let parent = Arc::new(self.own_overlay.clone());
         Self {
             db:             Arc::clone(&self.db),
-            cache:          Arc::clone(&self.cache),
             key_length:     self.key_length,
             own_overlay:    Overlay::new(),
             parent_overlay: Some(parent),
@@ -98,9 +94,8 @@ impl DiskSmtSnapshot {
 
         let parent = self.parent_overlay.as_deref();
 
-        let (mut smt, old_keys) = materialize_for_batch(
+        let mut smt = materialize_for_batch(
             &self.db,
-            &self.cache,
             &self.own_overlay,
             parent,
             &pending,
@@ -112,7 +107,7 @@ impl DiskSmtSnapshot {
         let raw  = calc_node_hash(&mut smt.root);
         let root = build_imprint(&raw);
 
-        persist_tree(&mut smt, &old_keys, &mut self.own_overlay);
+        persist_modified(&mut smt, &mut self.own_overlay);
 
         self.cached_root = Some(root);
         Ok(())

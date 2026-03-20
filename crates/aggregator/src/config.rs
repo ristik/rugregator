@@ -52,8 +52,9 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_DB_PATH", default_value = "")]
     pub db_path: String,
 
-    /// Disk-backed SMT node cache capacity (number of nodes).
-    #[arg(long, env = "AGGREGATOR_CACHE_CAPACITY", default_value_t = 500_000)]
+    /// RocksDB block cache size in bytes for the SMT nodes column family.
+    /// Set to 0 to use RocksDB's default (~8 MB).
+    #[arg(long, env = "AGGREGATOR_CACHE_CAPACITY", default_value_t = 0)]
     pub cache_capacity: usize,
 
     /// Send a consistency proof (zk_proof) to BFT Core with each round.

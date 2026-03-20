@@ -7,7 +7,6 @@ authors.workspace = true
 [dependencies]
 rsmt.workspace       = true
 rocksdb.workspace    = true
-lru.workspace        = true
 anyhow.workspace     = true
 tracing.workspace    = true
 num-bigint.workspace = true

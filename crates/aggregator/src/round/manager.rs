@@ -612,25 +612,40 @@ impl<S: SmtStore> RoundManager<S> {
 
     fn generate_proofs(&mut self, processed: Vec<ProcessedRecord>, block_number: u64) -> Vec<FinalizedRecord> {
         use rsmt::proof::merkle_path_to_cbor;
+
+        // Decode state_ids and build paths up front; track which indices are valid.
+        let mut valid: Vec<(usize, Vec<u8>)> = Vec::with_capacity(processed.len());
+        let mut paths = Vec::with_capacity(processed.len());
+        for (i, r) in processed.iter().enumerate() {
+            match hex::decode(&r.state_id_hex) {
+                Ok(b) => {
+                    paths.push(state_id_to_smt_path(&b));
+                    valid.push((i, b));
+                }
+                Err(e) => { warn!("invalid state_id_hex: {e}"); }
+            }
+        }
+
+        // Single batch materialization for all proofs.
+        let merkle_paths = match self.smt.get_paths_batch(&paths) {
+            Ok(ps) => ps,
+            Err(e) => {
+                warn!(block = block_number, err = %e, "get_paths_batch failed");
+                return Vec::new();
+            }
+        };
+
         let mut out = Vec::with_capacity(processed.len());
-        for r in processed {
-            let state_id = match hex::decode(&r.state_id_hex) {
-                Ok(b) => b,
-                Err(e) => { warn!("invalid state_id_hex: {e}"); continue; }
-            };
-            let path = state_id_to_smt_path(&state_id);
-            let merkle_path = match self.smt.get_path(&path) {
-                Ok(p) => p,
-                Err(e) => { warn!(sid = %r.state_id_hex, err = %e, "get_path failed"); continue; }
-            };
-            let merkle_path_cbor = match merkle_path_to_cbor(&merkle_path) {
+        let processed_vec: Vec<ProcessedRecord> = processed.into_iter().collect();
+        for (j, (orig_idx, _state_id)) in valid.into_iter().enumerate() {
+            let merkle_path_cbor = match merkle_path_to_cbor(&merkle_paths[j]) {
                 Ok(c) => c,
                 Err(e) => { warn!(err = %e, "merkle_path_to_cbor failed"); continue; }
             };
             out.push(FinalizedRecord {
-                state_id_hex: r.state_id_hex,
+                state_id_hex: processed_vec[orig_idx].state_id_hex.clone(),
                 block_number,
-                cert_data: r.cert_data,
+                cert_data: processed_vec[orig_idx].cert_data.clone(),
                 merkle_path_cbor: Some(merkle_path_cbor),
             });
         }

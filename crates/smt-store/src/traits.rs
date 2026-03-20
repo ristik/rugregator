@@ -13,6 +13,14 @@ pub trait SmtStore: Send + 'static {
 
     /// Generate an inclusion proof for `leaf_path` from the committed state.
     fn get_path(&mut self, leaf_path: &SmtPath) -> anyhow::Result<MerkleTreePath>;
+
+    /// Generate inclusion proofs for multiple paths in a single materialization.
+    /// Default: calls `get_path` for each path individually.
+    fn get_paths_batch(&mut self, paths: &[SmtPath]) -> anyhow::Result<Vec<MerkleTreePath>> {
+        paths.iter()
+            .map(|p| self.get_path(p))
+            .collect()
+    }
 }
 
 /// A speculative snapshot of an [`SmtStore`].

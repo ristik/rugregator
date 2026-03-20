@@ -1,6 +1,9 @@
 //! After-mutation persistence: walk the modified tree and write to overlay.
+//!
+//! `persist_modified` is the primary entry-point.  It writes only non-Stub
+//! (i.e. actually modified) nodes.  Since the SMT is insert-only, no nodes
+//! are ever orphaned, so tombstoning is unnecessary.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use num_bigint::BigUint;
 use rsmt::{Branch, SparseMerkleTree};
@@ -15,90 +18,82 @@ use super::materializer::extract_node_prefix_bits;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/// Walk the modified SMT, serialize every node, and populate `overlay`.
-pub fn persist_tree(
-    smt:      &mut SparseMerkleTree,
-    old_keys: &[NodeKey],
-    overlay:  &mut Overlay,
+/// Walk the post-insertion tree and serialize every non-Stub node into `overlay`.
+///
+/// Stubs represent untouched subtrees already persisted in RocksDB and are
+/// skipped.  No tombstoning is performed: in an insert-only tree, NodeKeys
+/// are only ever created or updated in-place (never orphaned).
+pub fn persist_modified(
+    smt:     &mut SparseMerkleTree,
+    overlay: &mut Overlay,
 ) {
-    // Fill all hash caches.
     calc_node_hash(&mut smt.root);
 
-    let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
-
-    // Persist root.
     let root_nk = NodeKey::root();
     overlay.put(&root_nk, serialize_node(&smt.root));
-    new_keys.insert(root_nk.into_bytes());
 
-    let n_path      = path_len(&smt.root.path);
-    let prefix_bits = extract_node_prefix_bits(&smt.root.path, n_path);
-    let base_acc    = prefix_bits;
-    let split       = n_path;
+    let n_path   = path_len(&smt.root.path);
+    let base_acc = extract_node_prefix_bits(&smt.root.path, n_path);
+    let split    = n_path;
 
     if let Some(left) = &mut smt.root.left {
-        persist_branch(Arc::make_mut(left), false, split, &base_acc, overlay, &mut new_keys);
+        persist_branch_modified(Arc::make_mut(left), false, split, &base_acc, overlay);
     }
     if let Some(right) = &mut smt.root.right {
-        persist_branch(Arc::make_mut(right), true, split, &base_acc, overlay, &mut new_keys);
-    }
-
-    // Tombstone old keys no longer in the tree.
-    for old_nk in old_keys {
-        if !new_keys.contains(old_nk.as_bytes()) {
-            overlay.delete(old_nk);
-        }
+        persist_branch_modified(Arc::make_mut(right), true, split, &base_acc, overlay);
     }
 }
 
 // ─── Recursive helper ────────────────────────────────────────────────────────
 
-fn persist_branch(
-    branch:  &mut Branch,
+fn persist_branch_modified(
+    branch:   &mut Branch,
     is_right: bool,
     split:    usize,
     acc:      &BigUint,
     overlay:  &mut Overlay,
-    new_keys: &mut HashSet<Vec<u8>>,
 ) {
-    let child_acc = if is_right {
-        acc | (BigUint::from(1u8) << split)
-    } else {
-        acc.clone()
-    };
-    let nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
-
     match branch {
+        Branch::Stub(_) => {
+            // Already in DB — nothing to write.
+        }
+
         Branch::Leaf(l) => {
+            let child_acc = if is_right {
+                acc | (BigUint::from(1u8) << split)
+            } else {
+                acc.clone()
+            };
+            let nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
             if l.hash_cache.is_none() {
                 l.hash_cache = Some(calc_leaf_hash(l));
             }
             overlay.put(&nk, serialize_leaf(l));
-            new_keys.insert(nk.into_bytes());
         }
 
         Branch::Node(n) => {
             calc_node_hash(n);
 
+            let child_acc = if is_right {
+                acc | (BigUint::from(1u8) << split)
+            } else {
+                acc.clone()
+            };
+            let nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
+
             let n_path      = path_len(&n.path);
             let prefix_bits = extract_node_prefix_bits(&n.path, n_path);
-            let base_acc = &child_acc | (prefix_bits << split);
-            let node_split = split + n_path;
+            let base_acc    = &child_acc | (prefix_bits << split);
+            let node_split  = split + n_path;
 
             overlay.put(&nk, serialize_node(n));
-            new_keys.insert(nk.into_bytes());
 
             if let Some(left) = &mut n.left {
-                persist_branch(Arc::make_mut(left), false, node_split, &base_acc, overlay, new_keys);
+                persist_branch_modified(Arc::make_mut(left), false, node_split, &base_acc, overlay);
             }
             if let Some(right) = &mut n.right {
-                persist_branch(Arc::make_mut(right), true, node_split, &base_acc, overlay, new_keys);
+                persist_branch_modified(Arc::make_mut(right), true, node_split, &base_acc, overlay);
             }
-        }
-
-        Branch::Stub(_) => {
-            // Stub = untouched existing subtree.
-            new_keys.insert(nk.into_bytes());
         }
     }
 }

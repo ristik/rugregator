@@ -1,4 +1,3 @@
-pub mod cache;
 pub mod materializer;
 pub mod node_key;
 pub mod overlay;

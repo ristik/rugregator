@@ -18,7 +18,7 @@
 //!   --seed S              PRNG seed                            (default: random)
 //!   --proof-sample N      Proofs sampled per round             (default: 200)
 //!   --batch-sizes X,Y,..  Comma-separated sizes                (default: 1000,5000,10000)
-//!   --cache-capacity N    Disk-SMT LRU node cache              (default: 500000)
+//!   --cache-capacity N    RocksDB block cache bytes for SMT CF  (default: 0 = RocksDB default)
 //!   --db-path PATH        Fixed DB directory; default = fresh temp dir per sweep
 //!   --csv                 Also emit CSV rows
 
@@ -53,7 +53,7 @@ impl Default for Config {
             seed:           0, // resolved in parse_args
             proof_sample:   200,
             batch_sizes:    vec![1_000, 5_000, 10_000],
-            cache_capacity: 500_000,
+            cache_capacity: 0,
             db_path:        String::new(),
             csv:            false,
         }
@@ -121,8 +121,8 @@ fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtPath, Vec<u8>)> {
     }).collect()
 }
 
-fn open_db(path: &str) -> anyhow::Result<Arc<rocksdb::DB>> {
-    let (_, arc_db) = uni_aggregator::storage_rocksdb::RocksDbStore::open(path)?;
+fn open_db(path: &str, block_cache_bytes: usize) -> anyhow::Result<Arc<rocksdb::DB>> {
+    let (_, arc_db) = uni_aggregator::storage_rocksdb::RocksDbStore::open(path, block_cache_bytes)?;
     Ok(arc_db)
 }
 
@@ -320,7 +320,7 @@ fn main() -> anyhow::Result<()> {
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
                     let tmp = temp_db_path(label, sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
-                    let arc_db = open_db(&db_path)?;
+                    let arc_db = open_db(&db_path, cfg.cache_capacity)?;
                     let mut store = smt_store::MemSmt::open(arc_db, mode)?;
 
                     print_header(label, batch_size);
@@ -338,7 +338,7 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 // Persistent mode: load once, run all sweeps on the same tree, keep DB.
-                let arc_db = open_db(&cfg.db_path)?;
+                let arc_db = open_db(&cfg.db_path, cfg.cache_capacity)?;
                 let existing = count_leaves_in_db(&arc_db);
 
                 print!("Loading {} leaves from '{}'...", existing, cfg.db_path);
@@ -361,7 +361,7 @@ fn main() -> anyhow::Result<()> {
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
                     let tmp = temp_db_path("disk", sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
-                    let arc_db = open_db(&db_path)?;
+                    let arc_db = open_db(&db_path, cfg.cache_capacity)?;
                     let mut store = smt_store::DiskSmt::open(arc_db, cfg.cache_capacity)?;
 
                     print_header("disk", batch_size);
@@ -379,7 +379,7 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 // Persistent mode: open once (root hash only; nodes are lazy), keep DB.
-                let arc_db = open_db(&cfg.db_path)?;
+                let arc_db = open_db(&cfg.db_path, cfg.cache_capacity)?;
                 let existing = count_leaves_in_db(&arc_db);
 
                 print!("Opening disk-SMT '{}' ({} persisted leaves)...", cfg.db_path, existing);

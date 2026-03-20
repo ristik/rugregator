@@ -1,7 +1,7 @@
 //! RocksDB-backed persistence store.
 
 use std::sync::Arc;
-use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType, Options, WriteBatch};
+use rocksdb::{BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options, WriteBatch};
 
 use crate::api::cbor::CertDataFields;
 use crate::storage::{BlockInfo, FinalizedRecord, RecordInfo, RecoveredState, Store};
@@ -29,13 +29,24 @@ pub struct RocksDbStore {
 impl RocksDbStore {
     /// Open (or create) the database at `path`, returning a `RocksDbStore`
     /// and a shared `Arc<DB>` suitable for passing to `DiskBackedSmt`.
-    pub fn open(path: &str) -> anyhow::Result<(Self, Arc<DB>)> {
+    /// Open (or create) the database at `path`.
+    ///
+    /// `block_cache_bytes` controls the RocksDB block cache size for the
+    /// `smt_nodes` column family.  Pass 0 to use RocksDB's default (~8 MB).
+    pub fn open(path: &str, block_cache_bytes: usize) -> anyhow::Result<(Self, Arc<DB>)> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
         let mut node_opts = Options::default();
         node_opts.set_compression_type(DBCompressionType::Lz4);
+
+        if block_cache_bytes > 0 {
+            let cache = Cache::new_lru_cache(block_cache_bytes);
+            let mut table_opts = BlockBasedOptions::default();
+            table_opts.set_block_cache(&cache);
+            node_opts.set_block_based_table_factory(&table_opts);
+        }
 
         let cfs = [
             ColumnFamilyDescriptor::new(CF_RECORDS,    Options::default()),
