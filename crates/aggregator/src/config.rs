@@ -64,6 +64,19 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_CONSISTENCY_PROOFS", default_value_t = false)]
     pub consistency_proofs: bool,
 
+    /// SMT backend selection.
+    ///
+    /// - `"mem"`        — pure in-memory; state lost on restart
+    /// - `"mem-leaves"` — in-memory + persist leaf values (requires `--db-path`);
+    ///                    on restart replays all leaves to rebuild the tree
+    /// - `"mem-full"`   — in-memory + persist leaves and internal nodes (requires `--db-path`);
+    ///                    on restart loads the full node tree directly
+    /// - `"disk"`       — fully disk-backed SMT (default when `--db-path` is set)
+    ///
+    /// Defaults to `"disk"` when `--db-path` is non-empty, `"mem"` otherwise.
+    #[arg(long, env = "AGGREGATOR_SMT_BACKEND", default_value = "")]
+    pub smt_backend: String,
+
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,

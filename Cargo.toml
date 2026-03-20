@@ -2,6 +2,7 @@
 members = [
     "crates/aggregator",
     "crates/rsmt",
+    "crates/smt-store",
 ]
 resolver = "2"
 
@@ -38,3 +39,5 @@ serde_tuple  = "0.5"
 rand         = "0.8"
 rsmt         = { path = "crates/rsmt" }
 rocksdb      = { version = "0.22", features = ["multi-threaded-cf"] }
+lru          = "0.12"
+smt-store    = { path = "crates/smt-store" }

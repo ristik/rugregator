@@ -14,7 +14,6 @@ pub enum Branch {
     Node(NodeBranch),
     /// Disk-backed: an on-disk subtree represented only by its hash.
     /// Must be materialized (loaded from disk) before any traversal.
-    #[cfg(feature = "disk-backed")]
     Stub([u8; 32]),
 }
 
@@ -27,7 +26,6 @@ impl Branch {
         match self {
             Branch::Leaf(l) => &l.path,
             Branch::Node(n) => &n.path,
-            #[cfg(feature = "disk-backed")]
             Branch::Stub(_) => panic!("Branch::Stub::path() — must not navigate into a Stub; materialize first"),
         }
     }
@@ -144,7 +142,6 @@ pub fn branch_hash_cached(b: &Branch) -> [u8; 32] {
     match b {
         Branch::Leaf(l) => l.hash_cache.expect("Arc<Branch::Leaf> must have pre-computed hash"),
         Branch::Node(n) => n.hash_cache.expect("Arc<Branch::Node> must have pre-computed hash"),
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(h) => *h,
     }
 }

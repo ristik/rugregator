@@ -1,24 +1,4 @@
 //! Materialize a partial in-memory SMT from RocksDB, guided by a batch of keys.
-//!
-//! ## Strategy
-//!
-//! Only the nodes along the batch keys' paths (plus one-level siblings for
-//! hash computation) are loaded.  Every untouched sibling subtree is
-//! represented as a `Branch::Stub(hash)` — rsmt's algorithms never recurse
-//! into a Stub; they only call `calc_branch_hash` which returns the stored
-//! hash directly.
-//!
-//! ## NodeKey accumulation
-//!
-//! Accumulated prefix (`acc`) carries the absolute routing-bit values from
-//! root to the current position:
-//! - bit `i` of `acc` = the routing decision made at tree-depth `i`
-//!
-//! A child whose routing bit is at `split`:
-//! ```text
-//! child_acc  = acc | (is_right << split)
-//! child_nk   = NodeKey::from_depth_and_prefix(split + 1, child_acc)
-//! ```
 
 use std::sync::{Arc, Mutex};
 use num_bigint::BigUint;
@@ -36,11 +16,6 @@ pub const CF_SMT_NODES: &str = "smt_nodes";
 // ─── Public entry-points ──────────────────────────────────────────────────────
 
 /// Materialize a partial SMT for a batch insertion.
-///
-/// `own_overlay`    — mutations accumulated by the current snapshot.
-/// `parent_overlay` — parent snapshot's overlay (for forked/speculative snapshots).
-///
-/// Returns `(working_tree, visited_node_keys)`.
 pub fn materialize_for_batch(
     db:             &Arc<DB>,
     cache:          &Arc<Mutex<NodeCache>>,
@@ -182,8 +157,6 @@ fn load_as_stub(
 // ─── DB helpers ───────────────────────────────────────────────────────────────
 
 /// Load node bytes, checking overlays before cache/DB.
-///
-/// Read priority: `own_overlay → parent_overlay → cache → RocksDB`.
 pub fn load_bytes(
     db:             &Arc<DB>,
     cache:          &Arc<Mutex<NodeCache>>,

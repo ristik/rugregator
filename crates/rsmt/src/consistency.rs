@@ -146,7 +146,6 @@ fn run_batch(
             tree.root = n;
         }
         Branch::Leaf(_) => panic!("tree root became a leaf — logic error"),
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(_) => panic!("tree root became a Stub — logic error"),
     }
 
@@ -181,7 +180,6 @@ fn insert_node(
 
     match b {
         // ── Stub: must have been materialized before reaching here ─────────────
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(_) => panic!("insert_node: encountered Stub — materialize from disk first"),
 
         // ── Existing leaf ─────────────────────────────────────────────────────

@@ -1,10 +1,4 @@
 //! Integration tests for the disk-backed SMT.
-//!
-//! These tests verify:
-//! 1. Root hash equivalence: disk-backed insertions produce the same root as in-memory.
-//! 2. Rollback: discard() leaves DB unchanged.
-//! 3. Commit + reload: root hash survives restart.
-//! 4. Proof equivalence: disk-backed proofs match in-memory proofs byte-for-byte.
 
 #![cfg(test)]
 
@@ -13,7 +7,7 @@ use rsmt::path::state_id_to_smt_path;
 use rsmt::{SparseMerkleTree, consistency::batch_insert as mem_batch_insert};
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, DBCompressionType};
 
-use super::store::{DiskBackedSmt, CF_SMT_META};
+use super::store::{DiskSmt, CF_SMT_META};
 use super::materializer::CF_SMT_NODES;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -62,7 +56,7 @@ fn root_hash_equivalence_single_batch() {
     let expected_root = mem_smt.root_hash_imprint();
 
     // Disk-backed.
-    let mut disk = DiskBackedSmt::open(db, 10_000).unwrap();
+    let mut disk = DiskSmt::open(db, 10_000).unwrap();
     let (new_root, overlay) = disk.batch_insert_round(&pairs).unwrap();
     disk.commit_overlay(overlay, new_root).unwrap();
 
@@ -73,7 +67,7 @@ fn root_hash_equivalence_single_batch() {
 fn root_hash_equivalence_multi_round() {
     let dir   = tempfile::tempdir().unwrap();
     let db    = open_test_db(&dir);
-    let mut disk = DiskBackedSmt::open(db, 10_000).unwrap();
+    let mut disk = DiskSmt::open(db, 10_000).unwrap();
 
     let mut mem_smt = SparseMerkleTree::new();
 
@@ -96,7 +90,7 @@ fn root_hash_equivalence_multi_round() {
 fn rollback_leaves_db_unchanged() {
     let dir   = tempfile::tempdir().unwrap();
     let db    = open_test_db(&dir);
-    let mut disk = DiskBackedSmt::open(Arc::clone(&db), 10_000).unwrap();
+    let mut disk = DiskSmt::open(Arc::clone(&db), 10_000).unwrap();
 
     // Initial insert.
     let pairs1 = batch(4);
@@ -106,12 +100,12 @@ fn rollback_leaves_db_unchanged() {
     let committed_root = disk.root_hash_imprint();
 
     // Speculative insert — discard.
-    let pairs2 = batch(8); // pairs1 ∪ extra
+    let pairs2 = batch(8);
     let (_new_root, _overlay2) = disk.batch_insert_round(&pairs2).unwrap();
     // Discard: just don't call commit_overlay.
 
     // Re-open from DB.
-    let disk2 = DiskBackedSmt::open(db, 10_000).unwrap();
+    let disk2 = DiskSmt::open(db, 10_000).unwrap();
     assert_eq!(disk2.root_hash_imprint(), committed_root,
         "root hash must be unchanged after discarded overlay");
 }
@@ -122,19 +116,17 @@ fn commit_then_reload_root_survives() {
     let pairs = batch(6);
     let committed_root;
 
-    // First open: insert and commit.
     {
         let db   = open_test_db(&dir);
-        let mut disk = DiskBackedSmt::open(db, 1_000).unwrap();
+        let mut disk = DiskSmt::open(db, 1_000).unwrap();
         let (root, overlay) = disk.batch_insert_round(&pairs).unwrap();
         disk.commit_overlay(overlay, root).unwrap();
         committed_root = root;
     }
 
-    // Second open (simulates restart): verify root hash matches.
     {
         let db = open_test_db(&dir);
-        let disk = DiskBackedSmt::open(db, 1_000).unwrap();
+        let disk = DiskSmt::open(db, 1_000).unwrap();
         assert_eq!(disk.root_hash_imprint(), committed_root,
             "root hash must survive DB reopen");
     }
@@ -144,7 +136,7 @@ fn commit_then_reload_root_survives() {
 fn proof_equivalence() {
     let dir   = tempfile::tempdir().unwrap();
     let db    = open_test_db(&dir);
-    let mut disk = DiskBackedSmt::open(db, 10_000).unwrap();
+    let mut disk = DiskSmt::open(db, 10_000).unwrap();
 
     let pairs = batch(4);
 

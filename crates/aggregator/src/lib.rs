@@ -15,6 +15,3 @@ pub mod smt;
 pub mod storage;
 pub mod storage_rocksdb;
 pub mod validation;
-
-#[cfg(feature = "rocksdb-storage")]
-pub mod smt_disk;

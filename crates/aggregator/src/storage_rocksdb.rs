@@ -1,4 +1,3 @@
-#![cfg(feature = "rocksdb-storage")]
 //! RocksDB-backed persistence store.
 
 use std::sync::Arc;
@@ -9,13 +8,15 @@ use crate::storage::{BlockInfo, FinalizedRecord, RecordInfo, RecoveredState, Sto
 
 // ─── Column families ──────────────────────────────────────────────────────────
 
-const CF_RECORDS:   &str = "records";
-const CF_BLOCKS:    &str = "blocks";
-const CF_META:      &str = "meta";
-/// SMT node storage — used by `smt_disk`.
-pub const CF_SMT_NODES: &str = "smt_nodes";
-/// SMT metadata (committed root hash) — used by `smt_disk`.
-pub const CF_SMT_META:  &str = "smt_meta";
+const CF_RECORDS:    &str = "records";
+const CF_BLOCKS:     &str = "blocks";
+const CF_META:       &str = "meta";
+/// SMT node storage — used by `smt-store`.
+pub const CF_SMT_NODES:  &str = "smt_nodes";
+/// SMT metadata (committed root hash) — used by `smt-store`.
+pub const CF_SMT_META:   &str = "smt_meta";
+/// SMT leaf values — reserved for future MemSmt::LeavesOnly persistence.
+pub const CF_SMT_LEAVES: &str = "smt_leaves";
 
 const KEY_BLOCK_NUMBER: &[u8] = b"block_number";
 
@@ -37,11 +38,12 @@ impl RocksDbStore {
         node_opts.set_compression_type(DBCompressionType::Lz4);
 
         let cfs = [
-            ColumnFamilyDescriptor::new(CF_RECORDS,   Options::default()),
-            ColumnFamilyDescriptor::new(CF_BLOCKS,    Options::default()),
-            ColumnFamilyDescriptor::new(CF_META,      Options::default()),
-            ColumnFamilyDescriptor::new(CF_SMT_NODES, node_opts),
-            ColumnFamilyDescriptor::new(CF_SMT_META,  Options::default()),
+            ColumnFamilyDescriptor::new(CF_RECORDS,    Options::default()),
+            ColumnFamilyDescriptor::new(CF_BLOCKS,     Options::default()),
+            ColumnFamilyDescriptor::new(CF_META,       Options::default()),
+            ColumnFamilyDescriptor::new(CF_SMT_NODES,  node_opts),
+            ColumnFamilyDescriptor::new(CF_SMT_META,   Options::default()),
+            ColumnFamilyDescriptor::new(CF_SMT_LEAVES, Options::default()),
         ];
         let db = Arc::new(DB::open_cf_descriptors(&opts, path, cfs.into_iter())?);
         Ok((Self { db: Arc::clone(&db) }, db))

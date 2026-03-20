@@ -12,7 +12,7 @@
 //!   --seed S              PRNG seed                  (default: 42)
 //!   --proof-sample N      Proofs sampled per round   (default: 200)
 //!   --batch-sizes X,Y,..  Comma-separated sizes      (default: 1000,5000,10000)
-//!   --disk                Use disk-backed SMT (requires rocksdb-storage feature)
+//!   --disk                Use disk-backed SMT
 //!   --cache-capacity N    Disk SMT node cache capacity (default: 500000)
 //!   --db-path PATH        Persistent DB path; empty = temp dir  (default: "")
 //!   --csv                 Also emit a CSV table
@@ -94,7 +94,6 @@ fn fmt_dur(d: Duration) -> String {
     else                     { format!("{:.2}s",  us / 1_000_000.0) }
 }
 
-/// Generate `n` random (smt_path, leaf_value) pairs using the given rng.
 fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtPath, Vec<u8>)> {
     (0..n).map(|_| {
         let mut state_id = [0u8; 32];
@@ -118,12 +117,10 @@ fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtPath, Vec<u8>)> {
 #[derive(Debug)]
 struct Row {
     batch_size:   usize,
-    pre_fill:     usize,   // leaves already in tree before this batch
-    inserted:     usize,   // actually inserted (excluding duplicates)
+    pre_fill:     usize,
+    inserted:     usize,
     insert_ms:    f64,
-    throughput:   f64,     // inserted/s
-    /// For in-memory: root hash computation time.
-    /// For disk: commit_overlay time (root hash is computed inside batch_insert_round).
+    throughput:   f64,
     root_ms:      f64,
     proof_p50_us: f64,
     proof_p95_us: f64,
@@ -140,7 +137,6 @@ fn measure_round_mem(
 ) -> Row {
     let batch_size = batch.len();
 
-    // Insert via snapshot (mirrors the real round path).
     let mut snap = SmtSnapshot::create(tree);
     let mut inserted = 0usize;
 
@@ -158,7 +154,6 @@ fn measure_round_mem(
 
     snap.commit(tree);
 
-    // Proof generation on a random sample.
     let n = batch.len();
     let sample: Vec<usize> = (0..proof_sample.min(inserted))
         .map(|_| rng.gen_range(0..n))
@@ -186,30 +181,26 @@ fn measure_round_mem(
 
 // ─── Disk-backed measurement ──────────────────────────────────────────────────
 
-#[cfg(feature = "rocksdb-storage")]
 fn measure_round_disk(
-    disk:         &mut uni_aggregator::smt_disk::DiskBackedSmt,
+    disk:         &mut smt_store::DiskSmt,
     pre_fill:     usize,
     batch:        &[(SmtPath, Vec<u8>)],
     proof_sample: usize,
     rng:          &mut StdRng,
 ) -> Row {
-    use uni_aggregator::smt_disk::overlay::Overlay;
+    use smt_store::disk::overlay::Overlay;
 
     let batch_size = batch.len();
 
-    // Materialize + insert + root hash + persist to overlay.
     let t_ins = Instant::now();
     let (new_root, overlay) = disk.batch_insert_round(batch)
         .expect("batch_insert_round failed");
     let insert_dur = t_ins.elapsed();
 
-    // Commit overlay to RocksDB.
     let t_commit = Instant::now();
     disk.commit_overlay(overlay, new_root).expect("commit_overlay failed");
     let commit_dur = t_commit.elapsed();
 
-    // Proof generation on a random sample (against committed state, empty overlay).
     let empty_overlay = Overlay::new();
     let n = batch.len();
     let sample: Vec<usize> = (0..proof_sample.min(batch_size))
@@ -227,7 +218,7 @@ fn measure_round_disk(
     Row {
         batch_size,
         pre_fill,
-        inserted: batch_size,  // duplicates negligible with random data
+        inserted: batch_size,
         insert_ms:    insert_dur.as_secs_f64() * 1e3,
         throughput:   batch_size as f64 / insert_dur.as_secs_f64(),
         root_ms:      commit_dur.as_secs_f64() * 1e3,
@@ -311,32 +302,28 @@ fn run_memory(cfg: &Config) {
     }
 }
 
-#[cfg(feature = "rocksdb-storage")]
 fn run_disk(cfg: &Config) {
     use uni_aggregator::storage_rocksdb::RocksDbStore;
-    use uni_aggregator::smt_disk::DiskBackedSmt;
+    use smt_store::DiskSmt;
 
     if cfg.csv {
         println!("batch_size,pre_fill,inserted,insert_ms,throughput_leaves_per_s,commit_ms,proof_p50_us,proof_p95_us");
     }
 
-    // Either use the provided db_path or a unique temp directory.
     let _owned_tmp;
     let db_path = if cfg.db_path.is_empty() {
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("perf_test_smt_{}", std::process::id()));
         _owned_tmp = tmp;
-        // Clean up any prior run at this path.
         let _ = std::fs::remove_dir_all(&_owned_tmp);
         _owned_tmp.to_str().unwrap().to_string()
     } else {
         cfg.db_path.clone()
     };
 
-    // Open RocksDB via RocksDbStore (creates all required column families).
     let (_store, arc_db) = RocksDbStore::open(&db_path).expect("failed to open RocksDB");
-    let mut disk = DiskBackedSmt::open(arc_db, cfg.cache_capacity)
-        .expect("failed to open DiskBackedSmt");
+    let mut disk = DiskSmt::open(arc_db, cfg.cache_capacity)
+        .expect("failed to open DiskSmt");
 
     for &batch_size in &cfg.batch_sizes {
         print_header("disk-backed", batch_size);
@@ -353,11 +340,4 @@ fn run_disk(cfg: &Config) {
         }
         println!();
     }
-}
-
-#[cfg(not(feature = "rocksdb-storage"))]
-fn run_disk(_cfg: &Config) {
-    eprintln!("error: --disk requires the 'rocksdb-storage' feature.");
-    eprintln!("  Rebuild with:  cargo run --release --features rocksdb-storage --bin perf-test -- --disk");
-    std::process::exit(1);
 }

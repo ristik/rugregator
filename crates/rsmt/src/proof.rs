@@ -141,7 +141,6 @@ fn generate_path_branch(branch: &Branch, remaining_path: &SmtPath) -> Vec<Merkle
             vec![MerkleTreeStep { path: path_str, data }]
         }
         Branch::Node(n) => generate_path(n, remaining_path, false),
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(_) => panic!("generate_path_branch: Stub on the proof path — materialize this node first"),
     }
 }

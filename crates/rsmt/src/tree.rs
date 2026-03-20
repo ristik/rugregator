@@ -186,7 +186,6 @@ fn build_tree(
     original_path: SmtPath,
     parent_mode: bool,
 ) -> Result<Arc<Branch>, SmtError> {
-    #[cfg(feature = "disk-backed")]
     if matches!(*branch, Branch::Stub(_)) {
         panic!("build_tree: encountered Stub — subtree must be materialized from disk first");
     }
@@ -278,7 +277,6 @@ fn build_tree(
             Ok(Arc::new(Branch::Node(n)))
         }
         Branch::Leaf(_) => unreachable!("leaf handled above"),
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(_) => unreachable!("Stub handled by panic guard above"),
     }
 }
@@ -373,7 +371,6 @@ fn find_leaf_in_branch_ref<'a>(
                 find_leaf_in_branch_ref(&n.left, &shifted)
             }
         }
-        #[cfg(feature = "disk-backed")]
         Branch::Stub(_) => Err(SmtError::LeafNotFound),
     }
 }

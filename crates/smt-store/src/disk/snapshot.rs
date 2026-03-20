@@ -1,30 +1,4 @@
 //! Disk-backed speculative snapshot for one round.
-//!
-//! Unlike `SmtSnapshot` (which CoW-clones the in-memory tree root),
-//! `DiskSmtSnapshot` accumulates pending insertions into an in-memory overlay
-//! and only touches RocksDB at commit time.
-//!
-//! ## Speculative execution (fork)
-//!
-//! `fork()` creates a child snapshot that reads through the parent's flushed
-//! overlay (`parent_overlay`) before hitting the cache or DB.  This lets the
-//! speculative next-round work run while waiting for the BFT UC without
-//! performing any DB writes.
-//!
-//! Read priority inside the child:
-//! ```text
-//! own_overlay → parent_overlay → LRU cache → RocksDB
-//! ```
-//!
-//! When the proposed round commits its overlay to DB, the `parent_overlay`
-//! entries are now in the DB — the child's subsequent reads are equivalent
-//! whether they go through `parent_overlay` or directly to DB.
-//!
-//! ## Duplicate detection
-//!
-//! Within a single round, duplicates are detected via `pending_set`.
-//! Duplicates already present in the committed DB (or parent overlay) are
-//! detected lazily by rsmt's `batch_insert` during `flush_pending`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -35,36 +9,27 @@ use rsmt::hash::build_imprint;
 use rsmt::tree::calc_node_hash;
 use rsmt::consistency::batch_insert;
 
-use super::store::DiskBackedSmt;
+use super::store::DiskSmt;
 use super::overlay::Overlay;
 use super::cache::NodeCache;
 use super::materializer::materialize_for_batch;
 use super::persister::persist_tree;
 
 /// Speculative working copy of the disk-backed SMT for one round.
-///
-/// Owns all the resources it needs (no lifetime constraint on the store).
-/// Can be stored in `InFlightDiskRound` while waiting for a UC.
 pub struct DiskSmtSnapshot {
     db:             Arc<DB>,
     cache:          Arc<Mutex<NodeCache>>,
     key_length:     usize,
-    /// Mutations accumulated by this snapshot.
     own_overlay:    Overlay,
-    /// Parent snapshot's flushed overlay (read-through for forked snapshots).
-    /// `None` for snapshots created directly from a committed DB state.
     parent_overlay: Option<Arc<Overlay>>,
-    /// Keys inserted in this round (for within-round duplicate detection).
     pending_set:    HashSet<SmtPath>,
-    /// Pending items not yet flushed to overlay.
     pending:        Vec<(SmtPath, Vec<u8>)>,
-    /// Cached root hash after the most recent flush; None = pending not flushed yet.
-    cached_root:    Option<[u8; 34]>,
+    pub(crate) cached_root: Option<[u8; 34]>,
 }
 
 impl DiskSmtSnapshot {
     /// Create a snapshot from the current committed state of `store`.
-    pub fn create(store: &DiskBackedSmt) -> Self {
+    pub fn create(store: &DiskSmt) -> Self {
         Self {
             db:             Arc::clone(&store.db),
             cache:          Arc::clone(&store.cache),
@@ -77,11 +42,8 @@ impl DiskSmtSnapshot {
         }
     }
 
-    /// Add a single leaf to the snapshot (deferred; flushed at root_hash or commit).
-    ///
-    /// Returns `SmtError::DuplicateLeaf` if the same key was already inserted
-    /// in this round.
-    pub fn add_leaf(&mut self, path: SmtPath, value: Vec<u8>) -> Result<(), SmtError> {
+    /// Add a single leaf to the snapshot (deferred).
+    pub fn add_leaf_inner(&mut self, path: SmtPath, value: Vec<u8>) -> Result<(), SmtError> {
         if self.pending_set.contains(&path) {
             return Err(SmtError::DuplicateLeaf);
         }
@@ -92,31 +54,16 @@ impl DiskSmtSnapshot {
     }
 
     /// Current working root hash imprint (34 bytes).
-    /// Flushes pending items if needed.
-    pub fn root_hash_imprint(&mut self) -> anyhow::Result<[u8; 34]> {
+    pub fn root_hash_imprint_inner(&mut self) -> anyhow::Result<[u8; 34]> {
         self.flush_pending()?;
-        Ok(self.cached_root.unwrap_or_else(|| {
-            // Empty tree.
-            build_imprint(&[0u8; 32])
-        }))
+        Ok(self.cached_root.unwrap_or_else(|| build_imprint(&[0u8; 32])))
     }
 
     /// Fork this snapshot into a speculative copy for the next round.
-    ///
-    /// Must be called after `root_hash_imprint()` (or `flush_pending()`) so
-    /// that `own_overlay` reflects all insertions so far.
-    ///
-    /// The fork inherits this snapshot's flushed overlay as a read-through
-    /// base (`parent_overlay`).  The fork itself starts with an empty
-    /// `own_overlay` and accumulates only its own new mutations.
-    ///
-    /// Cost: O(own_overlay_size) — clones the overlay HashMap.
-    pub fn fork(&mut self) -> Self {
-        // Ensure all pending are in own_overlay before sharing.
+    pub fn fork_inner(&mut self) -> Self {
         if let Err(e) = self.flush_pending() {
             tracing::warn!("DiskSmtSnapshot::fork: flush_pending failed: {e}");
         }
-        // Share a clone of own_overlay as the parent for the fork.
         let parent = Arc::new(self.own_overlay.clone());
         Self {
             db:             Arc::clone(&self.db),
@@ -131,20 +78,13 @@ impl DiskSmtSnapshot {
     }
 
     /// Commit this snapshot to `store`.
-    ///
-    /// Flushes any remaining pending items, then atomically writes
-    /// `own_overlay` to RocksDB and updates `store.current_root`.
-    ///
-    /// The `parent_overlay` (if any) is assumed to have already been committed
-    /// to DB by a prior call (i.e. the proposed round was committed before
-    /// promoting the spec round).
-    pub fn commit(mut self, store: &mut DiskBackedSmt, new_root: [u8; 34]) -> anyhow::Result<()> {
+    pub fn commit_inner(mut self, store: &mut DiskSmt, new_root: [u8; 34]) -> anyhow::Result<()> {
         self.flush_pending()?;
         store.commit_overlay(self.own_overlay, new_root)
     }
 
     /// Discard this snapshot without committing.
-    pub fn discard(self) {
+    pub fn discard_inner(self) {
         // own_overlay, pending, and parent_overlay (Arc) are all dropped here.
     }
 
@@ -176,5 +116,30 @@ impl DiskSmtSnapshot {
 
         self.cached_root = Some(root);
         Ok(())
+    }
+}
+
+impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
+    type Store = DiskSmt;
+
+    fn add_leaf(&mut self, path: SmtPath, value: Vec<u8>) -> Result<(), SmtError> {
+        self.add_leaf_inner(path, value)
+    }
+
+    fn root_hash_imprint(&mut self) -> anyhow::Result<[u8; 34]> {
+        self.root_hash_imprint_inner()
+    }
+
+    fn fork(&mut self) -> Self {
+        self.fork_inner()
+    }
+
+    fn commit(self, store: &mut DiskSmt) -> anyhow::Result<()> {
+        let root = self.cached_root.unwrap_or_else(|| store.root_hash_imprint());
+        self.commit_inner(store, root)
+    }
+
+    fn discard(self) {
+        self.discard_inner()
     }
 }
