@@ -23,6 +23,17 @@ impl SmtSnapshot {
         self.inner.add_leaf(path, value)
     }
 
+    /// Insert a batch and generate a consistency proof.
+    ///
+    /// Returns `(inserted_items, proof)` where `inserted_items` contains only
+    /// the actually-inserted (path, value) pairs (duplicates excluded).
+    pub fn batch_insert_with_proof(
+        &mut self,
+        batch: &[(SmtPath, Vec<u8>)],
+    ) -> Result<(Vec<(SmtPath, Vec<u8>)>, super::consistency::ConsistencyProof), super::tree::SmtError> {
+        super::consistency::batch_insert_with_proof(&mut self.inner, batch)
+    }
+
     /// Current root hash imprint (34 bytes).
     pub fn root_hash_imprint(&mut self) -> [u8; 34] {
         self.inner.root_hash_imprint()

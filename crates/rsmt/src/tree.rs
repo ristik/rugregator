@@ -3,12 +3,13 @@
 //! This is a direct translation of `aggregator-go/internal/smt/smt.go`.
 //! The tree is **not thread-safe**; callers must wrap it in a `RwLock`.
 
+use std::sync::Arc;
 use num_bigint::BigUint;
 use thiserror::Error;
 
-use crate::hash::{build_imprint, hash_leaf, hash_node};
+use crate::hash::{build_imprint, hash_node};
 use crate::path::{bit_at, calculate_common_path, path_len, root_path, rsh, SmtPath};
-use crate::types::{leaf, node, Branch, LeafBranch, NodeBranch};
+use crate::types::{branch_hash_cached, leaf, node, Branch, LeafBranch, NodeBranch};
 
 /// Key length in bits for standalone (monolithic) mode.
 /// StateID is 32 bytes padded to 34 bytes + 1 sentinel byte → 272 data bits.
@@ -37,8 +38,10 @@ pub enum SmtError {
 
 /// A path-compressed Patricia trie compatible with the Go/TypeScript SMT.
 ///
-/// The tree is **not** `Clone` by default because cloning is O(n) and should
-/// be explicit.  Call `deep_clone()` to get a copy for snapshot purposes.
+/// Children of the root node are `Arc<Branch>` values.  Creating a snapshot
+/// via `deep_clone()` is O(1): it just increments the Arc reference counts for
+/// the two direct children; all deeper subtrees are shared automatically.
+/// Copy-on-write semantics are applied lazily during insertion (`add_leaf`).
 pub struct SparseMerkleTree {
     /// Bit-length of inserted keys (272 for standalone mode).
     pub key_length: usize,
@@ -63,12 +66,16 @@ impl SparseMerkleTree {
         }
     }
 
-    /// Deep-clone the entire tree.  Used for snapshot / rollback.
+    /// Create a CoW snapshot of this tree.
+    ///
+    /// O(1): clones only the root `NodeBranch` struct (two `Arc` ref-count
+    /// increments for the left/right children).  All deeper subtrees are shared
+    /// until a write triggers path-copying.
     pub fn deep_clone(&self) -> Self {
         Self {
             key_length: self.key_length,
             parent_mode: self.parent_mode,
-            root: clone_node(&self.root),
+            root: self.root.clone(), // O(1): Arc::clone for children
         }
     }
 
@@ -101,9 +108,7 @@ impl SparseMerkleTree {
         }
 
         // Pre-check: the tree is add-only.  If a leaf already exists at this
-        // path, skip it regardless of value (matches ndsmt3.py batch_insert
-        // semantics).  This also avoids tree corruption: the naive
-        // take()+build_tree+? pattern would lose the child on error.
+        // path, skip it regardless of value.
         match self.get_leaf(&path) {
             Ok(_existing) => return Err(SmtError::DuplicateLeaf),
             Err(SmtError::LeafNotFound) => {} // safe to insert
@@ -168,27 +173,37 @@ impl Default for SparseMerkleTree {
 
 // ─── build_tree (Go buildTree) ────────────────────────────────────────────────
 
-/// Recursive insertion into a subtree.  Translates Go `buildTree`.
+/// Recursive CoW insertion into a subtree.  Translates Go `buildTree`.
+///
+/// Applies copy-on-write: if `branch` is exclusively owned (`Arc::try_unwrap`
+/// succeeds) it is mutated in-place; otherwise a shallow clone of the branch
+/// node is created (O(1)) and the path from root to insertion point is
+/// reconstructed with new `Arc` wrappers.
 fn build_tree(
-    branch: Box<Branch>,
+    branch: Arc<Branch>,
     remaining_path: SmtPath,
     value: Vec<u8>,
     original_path: SmtPath,
     parent_mode: bool,
-) -> Result<Box<Branch>, SmtError> {
+) -> Result<Arc<Branch>, SmtError> {
     #[cfg(feature = "disk-backed")]
     if matches!(*branch, Branch::Stub(_)) {
         panic!("build_tree: encountered Stub — subtree must be materialized from disk first");
     }
 
+    // CoW: take ownership if we are the sole Arc owner, else clone this node.
+    let branch = match Arc::try_unwrap(branch) {
+        Ok(b) => b,
+        Err(arc) => (*arc).clone(),
+    };
+
     // ── Leaf collision ────────────────────────────────────────────────────────
-    if let Branch::Leaf(ref l) = *branch {
+    if let Branch::Leaf(ref l) = branch {
         if l.path == remaining_path {
             if l.is_child {
                 // Parent-mode: overwrite child hash.
                 return Ok(leaf(l.path.clone(), value, original_path));
             } else {
-                // Add-only: leaf already exists at this path; skip regardless of value.
                 return Err(SmtError::DuplicateLeaf);
             }
         }
@@ -197,7 +212,6 @@ fn build_tree(
     let branch_path = branch.path().clone();
     let common_path = calculate_common_path(&remaining_path, &branch_path);
 
-    // Cannot add a leaf whose path is a prefix of the branch's path.
     if common_path == remaining_path {
         return Err(SmtError::CannotAddInsideBranch);
     }
@@ -207,7 +221,7 @@ fn build_tree(
     let is_right = bit_at(&shifted, 0) == 1;
 
     // ── Leaf split ────────────────────────────────────────────────────────────
-    if let Branch::Leaf(ref l) = *branch {
+    if let Branch::Leaf(ref l) = branch {
         if common_path == l.path {
             return Err(SmtError::CannotExtendThroughLeaf);
         }
@@ -223,16 +237,12 @@ fn build_tree(
     }
 
     // ── Node: split in the middle ─────────────────────────────────────────────
-    if let Branch::Node(ref n) = *branch {
+    if let Branch::Node(ref n) = branch {
         if common_path.bits() < n.path.bits() {
             let new_leaf_path = rsh(&remaining_path, shift);
             let new_leaf_branch = leaf(new_leaf_path, value, original_path.clone());
             let old_node_path = rsh(&n.path, shift);
-            let old_node = Box::new(Branch::Node(NodeBranch::new(
-                old_node_path,
-                n.left.clone(),
-                n.right.clone(),
-            )));
+            let old_node = node(old_node_path, n.left.clone(), n.right.clone());
             return Ok(if is_right {
                 node(common_path, Some(old_node), Some(new_leaf_branch))
             } else {
@@ -243,9 +253,9 @@ fn build_tree(
 
     // ── Recurse ───────────────────────────────────────────────────────────────
     let deeper = rsh(&remaining_path, shift);
-    match *branch {
+    match branch {
         Branch::Node(mut n) => {
-            n.hash_cache = None; // invalidate cache
+            n.hash_cache = None; // will be recomputed below
             if is_right {
                 let right = n.right.take();
                 n.right = Some(if let Some(child) = right {
@@ -261,7 +271,11 @@ fn build_tree(
                     leaf(deeper, value, original_path)
                 });
             }
-            Ok(Box::new(Branch::Node(n)))
+            // Recompute hash before wrapping in Arc (invariant).
+            let lh = n.left.as_ref().map(|a| branch_hash_cached(a));
+            let rh = n.right.as_ref().map(|a| branch_hash_cached(a));
+            n.hash_cache = Some(hash_node(&n.path, lh.as_ref(), rh.as_ref()));
+            Ok(Arc::new(Branch::Node(n)))
         }
         Branch::Leaf(_) => unreachable!("leaf handled above"),
         #[cfg(feature = "disk-backed")]
@@ -277,33 +291,35 @@ pub fn calc_leaf_hash(l: &mut LeafBranch) -> [u8; 32] {
         return cached;
     }
     let raw = if l.is_child {
-        // Value IS the raw 32-byte hash (or nil → all-zeros treated as nil).
         if l.value.is_empty() {
-            return [0u8; 32]; // nil child — propagate as null
+            return [0u8; 32];
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&l.value[..32]);
         arr
     } else {
-        hash_leaf(&l.path, &l.value)
+        crate::hash::hash_leaf(&l.path, &l.value)
     };
     l.hash_cache = Some(raw);
     raw
 }
 
-/// Compute (and cache) the hash of a node.
-/// Returns the raw 32-byte digest.
+/// Compute (and cache) the hash of the root node.
+///
+/// For non-root nodes the hash is pre-computed at construction time and stored
+/// in the `Arc<Branch>`.  Only the root `NodeBranch` (which is never wrapped
+/// in an `Arc`) uses lazy computation.
 pub fn calc_node_hash(n: &mut NodeBranch) -> [u8; 32] {
     if let Some(cached) = n.hash_cache {
         return cached;
     }
 
-    let left_hash = n.left.as_mut().map(|b| calc_branch_hash(b));
-    let right_hash = n.right.as_mut().map(|b| calc_branch_hash(b));
+    // Children are Arc<Branch>; read their pre-computed hashes directly.
+    let left_hash = n.left.as_ref().map(|arc| branch_hash_cached(arc));
+    let right_hash = n.right.as_ref().map(|arc| branch_hash_cached(arc));
 
     // In sharded child-tree roots (is_root && path.bits() > 1),
     // the path used in the hash is the last bit of the shard ID.
-    // For monolithic mode (root path = 1, bits() = 1) we use the actual path.
     let hash_path: SmtPath = if n.is_root && n.path.bits() > 1 {
         let pos = n.path.bits() as usize - 2;
         let last_bit = bit_at(&n.path, pos);
@@ -321,41 +337,18 @@ pub fn calc_node_hash(n: &mut NodeBranch) -> [u8; 32] {
     raw
 }
 
-/// Dispatch to leaf or node hash computation.
-pub fn calc_branch_hash(b: &mut Branch) -> [u8; 32] {
-    match b {
-        Branch::Leaf(l) => calc_leaf_hash(l),
-        Branch::Node(n) => calc_node_hash(n),
-        #[cfg(feature = "disk-backed")]
-        Branch::Stub(h) => *h,
-    }
-}
-
-// ─── Deep clone helpers ───────────────────────────────────────────────────────
-
-fn clone_branch(b: &Branch) -> Box<Branch> {
-    Box::new(match b {
-        Branch::Leaf(l) => Branch::Leaf(l.clone()),
-        Branch::Node(n) => Branch::Node(clone_node(n)),
-        #[cfg(feature = "disk-backed")]
-        Branch::Stub(h) => Branch::Stub(*h),
-    })
-}
-
-fn clone_node(n: &NodeBranch) -> NodeBranch {
-    NodeBranch {
-        path: n.path.clone(),
-        left: n.left.as_deref().map(clone_branch),
-        right: n.right.as_deref().map(clone_branch),
-        is_root: n.is_root,
-        hash_cache: n.hash_cache,
-    }
+/// Read the hash from a branch (immutable; requires pre-computed `hash_cache`).
+///
+/// Used by `consistency.rs` and `proof.rs` for unchanged subtrees whose hash
+/// is guaranteed to be present.
+pub fn calc_branch_hash(b: &Branch) -> [u8; 32] {
+    branch_hash_cached(b)
 }
 
 // ─── Leaf lookup (immutable) ──────────────────────────────────────────────────
 
 fn find_leaf_in_branch_ref<'a>(
-    branch: &'a Option<Box<Branch>>,
+    branch: &'a Option<Arc<Branch>>,
     target: &SmtPath,
 ) -> Result<&'a LeafBranch, SmtError> {
     let b = branch.as_deref().ok_or(SmtError::LeafNotFound)?;
@@ -427,13 +420,11 @@ mod tests {
 
     #[test]
     fn existing_leaf_skipped_regardless_of_value() {
-        // Add-only tree: inserting a different value at the same path is also a DuplicateLeaf.
         let mut tree = SparseMerkleTree::new();
         let path = make_path(7);
         tree.add_leaf(path.clone(), vec![1u8; 34]).unwrap();
         let r = tree.add_leaf(path, vec![2u8; 34]);
         assert_eq!(r, Err(SmtError::DuplicateLeaf));
-        // Original value must be unchanged.
         let leaf = tree.get_leaf(&make_path(7)).unwrap();
         assert_eq!(leaf.value, vec![1u8; 34]);
     }
@@ -441,9 +432,7 @@ mod tests {
     #[test]
     fn wrong_key_length() {
         let mut tree = SparseMerkleTree::new();
-        // Path with 273 bits instead of 273 (off by 1)
-        // Use a 33-byte state_id to get a different bit-length.
-        let bad_path = BigUint::from(1u8) << 100; // 101 bits
+        let bad_path = BigUint::from(1u8) << 100;
         let r = tree.add_leaf(bad_path, vec![0u8; 34]);
         assert!(matches!(r, Err(SmtError::KeyLength { .. })));
     }

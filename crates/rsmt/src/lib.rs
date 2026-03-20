@@ -10,7 +10,7 @@ pub mod tree;
 pub mod types;
 
 pub use consistency::{
-    batch_insert, batch_insert_with_proof, verify_consistency,
+    batch_insert, batch_insert_with_proof, consistency_proof_to_cbor, verify_consistency,
     ConsistencyProof, ProofOp, synchronized_proof_eval,
 };
 pub use hash::{build_imprint, cbor_array, cbor_bytes, cbor_null, hash_leaf, hash_node};

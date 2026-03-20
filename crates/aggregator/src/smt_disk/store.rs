@@ -59,7 +59,7 @@ impl DiskBackedSmt {
 
         // 1. Materialize the partial tree.
         let (mut smt, old_keys) = materialize_for_batch(
-            &self.db, &self.cache, &empty_overlay, batch, self.key_length,
+            &self.db, &self.cache, &empty_overlay, None, batch, self.key_length,
         )?;
 
         // 2. Run rsmt batch insertion.
@@ -83,7 +83,7 @@ impl DiskBackedSmt {
         overlay: &Overlay,
     ) -> anyhow::Result<MerkleTreePath> {
         let mut smt = materialize_for_proof(
-            &self.db, &self.cache, overlay, leaf_key, self.key_length,
+            &self.db, &self.cache, overlay, None, leaf_key, self.key_length,
         )?;
         smt.get_path(leaf_key).map_err(|e| anyhow::anyhow!("get_path: {e}"))
     }

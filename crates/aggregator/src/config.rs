@@ -56,6 +56,14 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_CACHE_CAPACITY", default_value_t = 500_000)]
     pub cache_capacity: usize,
 
+    /// Send a consistency proof (zk_proof) to BFT Core with each round.
+    ///
+    /// When enabled the aggregator uses `batch_insert_with_proof` to compute an
+    /// append-only consistency proof and includes it in every Certification
+    /// Request.  Slightly slower per round; useful when BFT Core validates proofs.
+    #[arg(long, env = "AGGREGATOR_CONSISTENCY_PROOFS", default_value_t = false)]
+    pub consistency_proofs: bool,
+
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
@@ -66,6 +74,8 @@ pub struct Config {
 pub struct RoundConfig {
     pub round_duration_ms: u64,
     pub batch_limit: usize,
+    /// Generate and send a consistency proof with each Certification Request.
+    pub consistency_proofs: bool,
 }
 
 impl From<&Config> for RoundConfig {
@@ -73,6 +83,7 @@ impl From<&Config> for RoundConfig {
         Self {
             round_duration_ms: c.round_duration_ms,
             batch_limit: c.batch_limit,
+            consistency_proofs: c.consistency_proofs,
         }
     }
 }

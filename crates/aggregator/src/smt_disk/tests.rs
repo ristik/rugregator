@@ -119,8 +119,6 @@ fn rollback_leaves_db_unchanged() {
 #[test]
 fn commit_then_reload_root_survives() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_str().unwrap();
-
     let pairs = batch(6);
     let committed_root;
 

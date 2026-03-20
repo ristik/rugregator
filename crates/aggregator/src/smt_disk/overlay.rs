@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use super::node_key::NodeKey;
 
 /// Speculative write buffer for one round's SMT mutations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Overlay {
     /// NodeKey bytes → Some(serialized node) | None (tombstone)
     nodes: HashMap<Vec<u8>, Option<Vec<u8>>>,

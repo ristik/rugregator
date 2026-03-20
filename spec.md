@@ -68,3 +68,17 @@ Scaling beyond the available memory by inserting leaves and necessary nodes to R
 
 - Make the client request/reply loop callback based for efficiency (so that there is no polling for inclusion proof); this also needs updates at client sdk level; we're focusing on batch insertion performance now.
 - make the hashing algorithm configurable (sha256 is the default, we'd like to test other options' like blake3 performance).
+
+# The required end-state:
+
+0) There is no option without DB.
+1) In-memory SMT. Snapshots must be implemented by copy-on-write mechanism for maximum efficiency. The state is persisted using RocksDB,
+  with the goal of not losing state on crash or reset. This is the max. performance setup. Speculative execution is necessary - we must be
+  doing work while waiting for UC from BFT Core.
+2) The scale-to-disk option. Only necessary portion of leaves, internal nodes are kept in-memory. Most of the tree is on disk. Snapshots
+  implemented using DB specific technology. Caching for 1) reasonable performance of batch insertion, and 2) fast responses to near immediate
+  inclusion proof requests sent by clients who have just submitted (async) certification requests. This option is for scaling to maintain
+  possibly very large SMT with large number of leaves, while the performance is degrading gracefully while the tree is growing (and is much
+  larger than available memory).
+
+The options 1) and 2) are mutually exclusive and can be chosen at compile time. Initially we ignore how to convert between them.

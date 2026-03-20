@@ -7,7 +7,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 
 use crate::path::{bit_at, calculate_common_path, path_to_decimal, rsh, SmtPath};
-use crate::tree::{calc_branch_hash, calc_node_hash, SmtError, SparseMerkleTree};
+use crate::tree::{calc_node_hash, SmtError, SparseMerkleTree};
 use crate::types::{Branch, NodeBranch};
 
 // ─── Proof types ─────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ impl SparseMerkleTree {
         let root_hex = hex::encode(super::hash::build_imprint(&raw_root));
 
         // Generate proof steps (leaf-first).
-        let steps = generate_path(&mut self.root, path, true);
+        let steps = generate_path(&self.root, path, true);
 
         Ok(MerkleTreePath { root: root_hex, steps })
     }
@@ -71,7 +71,7 @@ impl SparseMerkleTree {
 /// Recursive proof generation.  Translates Go `generatePath`.
 ///
 /// Returns steps in leaf-first order (deepest first), to be collected bottom-up.
-fn generate_path(node: &mut NodeBranch, remaining_path: &SmtPath, is_root: bool) -> Vec<MerkleTreeStep> {
+fn generate_path(node: &NodeBranch, remaining_path: &SmtPath, is_root: bool) -> Vec<MerkleTreeStep> {
     // --- Compute effective path for this node (matches Go shard-root adjustment) ---
     let effective_path: SmtPath = if is_root && node.path.bits() > 1 {
         let pos = node.path.bits() as usize - 2;
@@ -82,8 +82,8 @@ fn generate_path(node: &mut NodeBranch, remaining_path: &SmtPath, is_root: bool)
     };
 
     // --- Compute child hashes ---
-    let left_hex: Option<String> = node.left.as_mut().map(|b| hex::encode(calc_branch_hash(b)));
-    let right_hex: Option<String> = node.right.as_mut().map(|b| hex::encode(calc_branch_hash(b)));
+    let left_hex: Option<String> = node.left.as_ref().map(|arc| hex::encode(crate::types::branch_hash_cached(arc)));
+    let right_hex: Option<String> = node.right.as_ref().map(|arc| hex::encode(crate::types::branch_hash_cached(arc)));
 
     // --- Check if path diverges before this node ---
     let cp = calculate_common_path(remaining_path, &node.path);
@@ -106,9 +106,9 @@ fn generate_path(node: &mut NodeBranch, remaining_path: &SmtPath, is_root: bool)
             path: path_to_decimal(&effective_path),
             data: left_hex,
         };
-        let sub_steps = match node.right.as_mut() {
+        let sub_steps = match node.right.as_ref() {
             None => vec![MerkleTreeStep { path: "1".into(), data: None }],
-            Some(right) => generate_path_branch(right, &sub_path),
+            Some(right) => generate_path_branch(&**right, &sub_path),
         };
         let mut steps = sub_steps;
         steps.push(node_step);
@@ -119,9 +119,9 @@ fn generate_path(node: &mut NodeBranch, remaining_path: &SmtPath, is_root: bool)
             path: path_to_decimal(&effective_path),
             data: right_hex,
         };
-        let sub_steps = match node.left.as_mut() {
+        let sub_steps = match node.left.as_ref() {
             None => vec![MerkleTreeStep { path: "0".into(), data: None }],
-            Some(left) => generate_path_branch(left, &sub_path),
+            Some(left) => generate_path_branch(&**left, &sub_path),
         };
         let mut steps = sub_steps;
         steps.push(node_step);
@@ -129,7 +129,7 @@ fn generate_path(node: &mut NodeBranch, remaining_path: &SmtPath, is_root: bool)
     }
 }
 
-fn generate_path_branch(branch: &mut Branch, remaining_path: &SmtPath) -> Vec<MerkleTreeStep> {
+fn generate_path_branch(branch: &Branch, remaining_path: &SmtPath) -> Vec<MerkleTreeStep> {
     match branch {
         Branch::Leaf(l) => {
             let path_str = path_to_decimal(&l.path);

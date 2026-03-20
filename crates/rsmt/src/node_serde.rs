@@ -239,13 +239,16 @@ mod tests {
 
     #[test]
     fn node_roundtrip_with_children_flags() {
+        use std::sync::Arc;
         use crate::types::{Branch, NodeBranch, LeafBranch};
-        let leaf = Box::new(Branch::Leaf(LeafBranch {
-            path: test_path(1),
-            original_path: test_path(1),
+        let path = test_path(1);
+        let hash = crate::hash::hash_leaf(&path, &[]);
+        let leaf = Arc::new(Branch::Leaf(LeafBranch {
+            path: path.clone(),
+            original_path: path.clone(),
             value: vec![],
             is_child: false,
-            hash_cache: None,
+            hash_cache: Some(hash),
         }));
         let node = NodeBranch {
             path: BigUint::from(3u8),

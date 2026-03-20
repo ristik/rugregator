@@ -14,6 +14,7 @@
 //!   `child_nk = NodeKey::from_depth_and_prefix(split + 1, child_acc)`
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use num_bigint::BigUint;
 use rsmt::{Branch, SparseMerkleTree};
 use rsmt::path::path_len;
@@ -54,10 +55,10 @@ pub fn persist_tree(
     let split       = n_path;      // routing bit for root's children
 
     if let Some(left) = &mut smt.root.left {
-        persist_branch(left, false, split, &base_acc, overlay, &mut new_keys);
+        persist_branch(Arc::make_mut(left), false, split, &base_acc, overlay, &mut new_keys);
     }
     if let Some(right) = &mut smt.root.right {
-        persist_branch(right, true, split, &base_acc, overlay, &mut new_keys);
+        persist_branch(Arc::make_mut(right), true, split, &base_acc, overlay, &mut new_keys);
     }
 
     // Tombstone old keys no longer in the tree.
@@ -111,10 +112,10 @@ fn persist_branch(
             new_keys.insert(nk.into_bytes());
 
             if let Some(left) = &mut n.left {
-                persist_branch(left, false, node_split, &base_acc, overlay, new_keys);
+                persist_branch(Arc::make_mut(left), false, node_split, &base_acc, overlay, new_keys);
             }
             if let Some(right) = &mut n.right {
-                persist_branch(right, true, node_split, &base_acc, overlay, new_keys);
+                persist_branch(Arc::make_mut(right), true, node_split, &base_acc, overlay, new_keys);
             }
         }
 

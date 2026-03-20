@@ -37,40 +37,38 @@ pub const CF_SMT_NODES: &str = "smt_nodes";
 
 /// Materialize a partial SMT for a batch insertion.
 ///
+/// `own_overlay`    — mutations accumulated by the current snapshot.
+/// `parent_overlay` — parent snapshot's overlay (for forked/speculative snapshots).
+///
 /// Returns `(working_tree, visited_node_keys)`.
-/// The working tree has `Branch::Stub` for untouched branches.
-/// `visited_node_keys` = all node keys loaded from DB during materialization
-/// (used by the persister to compute deletes after mutation).
 pub fn materialize_for_batch(
-    db:         &Arc<DB>,
-    cache:      &Arc<Mutex<NodeCache>>,
-    overlay:    &Overlay,
-    batch:      &[(SmtPath, Vec<u8>)],
-    key_length: usize,
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    batch:          &[(SmtPath, Vec<u8>)],
+    key_length:     usize,
 ) -> anyhow::Result<(SparseMerkleTree, Vec<NodeKey>)> {
     let root_nk = NodeKey::root();
     let mut visited = Vec::new();
 
-    let root_bytes = match load_bytes(db, cache, overlay, &root_nk)? {
+    let root_bytes = match load_bytes(db, cache, own_overlay, parent_overlay, &root_nk)? {
         None => {
-            // Empty tree.
             return Ok((SparseMerkleTree::with_key_length(key_length), vec![]));
         }
         Some(b) => b,
     };
     visited.push(root_nk);
 
-    // Root is always an internal node.
     let (mut root_node, has_left, has_right) = deserialize_node(&root_bytes);
     let n_path = path_len(&root_node.path);
-    let split  = n_path; // root start_bit = 0, so split = 0 + n_path = n_path
+    let split  = n_path;
 
-    // Common-prefix bits of root node, placed at absolute bit positions 0..n_path-1.
     let root_prefix_bits = extract_node_prefix_bits(&root_node.path, n_path);
-    let base_acc = root_prefix_bits.clone(); // acc = 0 | (root_prefix << 0) = root_prefix
+    let base_acc = root_prefix_bits.clone();
 
-    root_node.left  = if has_left  { materialize_at_split(db, cache, overlay, split, false, batch, &base_acc, &mut visited)? } else { None };
-    root_node.right = if has_right { materialize_at_split(db, cache, overlay, split, true,  batch, &base_acc, &mut visited)? } else { None };
+    root_node.left  = if has_left  { materialize_at_split(db, cache, own_overlay, parent_overlay, split, false, batch, &base_acc, &mut visited)? } else { None };
+    root_node.right = if has_right { materialize_at_split(db, cache, own_overlay, parent_overlay, split, true,  batch, &base_acc, &mut visited)? } else { None };
 
     let smt = SparseMerkleTree { key_length, root: root_node, parent_mode: false };
     Ok((smt, visited))
@@ -78,40 +76,36 @@ pub fn materialize_for_batch(
 
 /// Materialize a partial SMT for a single-leaf proof generation.
 pub fn materialize_for_proof(
-    db:         &Arc<DB>,
-    cache:      &Arc<Mutex<NodeCache>>,
-    overlay:    &Overlay,
-    leaf_key:   &SmtPath,
-    key_length: usize,
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    leaf_key:       &SmtPath,
+    key_length:     usize,
 ) -> anyhow::Result<SparseMerkleTree> {
-    // Treat the single key as a one-item batch.
     let batch = vec![(leaf_key.clone(), vec![])];
-    let (smt, _) = materialize_for_batch(db, cache, overlay, &batch, key_length)?;
+    let (smt, _) = materialize_for_batch(db, cache, own_overlay, parent_overlay, &batch, key_length)?;
     Ok(smt)
 }
 
 // ─── Core recursive materializer ──────────────────────────────────────────────
 
-/// Materialize the child whose routing bit is at `split`.
-/// `is_right` = 1 if the child is accessed via the right branch.
-/// `acc` = accumulated absolute prefix up to (but not including) bit `split`.
 fn materialize_at_split(
-    db:       &Arc<DB>,
-    cache:    &Arc<Mutex<NodeCache>>,
-    overlay:  &Overlay,
-    split:    usize,         // routing bit position
-    is_right: bool,
-    batch:    &[(SmtPath, Vec<u8>)],
-    acc:      &BigUint,      // bits 0..split-1 (common prefix of parent)
-    visited:  &mut Vec<NodeKey>,
-) -> anyhow::Result<Option<Box<Branch>>> {
-    // Filter batch to keys that route to this side.
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    split:          usize,
+    is_right:       bool,
+    batch:          &[(SmtPath, Vec<u8>)],
+    acc:            &BigUint,
+    visited:        &mut Vec<NodeKey>,
+) -> anyhow::Result<Option<std::sync::Arc<rsmt::Branch>>> {
     let child_batch: Vec<_> = batch.iter()
         .filter(|(k, _)| bit_at(k, split) == (is_right as u8))
         .cloned()
         .collect();
 
-    // Compute child's accumulated prefix and NodeKey.
     let child_acc = if is_right {
         acc | (BigUint::from(1u8) << split)
     } else {
@@ -120,88 +114,101 @@ fn materialize_at_split(
     let child_nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
 
     if child_batch.is_empty() {
-        // No batch keys go here → load just for hash, create Stub.
-        return load_as_stub(db, cache, overlay, child_nk);
+        return load_as_stub(db, cache, own_overlay, parent_overlay, child_nk);
     }
 
-    materialize_subtree(db, cache, overlay, child_nk, &child_batch, split, &child_acc, visited)
+    materialize_subtree(db, cache, own_overlay, parent_overlay, child_nk, &child_batch, split, &child_acc, visited)
 }
 
-/// Materialize the subtree rooted at `nk`.
-/// `start_bit` = routing bit position that led us here (= split of parent).
-/// `acc`       = accumulated prefix bits 0..start_bit (inclusive of routing bit).
 fn materialize_subtree(
-    db:        &Arc<DB>,
-    cache:     &Arc<Mutex<NodeCache>>,
-    overlay:   &Overlay,
-    nk:        NodeKey,
-    batch:     &[(SmtPath, Vec<u8>)],
-    start_bit: usize,
-    acc:       &BigUint,
-    visited:   &mut Vec<NodeKey>,
-) -> anyhow::Result<Option<Box<Branch>>> {
-    let bytes = match load_bytes(db, cache, overlay, &nk)? {
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    nk:             NodeKey,
+    batch:          &[(SmtPath, Vec<u8>)],
+    start_bit:      usize,
+    acc:            &BigUint,
+    visited:        &mut Vec<NodeKey>,
+) -> anyhow::Result<Option<std::sync::Arc<rsmt::Branch>>> {
+    let bytes = match load_bytes(db, cache, own_overlay, parent_overlay, &nk)? {
         None => return Ok(None),
         Some(b) => b,
     };
     visited.push(nk);
 
     if bytes[0] == TAG_LEAF {
-        let leaf = deserialize_leaf(&bytes);
-        return Ok(Some(Box::new(Branch::Leaf(leaf))));
+        let mut leaf_br = deserialize_leaf(&bytes);
+        if leaf_br.hash_cache.is_none() {
+            use rsmt::tree::calc_leaf_hash;
+            leaf_br.hash_cache = Some(calc_leaf_hash(&mut leaf_br));
+        }
+        return Ok(Some(std::sync::Arc::new(Branch::Leaf(leaf_br))));
     }
 
     debug_assert_eq!(bytes[0], TAG_NODE);
     let (mut node, has_left, has_right) = deserialize_node(&bytes);
     let n_path = path_len(&node.path);
 
-    // Go convention: child's start_bit = parent's split (routing bit not pre-consumed).
-    // The node's common-prefix bits sit at absolute positions start_bit..start_bit+n_path-1.
     let prefix_bits = extract_node_prefix_bits(&node.path, n_path);
     let base_acc = acc | (prefix_bits << start_bit);
-    let split = start_bit + n_path; // routing bit for children
+    let split = start_bit + n_path;
 
-    node.left  = if has_left  { materialize_at_split(db, cache, overlay, split, false, batch, &base_acc, visited)? } else { None };
-    node.right = if has_right { materialize_at_split(db, cache, overlay, split, true,  batch, &base_acc, visited)? } else { None };
+    node.left  = if has_left  { materialize_at_split(db, cache, own_overlay, parent_overlay, split, false, batch, &base_acc, visited)? } else { None };
+    node.right = if has_right { materialize_at_split(db, cache, own_overlay, parent_overlay, split, true,  batch, &base_acc, visited)? } else { None };
 
-    Ok(Some(Box::new(Branch::Node(node))))
+    if node.hash_cache.is_none() {
+        use rsmt::tree::calc_node_hash;
+        calc_node_hash(&mut node);
+    }
+    Ok(Some(std::sync::Arc::new(Branch::Node(node))))
 }
 
-/// Load a node just to get its hash for a `Branch::Stub`.
 fn load_as_stub(
-    db:      &Arc<DB>,
-    cache:   &Arc<Mutex<NodeCache>>,
-    overlay: &Overlay,
-    nk:      NodeKey,
-) -> anyhow::Result<Option<Box<Branch>>> {
-    let bytes = match load_bytes(db, cache, overlay, &nk)? {
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    nk:             NodeKey,
+) -> anyhow::Result<Option<std::sync::Arc<rsmt::Branch>>> {
+    let bytes = match load_bytes(db, cache, own_overlay, parent_overlay, &nk)? {
         None => return Ok(None),
         Some(b) => b,
     };
     let hash = extract_hash_from_bytes(&bytes)?;
-    Ok(Some(Box::new(Branch::Stub(hash))))
+    Ok(Some(std::sync::Arc::new(Branch::Stub(hash))))
 }
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────
 
+/// Load node bytes, checking overlays before cache/DB.
+///
+/// Read priority: `own_overlay → parent_overlay → cache → RocksDB`.
 pub fn load_bytes(
-    db:      &Arc<DB>,
-    cache:   &Arc<Mutex<NodeCache>>,
-    overlay: &Overlay,
-    nk:      &NodeKey,
+    db:             &Arc<DB>,
+    cache:          &Arc<Mutex<NodeCache>>,
+    own_overlay:    &Overlay,
+    parent_overlay: Option<&Overlay>,
+    nk:             &NodeKey,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    // Overlay first.
-    if let Some(opt) = overlay.get(nk) {
+    // 1. Own overlay first.
+    if let Some(opt) = own_overlay.get(nk) {
         return Ok(opt.map(|b| b.to_vec()));
     }
-    // Cache.
+    // 2. Parent overlay (for forked/speculative snapshots).
+    if let Some(parent) = parent_overlay {
+        if let Some(opt) = parent.get(nk) {
+            return Ok(opt.map(|b| b.to_vec()));
+        }
+    }
+    // 3. Cache.
     {
         let mut c = cache.lock().unwrap();
         if let Some(bytes) = c.get(nk) {
             return Ok(Some(bytes.clone()));
         }
     }
-    // RocksDB.
+    // 4. RocksDB.
     let cf = db.cf_handle(CF_SMT_NODES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
     match db.get_cf(&cf, nk.as_bytes())? {
@@ -216,8 +223,6 @@ pub fn load_bytes(
 
 // ─── Bit-extraction helpers ───────────────────────────────────────────────────
 
-/// Extract the `n_common` data bits from a sentinel-encoded path.
-/// Returns the lower `n_common` bits as a BigUint (bit 0 = LSB).
 pub fn extract_node_prefix_bits(path: &SmtPath, n_common: usize) -> BigUint {
     if n_common == 0 {
         return BigUint::ZERO;
