@@ -212,7 +212,10 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                 Ok((inserted_pairs, proof)) => {
                     let inserted_set: std::collections::HashSet<_> =
                         inserted_pairs.iter().map(|(p, _)| p.clone()).collect();
-                    let flags: Vec<bool> = batch.iter().map(|(p, _)| inserted_set.contains(p)).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let flags: Vec<bool> = batch.iter()
+                        .map(|(p, _)| inserted_set.contains(p) && seen.insert(p.clone()))
+                        .collect();
                     self.pending.extend(inserted_pairs);
                     let proof_cbor = consistency_proof_to_cbor(&proof);
                     Ok((flags, Some(proof_cbor)))
@@ -224,7 +227,12 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                 Ok(inserted_pairs) => {
                     let inserted_set: std::collections::HashSet<_> =
                         inserted_pairs.iter().map(|(p, _)| p.clone()).collect();
-                    let flags: Vec<bool> = batch.iter().map(|(p, _)| inserted_set.contains(p)).collect();
+                    // Only the first occurrence of each path gets flag=true;
+                    // subsequent duplicates within the same batch are skipped.
+                    let mut seen = std::collections::HashSet::new();
+                    let flags: Vec<bool> = batch.iter()
+                        .map(|(p, _)| inserted_set.contains(p) && seen.insert(p.clone()))
+                        .collect();
                     self.pending.extend(inserted_pairs);
                     Ok((flags, None))
                 }

@@ -1,7 +1,7 @@
 //! Live BFT Core committer using libp2p.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -82,20 +82,23 @@ mod opt_bytes {
 
 // ─── BFT round state ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
-struct BftRound {
+/// Authoritative reference from the last valid UC.
+/// Updated from EVERY valid UC (sync, cert response, repeat).
+#[derive(Debug, Clone)]
+struct LastUc {
+    /// TechnicalRecord.Round — the round number to use in the next cert request.
     next_round: u64,
     epoch: u64,
-    prev_certified_hash: Option<Vec<u8>>,
-    /// UnicitySeal.Timestamp from the last received UC — must be echoed in cert requests.
-    last_uc_timestamp: u64,
-    initialized: bool,
+    /// InputRecord.Hash — the certified state hash (becomes previous_hash in next request).
+    prev_hash: Option<Vec<u8>>,
+    /// UnicitySeal.Timestamp — must be echoed verbatim in the next cert request.
+    timestamp: u64,
 }
 
 // ─── Shared state between the committer and the network task ──────────────────
 
 struct Shared {
-    round: Mutex<BftRound>,
+    initialized: AtomicBool,
     /// block_number → oneshot receiver (set in commit_block, awaited in wait_for_uc)
     blk_receivers: Mutex<HashMap<u64, oneshot::Receiver<Vec<u8>>>>,
     init_notify: Notify,
@@ -122,7 +125,7 @@ struct PendingCert {
     state_changed: bool,
     zk_proof: Option<Vec<u8>>,
     uc_tx: oneshot::Sender<Vec<u8>>,
-    /// Round used in the last transmission (updated on each retry).
+    /// BFT round used when this cert request was sent.
     bft_round_used: u64,
 }
 
@@ -250,7 +253,7 @@ impl LiveBftCommitter {
         swarm.listen_on(cfg.listen_addr.clone())?;
 
         let shared = Arc::new(Shared {
-            round: Mutex::new(BftRound::default()),
+            initialized: AtomicBool::new(false),
             blk_receivers: Mutex::new(HashMap::new()),
             init_notify: Notify::new(),
         });
@@ -274,7 +277,7 @@ impl LiveBftCommitter {
 
     async fn wait_init(&self) {
         loop {
-            if self.shared.round.lock().unwrap().initialized { return; }
+            if self.shared.initialized.load(Ordering::Acquire) { return; }
             self.shared.init_notify.notified().await;
         }
     }
@@ -496,13 +499,21 @@ async fn network_loop(
     let mut pending: Option<PendingCert> = None;
     // Reconnect timer: fires after a delay when a reconnect is needed.
     let mut reconnect_delay: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    // Single source of truth for building the next cert request.
+    // Updated from EVERY valid UC (sync, cert response, repeat).
+    let mut last_uc: Option<LastUc> = None;
 
     loop {
+        // `biased` ensures swarm events (including incoming UCs) are always
+        // drained before we accept a new Submit from the channel.  This
+        // prevents using a stale round when multiple UCs are queued.
         tokio::select! {
+            biased;
+
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == bft_peer => {
-                        reconnect_delay = None; // cancel any pending reconnect
+                        reconnect_delay = None;
                         info!("Connected to BFT Core {}", peer_id);
                         if !hs_sent {
                             let h = Handshake { partition_id, shard_id: vec![0x80], node_id: node_id.clone() };
@@ -525,66 +536,46 @@ async fn network_loop(
                         let ev = match parse_uc(&request) { Some(e) => e, None => continue };
                         info!(uc_round = ev.uc_round, next_round = ev.next_round, epoch = ev.epoch, "UC received from BFT Core");
 
-                        // Update shared round tracker
-                        {
-                            let mut r = shared.round.lock().unwrap();
-                            r.next_round = ev.next_round;
-                            r.epoch = ev.epoch;
-                            if ev.timestamp > 0 { r.last_uc_timestamp = ev.timestamp; }
-                            if let Some(ref h) = ev.prev_hash {
-                                if !h.is_empty() { r.prev_certified_hash = Some(h.clone()); }
-                            }
-                            if !r.initialized { r.initialized = true; }
-                        }
-                        shared.init_notify.notify_waiters();
+                        // Always update last_uc from every valid UC.
+                        last_uc = Some(LastUc {
+                            next_round: ev.next_round,
+                            epoch: ev.epoch,
+                            prev_hash: ev.prev_hash.clone(),
+                            timestamp: ev.timestamp,
+                        });
 
-                        if ev.uc_round > 0 {
-                            // This is a response to one of our cert requests.
-                            if let Some(ref p) = pending {
-                                if ev.uc_round == p.bft_round_used {
-                                    info!(bft_round = ev.uc_round, "UC matched — cert request certified");
-                                    let p = pending.take().unwrap();
-                                    let _ = p.uc_tx.send(ev.uc_cbor);
-                                }
-                            }
-                        } else {
-                            // Sync (proactive) UC — BFT Core telling us the current next_round.
-                            // If we have a pending cert request and BFT Core has moved past the
-                            // round we submitted, retry with the fresh round.
-                            if let Some(ref mut p) = pending {
-                                if ev.next_round > p.bft_round_used {
-                                    let new_round = ev.next_round;
-                                    let new_epoch = ev.epoch;
-                                    let (prev_hash_ir, ts) = {
-                                        let r = shared.round.lock().unwrap();
-                                        (r.prev_certified_hash.clone(), r.last_uc_timestamp)
-                                    };
-                                    warn!(
-                                        old_round = p.bft_round_used,
-                                        new_round,
-                                        "BFT Core advanced, retrying cert request"
-                                    );
-                                    match make_cert_cbor(p, new_round, new_epoch, prev_hash_ir, ts,
-                                                         partition_id, &node_id, &secp, &sig_key) {
-                                        Ok(cbor) => {
-                                            p.bft_round_used = new_round;
-                                            swarm.behaviour_mut().cert.send_request(&bft_peer, cbor);
-                                        }
-                                        Err(e) => error!("retry: failed to build cert req: {e}"),
-                                    }
-                                }
+                        // Signal initialization on first valid UC.
+                        if !shared.initialized.swap(true, Ordering::AcqRel) {
+                            shared.init_notify.notify_waiters();
+                        }
+
+                        // Handle pending cert: check match first, then stale detection.
+                        if let Some(ref p) = pending {
+                            if ev.uc_round > 0 && ev.uc_round == p.bft_round_used {
+                                // Our cert request was certified.
+                                info!(bft_round = ev.uc_round, "UC matched — cert request certified");
+                                let p = pending.take().unwrap();
+                                let _ = p.uc_tx.send(ev.uc_cbor);
+                            } else if ev.next_round > p.bft_round_used {
+                                // BFT Core moved past our round — pending is stale.
+                                warn!(
+                                    our_round = p.bft_round_used,
+                                    bft_next_round = ev.next_round,
+                                    "pending cert stale — dropping"
+                                );
+                                let p = pending.take().unwrap();
+                                // uc_tx dropped → wait_for_uc error → round manager re-queues.
+                                drop(p);
                             }
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == bft_peer => {
                         warn!("BFT Core connection closed: {:?}", cause);
                         hs_sent = false;
-                        // Delay before reconnecting to avoid TCP TIME_WAIT / AddrInUse errors.
                         reconnect_delay = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_secs(2))));
                     }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
                         warn!("Connection error, will retry: {:?}", error);
-                        // Back off before retrying so we don't thrash on persistent errors.
                         reconnect_delay = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3))));
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -593,7 +584,7 @@ async fn network_loop(
                     _ => {}
                 }
             }
-            // Reconnect timer: dial BFT Core after a backoff delay.
+            // Reconnect timer.
             () = async {
                 match reconnect_delay.as_mut() {
                     Some(d) => d.await,
@@ -604,15 +595,21 @@ async fn network_loop(
                 info!("Reconnecting to BFT Core at {}", bft_addr);
                 let _ = swarm.dial(bft_addr.clone());
             }
-            Some(cmd) = cmd_rx.recv() => {
+            // Accept a new Submit only when no cert request is in flight.
+            // `biased` above guarantees all pending UCs are drained first,
+            // so `last_uc` holds the freshest state.
+            Some(cmd) = cmd_rx.recv(), if pending.is_none() => {
                 match cmd {
                     NetCmd::Submit(data) => {
-                        // Read the freshest round state available right now.
-                        let (bft_round, epoch, prev_hash_ir, timestamp) = {
-                            let r = shared.round.lock().unwrap();
-                            (r.next_round, r.epoch, r.prev_certified_hash.clone(), r.last_uc_timestamp)
+                        let lu = match &last_uc {
+                            Some(lu) => lu,
+                            None => {
+                                error!("Submit received but no UC available — dropping");
+                                continue;
+                            }
                         };
 
+                        let bft_round = lu.next_round;
                         let p = PendingCert {
                             new_hash: data.new_hash,
                             state_changed: data.state_changed,
@@ -621,8 +618,8 @@ async fn network_loop(
                             bft_round_used: bft_round,
                         };
 
-                        match make_cert_cbor(&p, bft_round, epoch, prev_hash_ir, timestamp,
-                                             partition_id, &node_id, &secp, &sig_key) {
+                        match make_cert_cbor(&p, bft_round, lu.epoch, lu.prev_hash.clone(),
+                                             lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
                             Ok(cbor) => {
                                 info!(bft_round, "sending cert request to BFT Core");
                                 pending = Some(p);
@@ -630,7 +627,6 @@ async fn network_loop(
                             }
                             Err(e) => {
                                 error!("failed to build cert req: {e}");
-                                // uc_tx dropped → wait_for_uc will get an error.
                             }
                         }
                     }
