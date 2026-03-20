@@ -23,6 +23,16 @@ impl SmtSnapshot {
         self.inner.add_leaf(path, value)
     }
 
+    /// Insert a batch without generating a proof (fast path).
+    ///
+    /// Returns only the actually-inserted (path, value) pairs (duplicates excluded).
+    pub fn batch_insert(
+        &mut self,
+        batch: &[(SmtPath, Vec<u8>)],
+    ) -> Result<Vec<(SmtPath, Vec<u8>)>, super::tree::SmtError> {
+        super::consistency::batch_insert(&mut self.inner, batch)
+    }
+
     /// Insert a batch and generate a consistency proof.
     ///
     /// Returns `(inserted_items, proof)` where `inserted_items` contains only

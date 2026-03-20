@@ -15,7 +15,6 @@ use rsmt::path::{bit_at, path_len};
 use crate::traits::{SmtStore, SmtStoreSnapshot};
 use crate::disk::materializer::{CF_SMT_NODES, extract_node_prefix_bits};
 use crate::disk::node_key::NodeKey;
-use crate::disk::overlay::Overlay;
 
 const CF_SMT_META:       &str = "smt_meta";
 pub const CF_SMT_LEAVES: &str = "smt_leaves";
@@ -193,10 +192,9 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
             }
 
             PersistMode::Full => {
-                let paths: Vec<SmtPath> = pending.iter().map(|(p, _)| p.clone()).collect();
                 inner.commit(&mut store.tree);
                 store.current_root = store.tree.root_hash_imprint();
-                persist_full(&db, &pending, &paths, &mut store.tree, store.current_root)?;
+                persist_full(&db, &pending, &mut store.tree, store.current_root)?;
             }
         }
         Ok(())
@@ -222,15 +220,16 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof failed: {e}")),
             }
         } else {
-            let mut flags = vec![false; batch.len()];
-            for (i, (path, value)) in batch.iter().enumerate() {
-                match self.add_leaf(path.clone(), value.clone()) {
-                    Ok(()) => flags[i] = true,
-                    Err(SmtError::DuplicateLeaf) => {}
-                    Err(e) => return Err(anyhow::anyhow!("{e}")),
+            match self.inner.batch_insert(batch) {
+                Ok(inserted_pairs) => {
+                    let inserted_set: std::collections::HashSet<_> =
+                        inserted_pairs.iter().map(|(p, _)| p.clone()).collect();
+                    let flags: Vec<bool> = batch.iter().map(|(p, _)| inserted_set.contains(p)).collect();
+                    self.pending.extend(inserted_pairs);
+                    Ok((flags, None))
                 }
+                Err(e) => Err(anyhow::anyhow!("batch_insert failed: {e}")),
             }
-            Ok((flags, None))
         }
     }
 }
@@ -258,15 +257,15 @@ fn persist_leaves_and_root(
     Ok(())
 }
 
-/// Serialize nodes along the insertion paths into `CF_SMT_NODES`,
+/// Serialize nodes along insertion paths directly into a WriteBatch,
 /// append leaves to `CF_SMT_LEAVES`, and update `CF_SMT_META` — all atomically.
 ///
-/// Only nodes on the insertion paths are written (O(batch_size × depth)),
-/// leaving untouched subtrees (Stubs) in the DB as-is.
+/// Writes only nodes that lie on the insertion paths (O(batch_size × depth)).
+/// Untouched subtrees are left as-is in the DB. No tombstoning needed: the
+/// insert-only tree never orphans NodeKeys.
 fn persist_full(
     db: &DB,
     pending: &[(SmtPath, Vec<u8>)],
-    paths: &[SmtPath],
     tree: &mut SparseMerkleTree,
     root: [u8; 34],
 ) -> anyhow::Result<()> {
@@ -277,77 +276,71 @@ fn persist_full(
     let cf_meta = db.cf_handle(CF_SMT_META)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_META))?;
 
-    // Walk post-commit tree along insertion paths only.
-    let mut overlay = Overlay::new();
-    persist_along_paths(tree, paths, &mut overlay);
-
     let mut batch = WriteBatch::default();
+
+    // Leaves.
     for (path, value) in pending {
         batch.put_cf(&cf_leaves, path.to_bytes_be(), value);
     }
-    for (key, val_opt) in overlay.into_nodes() {
-        match val_opt {
-            Some(val) => batch.put_cf(&cf_nodes, &key, &val),
-            None      => batch.delete_cf(&cf_nodes, &key),
-        }
-    }
+
+    // Walk post-commit tree along insertion paths, writing directly to WriteBatch.
+    let path_refs: Vec<&SmtPath> = pending.iter().map(|(p, _)| p).collect();
+    persist_paths_to_batch(tree, &path_refs, &cf_nodes, &mut batch);
+
     batch.put_cf(&cf_meta, KEY_ROOT_HASH, &root);
     db.write(batch)?;
     Ok(())
 }
 
-// ─── Path-guided persistence ──────────────────────────────────────────────────
+// ─── Path-guided persistence (directly to WriteBatch) ────────────────────────
 
-/// Serialize only the nodes that lie on insertion paths into `overlay`.
+/// Serialize only the nodes that lie on insertion paths into `batch`.
 ///
-/// NodeKeys encode absolute positions in key space.  Since MemSmt is
-/// insert-only, path splits reuse or create NodeKeys but never orphan them,
-/// so no tombstoning is required.  Untouched subtrees (Stub branches) are
-/// left in the DB as-is.
-fn persist_along_paths(
-    tree:    &mut SparseMerkleTree,
-    paths:   &[SmtPath],
-    overlay: &mut Overlay,
+/// Uses `&[&SmtPath]` references for routing (no BigUint cloning per level).
+fn persist_paths_to_batch(
+    tree:  &mut SparseMerkleTree,
+    paths: &[&SmtPath],
+    cf:    &impl rocksdb::AsColumnFamilyRef,
+    batch: &mut WriteBatch,
 ) {
-    // Always fill root hash cache and write root — its hash changes every round.
     calc_node_hash(&mut tree.root);
     let root_nk = NodeKey::root();
-    overlay.put(&root_nk, serialize_node(&tree.root));
+    batch.put_cf(cf, root_nk.as_bytes(), &serialize_node(&tree.root));
 
     if paths.is_empty() {
         return;
     }
 
-    let n_path      = path_len(&tree.root.path);
-    let prefix_bits = extract_node_prefix_bits(&tree.root.path, n_path);
-    let base_acc    = prefix_bits;
-    let split       = n_path;
+    let n_path   = path_len(&tree.root.path);
+    let base_acc = extract_node_prefix_bits(&tree.root.path, n_path);
+    let split    = n_path;
 
     if let Some(left) = &mut tree.root.left {
-        let left_paths: Vec<_> = paths.iter()
+        let left_paths: Vec<&SmtPath> = paths.iter()
             .filter(|p| bit_at(p, split) == 0)
-            .cloned().collect();
+            .copied().collect();
         if !left_paths.is_empty() {
-            persist_branch_guided(Arc::make_mut(left), false, split, &base_acc, &left_paths, overlay);
+            persist_branch_to_batch(Arc::make_mut(left), false, split, &base_acc, &left_paths, cf, batch);
         }
     }
     if let Some(right) = &mut tree.root.right {
-        let right_paths: Vec<_> = paths.iter()
+        let right_paths: Vec<&SmtPath> = paths.iter()
             .filter(|p| bit_at(p, split) == 1)
-            .cloned().collect();
+            .copied().collect();
         if !right_paths.is_empty() {
-            persist_branch_guided(Arc::make_mut(right), true, split, &base_acc, &right_paths, overlay);
+            persist_branch_to_batch(Arc::make_mut(right), true, split, &base_acc, &right_paths, cf, batch);
         }
     }
 }
 
-fn persist_branch_guided(
+fn persist_branch_to_batch(
     branch:   &mut Branch,
     is_right: bool,
     split:    usize,
     acc:      &BigUint,
-    paths:    &[SmtPath],
-    overlay:  &mut Overlay,
+    paths:    &[&SmtPath],
+    cf:       &impl rocksdb::AsColumnFamilyRef,
+    batch:    &mut WriteBatch,
 ) {
     let child_acc = if is_right {
         acc | (BigUint::from(1u8) << split)
@@ -361,7 +354,7 @@ fn persist_branch_guided(
             if l.hash_cache.is_none() {
                 l.hash_cache = Some(calc_leaf_hash(l));
             }
-            overlay.put(&nk, serialize_leaf(l));
+            batch.put_cf(cf, nk.as_bytes(), &serialize_leaf(l));
         }
 
         Branch::Node(n) => {
@@ -372,22 +365,22 @@ fn persist_branch_guided(
             let base_acc    = &child_acc | (prefix_bits << split);
             let node_split  = split + n_path;
 
-            overlay.put(&nk, serialize_node(n));
+            batch.put_cf(cf, nk.as_bytes(), &serialize_node(n));
 
             if let Some(left) = &mut n.left {
-                let left_paths: Vec<_> = paths.iter()
+                let left_paths: Vec<&SmtPath> = paths.iter()
                     .filter(|p| bit_at(p, node_split) == 0)
-                    .cloned().collect();
+                    .copied().collect();
                 if !left_paths.is_empty() {
-                    persist_branch_guided(Arc::make_mut(left), false, node_split, &base_acc, &left_paths, overlay);
+                    persist_branch_to_batch(Arc::make_mut(left), false, node_split, &base_acc, &left_paths, cf, batch);
                 }
             }
             if let Some(right) = &mut n.right {
-                let right_paths: Vec<_> = paths.iter()
+                let right_paths: Vec<&SmtPath> = paths.iter()
                     .filter(|p| bit_at(p, node_split) == 1)
-                    .cloned().collect();
+                    .copied().collect();
                 if !right_paths.is_empty() {
-                    persist_branch_guided(Arc::make_mut(right), true, node_split, &base_acc, &right_paths, overlay);
+                    persist_branch_to_batch(Arc::make_mut(right), true, node_split, &base_acc, &right_paths, cf, batch);
                 }
             }
         }

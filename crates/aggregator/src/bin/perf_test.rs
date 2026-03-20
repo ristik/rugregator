@@ -153,20 +153,14 @@ fn measure_round<S: SmtStore>(
 ) -> anyhow::Result<Row> {
     let batch_size = batch.len();
     let mut snap   = store.create_snapshot();
-    let mut inserted = 0usize;
-
     // ── Insert + root hash ────────────────────────────────────────────────────
-    // For DiskSmtSnapshot: add_leaf is O(1) (deferred); root_hash_imprint()
-    // triggers flush_pending() which materialises the batch from RocksDB,
+    // Uses insert_batch (matches the real aggregator's start_round flow).
+    // For DiskSmtSnapshot: defers, then flush_pending() materialises from DB,
     // runs batch_insert, computes root, and builds the overlay.
-    // For MemSmtSnapshot: add_leaf modifies the in-memory snapshot; root_hash_imprint
-    // is cheap (already cached).
+    // For MemSmtSnapshot with batch_insert: sorted single-pass insertion.
     let t_ins = Instant::now();
-    for (path, value) in batch {
-        if snap.add_leaf(path.clone(), value.clone()).is_ok() {
-            inserted += 1;
-        }
-    }
+    let (flags, _proof) = snap.insert_batch(batch, false)?;
+    let inserted = flags.iter().filter(|&&f| f).count();
     let _ = snap.root_hash_imprint()?;
     let insert_dur = t_ins.elapsed();
 
