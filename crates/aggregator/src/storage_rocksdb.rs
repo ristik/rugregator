@@ -88,7 +88,7 @@ impl Store for RocksDbStore {
 
         for r in records {
             let key = hex::decode(&r.state_id_hex)?;
-            let val = encode_record(r.block_number, &r.cert_data, &r.merkle_path_cbor);
+            let val = encode_record(r.block_number, &r.cert_data, r.merkle_path_cbor.as_deref().unwrap_or(&[]));
             batch.put_cf(&cf_records, &key, &val);
         }
 
@@ -147,7 +147,7 @@ fn decode_record(key: &[u8], val: &[u8]) -> anyhow::Result<(String, RecordInfo)>
     Ok((state_id_hex, RecordInfo {
         block_number,
         cert_data: CertDataFields { predicate_cbor, source_state_hash, transaction_hash, witness },
-        merkle_path_cbor,
+        merkle_path_cbor: Some(merkle_path_cbor),
     }))
 }
 

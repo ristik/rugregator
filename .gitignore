@@ -12,8 +12,9 @@ target/
 **/*.rs.bk
 *.pdb
 
-# Python
+# Python & nodejs
 __pycache__/
+node_modules/
 
 # IDE
 .vscode/

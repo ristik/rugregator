@@ -33,6 +33,14 @@ impl SmtSnapshot {
         *target = self.inner;
     }
 
+    /// Fork this snapshot into an independent copy for the next speculative block.
+    ///
+    /// The fork starts from the same state as `self`.  Both `self` and the fork
+    /// can then diverge independently; only one is ultimately committed.
+    pub fn fork(&self) -> Self {
+        Self { inner: self.inner.deep_clone() }
+    }
+
     /// Discard the snapshot (drop without committing).
     pub fn discard(self) {
         // Nothing to do — ownership dropped here.

@@ -494,12 +494,15 @@ async fn network_loop(
     let mut hs_sent = false;
     // Cert request currently in flight (awaiting UC from BFT Core).
     let mut pending: Option<PendingCert> = None;
+    // Reconnect timer: fires after a delay when a reconnect is needed.
+    let mut reconnect_delay: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == bft_peer => {
+                        reconnect_delay = None; // cancel any pending reconnect
                         info!("Connected to BFT Core {}", peer_id);
                         if !hs_sent {
                             let h = Handshake { partition_id, shard_id: vec![0x80], node_id: node_id.clone() };
@@ -559,7 +562,7 @@ async fn network_loop(
                                     warn!(
                                         old_round = p.bft_round_used,
                                         new_round,
-                                        "BFT Core advanced — retrying cert request"
+                                        "BFT Core advanced, retrying cert request"
                                     );
                                     match make_cert_cbor(p, new_round, new_epoch, prev_hash_ir, ts,
                                                          partition_id, &node_id, &secp, &sig_key) {
@@ -576,16 +579,30 @@ async fn network_loop(
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } if peer_id == bft_peer => {
                         warn!("BFT Core connection closed: {:?}", cause);
                         hs_sent = false;
-                        let _ = swarm.dial(bft_addr.clone());
+                        // Delay before reconnecting to avoid TCP TIME_WAIT / AddrInUse errors.
+                        reconnect_delay = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_secs(2))));
                     }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
-                        error!("Connection error: {:?}", error);
+                        warn!("Connection error, will retry: {:?}", error);
+                        // Back off before retrying so we don't thrash on persistent errors.
+                        reconnect_delay = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3))));
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("p2p listening on {}", address);
                     }
                     _ => {}
                 }
+            }
+            // Reconnect timer: dial BFT Core after a backoff delay.
+            () = async {
+                match reconnect_delay.as_mut() {
+                    Some(d) => d.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                reconnect_delay = None;
+                info!("Reconnecting to BFT Core at {}", bft_addr);
+                let _ = swarm.dial(bft_addr.clone());
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {

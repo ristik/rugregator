@@ -1,7 +1,7 @@
 //! JSON-RPC method handlers.
 
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::storage::AggregatorState;
 use super::cbor::{encode_inclusion_proof_response, parse_certification_request};
@@ -47,7 +47,7 @@ pub async fn handle_certification_request(
         &parsed.witness,
     )
     .map_err(|e| {
-        debug!("certification_request validation failed: {}", e.status);
+        info!(status = %e.status, "certification_request rejected");
         // Return the validation status string as the error message (matching Go behavior).
         JsonRpcError {
             code: JsonRpcError::INVALID_PARAMS,

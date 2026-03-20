@@ -1,13 +1,22 @@
-//! Round manager – sequential (non-speculative) round processing.
+//! Round manager – speculative round processing.
 //!
-//! State machine:
+//! State machine (in-memory path):
 //! ```text
-//! COLLECTING ──(timer | batch_limit)──> PROCESSING
-//!           ──> CERTIFYING ──(UC received)──> FINALIZING ──> COLLECTING
+//! COLLECTING ──(timer | batch_limit)──> start_round_in_memory()
+//!   acquires certified_smt lock briefly (snapshot creation), sends CR to BFT Core,
+//!   forks snapshot for next block, returns immediately (self.inflight = Some).
+//!
+//! INFLIGHT ──(requests arrive)──> inserted speculatively into spec_snap
+//!          ──(UC arrives via uc_rx)──> on_uc_result()
+//!              Case A: commits proposed_snap to certified_smt (brief lock), finalizes block,
+//!                      immediately promotes spec round (if non-empty).
+//!              Case B: discards both snapshots, re-queues all requests.
 //! ```
 //!
-//! BFT Core integration is via the `BftCommitter` trait.  A stub implementation
-//! is provided for testing; replace with the real libp2p-based committer.
+//! Proof generation is NOT pre-computed.  HTTP handlers call
+//! `AggregatorState::get_inclusion_proof`, which locks `certified_smt` and
+//! calls `get_path` on the latest certified tree.  The path root always equals
+//! the latest UC's `InputRecord.hash` by construction.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,12 +25,12 @@ use tokio::time;
 use tracing::{debug, info, warn, error};
 
 use crate::config::RoundConfig;
-use crate::smt::{SmtSnapshot, SparseMerkleTree, state_id_to_smt_path, MerkleTreePath};
-use crate::smt::proof::merkle_path_to_cbor;
+use crate::smt::{SmtSnapshot, SparseMerkleTree, state_id_to_smt_path};
 use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord};
 use crate::validation::ValidatedRequest;
 use crate::validation::state_id::compute_cert_data_hash_imprint;
 use crate::api::cbor::CertDataFields;
+#[cfg(feature = "rocksdb-storage")]
 use super::state::ProcessedRecord;
 use async_trait::async_trait;
 
@@ -274,21 +283,36 @@ fn stub_generate_uc(block_number: u64, new_root: &[u8; 34], private_key: [u8; 32
 
 /// Selects the SMT implementation used by the round manager.
 pub enum SmtBackend {
-    /// Pure in-memory tree (default).
-    InMemory(SparseMerkleTree),
+    /// Pure in-memory tree (shared with AggregatorState via `certified_smt`).
+    InMemory,
     /// Disk-backed tree via RocksDB (enabled by `rocksdb-storage` feature).
     #[cfg(feature = "rocksdb-storage")]
     DiskBacked(crate::smt_disk::DiskBackedSmt),
 }
 
-impl SmtBackend {
-    pub fn root_hash_imprint(&mut self) -> [u8; 34] {
-        match self {
-            SmtBackend::InMemory(smt) => smt.root_hash_imprint(),
-            #[cfg(feature = "rocksdb-storage")]
-            SmtBackend::DiskBacked(store) => store.root_hash_imprint(),
-        }
-    }
+// ─── InFlightRound ────────────────────────────────────────────────────────────
+
+/// State of a round that has been proposed to BFT Core and is awaiting its UC.
+///
+/// While waiting, incoming requests are inserted speculatively into `spec_snap`
+/// (a fork of `proposed_snap`).  On UC success both are kept; on rollback both
+/// are discarded and all requests are re-queued.
+struct InFlightRound {
+    block_number: u64,
+    /// New SMT root hash submitted for certification.
+    new_root: [u8; 34],
+    /// The snapshot that was proposed (committed on Case A success).
+    proposed_snap: SmtSnapshot,
+    /// Fork of `proposed_snap` accumulating the next block speculatively.
+    spec_snap: SmtSnapshot,
+    /// ALL requests attempted in this batch (for rollback re-queuing).
+    submitted_batch: Vec<ValidatedRequest>,
+    /// Requests successfully inserted into `proposed_snap` (for RecordInfo).
+    inserted: Vec<ValidatedRequest>,
+    /// ALL spec requests attempted (for rollback + next round).
+    spec_batch: Vec<ValidatedRequest>,
+    /// Spec requests successfully inserted into `spec_snap` (for RecordInfo).
+    spec_inserted: Vec<ValidatedRequest>,
 }
 
 // ─── RoundManager ─────────────────────────────────────────────────────────────
@@ -301,6 +325,17 @@ pub struct RoundManager {
     current_root: [u8; 34],
     state: Arc<AggregatorState>,
     bft: Arc<dyn BftCommitter>,
+    /// Shared reference to the latest certified SMT (also held by AggregatorState).
+    ///
+    /// Updated (under the mutex) after each successful round finalization.
+    /// HTTP handlers read this tree to generate on-demand inclusion proofs.
+    certified_smt: Arc<tokio::sync::Mutex<SparseMerkleTree>>,
+    /// In-flight round (Some while waiting for a UC from BFT Core).
+    inflight: Option<InFlightRound>,
+    /// Sender half of the UC notification channel (cloned into spawned tasks).
+    uc_tx: mpsc::Sender<anyhow::Result<Vec<u8>>>,
+    /// Receiver half of the UC notification channel.
+    uc_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
 }
 
 impl RoundManager {
@@ -310,16 +345,21 @@ impl RoundManager {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
     ) -> Self {
-        let mut smt = SparseMerkleTree::new();
-        let initial_root = smt.root_hash_imprint();
+        let certified_smt = state.certified_smt_arc();
+        let initial_root = SparseMerkleTree::new().root_hash_imprint();
+        let (uc_tx, uc_rx) = mpsc::channel(4);
         Self {
             config,
             request_rx,
             pending: Vec::new(),
-            smt: SmtBackend::InMemory(smt),
+            smt: SmtBackend::InMemory,
             current_root: initial_root,
             state,
             bft,
+            certified_smt,
+            inflight: None,
+            uc_tx,
+            uc_rx,
         }
     }
 
@@ -328,12 +368,22 @@ impl RoundManager {
         request_rx: mpsc::Receiver<ValidatedRequest>,
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
-        mut smt: SparseMerkleTree,
+        smt: SparseMerkleTree,
     ) -> Self {
-        let current_root = smt.root_hash_imprint();
+        let certified_smt = state.certified_smt_arc();
+        // Replace the empty tree in the Arc with the provided smt.
+        // This is called before any tasks run, so try_lock always succeeds.
+        let current_root = if let Ok(mut guard) = certified_smt.try_lock() {
+            *guard = smt;
+            guard.root_hash_imprint()
+        } else {
+            SparseMerkleTree::new().root_hash_imprint()
+        };
+        let (uc_tx, uc_rx) = mpsc::channel(4);
         Self {
             config, request_rx, pending: Vec::new(),
-            smt: SmtBackend::InMemory(smt), current_root, state, bft,
+            smt: SmtBackend::InMemory, current_root, state, bft,
+            certified_smt, inflight: None, uc_tx, uc_rx,
         }
     }
 
@@ -343,16 +393,21 @@ impl RoundManager {
         request_rx: mpsc::Receiver<ValidatedRequest>,
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
-        store: crate::smt_disk::DiskBackedSmt,
+        mut store: crate::smt_disk::DiskBackedSmt,
     ) -> Self {
         let current_root = store.root_hash_imprint();
+        let certified_smt = state.certified_smt_arc();
+        let (uc_tx, uc_rx) = mpsc::channel(4);
         Self {
             config, request_rx, pending: Vec::new(),
             smt: SmtBackend::DiskBacked(store), current_root, state, bft,
+            certified_smt, inflight: None, uc_tx, uc_rx,
         }
     }
 
-    /// Run the round manager event loop.  This task owns the SMT.
+    // ── Event loop ────────────────────────────────────────────────────────────
+
+    /// Run the round manager event loop.
     pub async fn run(mut self) {
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -360,146 +415,301 @@ impl RoundManager {
         loop {
             tokio::select! {
                 _ = timer.tick() => {
-                    if !self.pending.is_empty() {
-                        self.process_round().await;
+                    // Only start a new round when nothing is in-flight.
+                    if self.inflight.is_none() && !self.pending.is_empty() {
+                        self.start_round().await;
                     }
                 }
                 Some(req) = self.request_rx.recv() => {
-                    self.pending.push(req);
-                    if self.pending.len() >= self.config.batch_limit {
-                        self.process_round().await;
+                    if self.inflight.is_some() && matches!(self.smt, SmtBackend::InMemory) {
+                        // In-flight: insert speculatively into the next block's snapshot.
+                        self.insert_speculative(req);
+                    } else {
+                        self.pending.push(req);
+                        if self.inflight.is_none() && self.pending.len() >= self.config.batch_limit {
+                            self.start_round().await;
+                        }
                     }
+                }
+                Some(uc_result) = self.uc_rx.recv() => {
+                    self.on_uc_result(uc_result).await;
                 }
             }
         }
     }
 
-    async fn process_round(&mut self) {
+    // ── Round startup ─────────────────────────────────────────────────────────
+
+    /// Kick off a new round from `self.pending`.
+    ///
+    /// For the in-memory path: non-blocking — sets `self.inflight` and returns.
+    /// For the disk path: sequential — blocks until the round is fully finalized.
+    async fn start_round(&mut self) {
         let batch: Vec<ValidatedRequest> = std::mem::take(&mut self.pending);
-        if batch.is_empty() {
-            return;
-        }
+        if batch.is_empty() { return; }
 
         let block_number = self.state.current_block_number().await;
-        info!(block = block_number, count = batch.len(), "processing round");
+        info!(block = block_number, count = batch.len(), "starting round");
 
-        // Temporarily take ownership of the SMT backend so we can call &mut self methods.
-        let backend = std::mem::replace(&mut self.smt, SmtBackend::InMemory(SparseMerkleTree::new()));
-        match backend {
-            SmtBackend::InMemory(mut smt) => {
-                self.process_round_in_memory(&mut smt, batch, block_number).await;
-                self.smt = SmtBackend::InMemory(smt);
+        match self.smt {
+            SmtBackend::InMemory => {
+                self.start_round_in_memory(batch, block_number).await;
             }
             #[cfg(feature = "rocksdb-storage")]
-            SmtBackend::DiskBacked(store) => {
-                let new_store = self.process_round_disk(store, batch, block_number).await;
-                self.smt = SmtBackend::DiskBacked(new_store);
+            SmtBackend::DiskBacked(_) => {
+                let backend = std::mem::replace(&mut self.smt, SmtBackend::InMemory);
+                if let SmtBackend::DiskBacked(store) = backend {
+                    let new_store = self.process_round_disk(store, batch, block_number).await;
+                    self.smt = SmtBackend::DiskBacked(new_store);
+                }
             }
         }
     }
 
-    // ── In-memory path ────────────────────────────────────────────────────────
-
-    async fn process_round_in_memory(
+    /// Propose a round using the in-memory SMT (non-blocking).
+    ///
+    /// Briefly locks `certified_smt` to clone the current certified state into
+    /// a snapshot, inserts `batch`, then forks the snapshot for speculative
+    /// next-block work.  Spawns a task to await the UC and deliver it via
+    /// `uc_rx`.  Sets `self.inflight` and returns.
+    async fn start_round_in_memory(
         &mut self,
-        smt: &mut SparseMerkleTree,
         batch: Vec<ValidatedRequest>,
         block_number: u64,
     ) {
-        let mut snapshot = SmtSnapshot::create(smt);
-        let mut processed: Vec<ProcessedRecord> = Vec::with_capacity(batch.len());
+        // Create snapshot from the latest certified state (brief mutex lock).
+        let mut proposed_snap = {
+            let smt = self.certified_smt.lock().await;
+            SmtSnapshot::create(&*smt)
+        };
+
+        let mut inserted: Vec<ValidatedRequest> = Vec::with_capacity(batch.len());
 
         for req in &batch {
-            let path      = state_id_to_smt_path(&req.state_id);
+            let path       = state_id_to_smt_path(&req.state_id);
             let leaf_value = compute_cert_data_hash_imprint(
                 &req.predicate_cbor, &req.source_state_hash,
                 &req.transaction_hash, &req.witness,
             );
-
-            match snapshot.add_leaf(path.clone(), leaf_value.to_vec()) {
-                Ok(()) => {}
+            match proposed_snap.add_leaf(path, leaf_value.to_vec()) {
+                Ok(()) => { inserted.push(req.clone()); }
                 Err(crate::smt::SmtError::DuplicateLeaf) => {
                     debug!(state_id = %hex::encode(&req.state_id), "skipping existing leaf");
-                    continue;
                 }
                 Err(e) => {
-                    warn!(state_id = %hex::encode(&req.state_id), err = %e, "leaf insertion failed");
-                    continue;
+                    warn!(state_id = %hex::encode(&req.state_id), err = %e, "leaf insert failed");
                 }
             }
-
-            processed.push(ProcessedRecord {
-                state_id_hex: hex::encode(&req.state_id),
-                cert_data: CertDataFields {
-                    predicate_cbor:    req.predicate_cbor.clone(),
-                    source_state_hash: req.source_state_hash.clone(),
-                    transaction_hash:  req.transaction_hash.clone(),
-                    witness:           req.witness.clone(),
-                },
-                merkle_path: MerkleTreePath { root: String::new(), steps: vec![] },
-            });
         }
 
-        let new_root  = snapshot.root_hash_imprint();
+        let new_root  = proposed_snap.root_hash_imprint();
         let prev_root = self.current_root;
+
+        // Fork the proposed snapshot for speculative next-block work.
+        let spec_snap = proposed_snap.fork();
 
         if let Err(e) = self.bft.commit_block(block_number, &new_root, &prev_root, None).await {
             error!(block = block_number, err = %e, "commit_block failed — rolling back");
-            snapshot.discard();
+            proposed_snap.discard();
+            spec_snap.discard();
             self.pending.extend(batch);
             return;
         }
 
-        let uc_cbor = match self.bft.wait_for_uc(block_number).await {
-            Ok(uc) => uc,
-            Err(e) => {
-                error!(block = block_number, err = %e, "wait_for_uc failed — rolling back");
-                snapshot.discard();
-                self.pending.extend(batch);
-                return;
-            }
+        // Spawn a task to await the UC and deliver it via the channel.
+        let bft   = Arc::clone(&self.bft);
+        let uc_tx = self.uc_tx.clone();
+        tokio::spawn(async move {
+            let result = bft.wait_for_uc(block_number).await;
+            let _ = uc_tx.send(result).await;
+        });
+
+        info!(
+            block = block_number, count = batch.len(), root = %hex::encode(new_root),
+            "round proposed, waiting for UC (speculative next-block enabled)"
+        );
+
+        self.inflight = Some(InFlightRound {
+            block_number,
+            new_root,
+            proposed_snap,
+            spec_snap,
+            submitted_batch: batch,
+            inserted,
+            spec_batch:    Vec::new(),
+            spec_inserted: Vec::new(),
+        });
+    }
+
+    /// Immediately start the next round from a pre-built speculative snapshot.
+    ///
+    /// Called after a successful UC when `spec_batch` is non-empty.  Avoids
+    /// re-doing the SMT insertions already performed speculatively.
+    async fn start_round_from_spec(
+        &mut self,
+        block_number: u64,
+        mut spec_snap: SmtSnapshot,
+        spec_batch: Vec<ValidatedRequest>,
+        spec_inserted: Vec<ValidatedRequest>,
+    ) {
+        let new_root  = spec_snap.root_hash_imprint();
+        let prev_root = self.current_root;
+        let count     = spec_batch.len();
+
+        // Fork for the layer after this one.
+        let new_spec_snap = spec_snap.fork();
+
+        if let Err(e) = self.bft.commit_block(block_number, &new_root, &prev_root, None).await {
+            error!(block = block_number, err = %e, "commit_block (spec promotion) failed — rolling back");
+            spec_snap.discard();
+            new_spec_snap.discard();
+            self.pending.extend(spec_batch);
+            return;
+        }
+
+        let bft   = Arc::clone(&self.bft);
+        let uc_tx = self.uc_tx.clone();
+        tokio::spawn(async move {
+            let result = bft.wait_for_uc(block_number).await;
+            let _ = uc_tx.send(result).await;
+        });
+
+        info!(
+            block = block_number, count, root = %hex::encode(new_root),
+            "spec round promoted immediately, waiting for UC"
+        );
+
+        self.inflight = Some(InFlightRound {
+            block_number,
+            new_root,
+            proposed_snap:  spec_snap,
+            spec_snap:      new_spec_snap,
+            submitted_batch: spec_batch,
+            inserted:        spec_inserted,
+            spec_batch:      Vec::new(),
+            spec_inserted:   Vec::new(),
+        });
+
+        // Drain any pending requests into the new speculative layer.
+        let pending = std::mem::take(&mut self.pending);
+        for req in pending {
+            self.insert_speculative(req);
+        }
+    }
+
+    // ── Speculative insertion ─────────────────────────────────────────────────
+
+    /// Insert `req` speculatively into the in-flight round's `spec_snap`.
+    fn insert_speculative(&mut self, req: ValidatedRequest) {
+        let inf = match self.inflight.as_mut() {
+            Some(i) => i,
+            None => { self.pending.push(req); return; }
         };
 
-        snapshot.commit(smt);
-        self.current_root = new_root;
+        let path       = state_id_to_smt_path(&req.state_id);
+        let leaf_value = compute_cert_data_hash_imprint(
+            &req.predicate_cbor, &req.source_state_hash,
+            &req.transaction_hash, &req.witness,
+        );
 
-        let finalized = self.generate_proofs_in_memory(smt, &processed, block_number);
-        self.state.finalize_round(BlockInfo {
-            block_number, root_hash: new_root, uc_cbor,
-        }, finalized).await;
-
-        info!(block = block_number, root = %hex::encode(new_root), "round finalized");
-    }
-
-    fn generate_proofs_in_memory(
-        &self,
-        smt:        &mut SparseMerkleTree,
-        processed:  &[ProcessedRecord],
-        block_number: u64,
-    ) -> Vec<FinalizedRecord> {
-        let mut out = Vec::with_capacity(processed.len());
-        for pr in processed {
-            let state_id_bytes = hex::decode(&pr.state_id_hex).unwrap_or_default();
-            let smt_path = state_id_to_smt_path(&state_id_bytes);
-            let merkle_path = match smt.get_path(&smt_path) {
-                Ok(p) => p,
-                Err(e) => { warn!(state_id = %pr.state_id_hex, err = %e, "get_path failed"); continue; }
-            };
-            let merkle_path_cbor = match merkle_path_to_cbor(&merkle_path) {
-                Ok(b) => b,
-                Err(e) => { warn!(state_id = %pr.state_id_hex, err = %e, "cbor encode failed"); continue; }
-            };
-            out.push(FinalizedRecord {
-                state_id_hex: pr.state_id_hex.clone(),
-                block_number,
-                cert_data: pr.cert_data.clone(),
-                merkle_path_cbor,
-            });
+        match inf.spec_snap.add_leaf(path, leaf_value.to_vec()) {
+            Ok(()) => {
+                inf.spec_inserted.push(req.clone());
+                inf.spec_batch.push(req);
+            }
+            Err(crate::smt::SmtError::DuplicateLeaf) => {
+                debug!(state_id = %hex::encode(&req.state_id), "skipping duplicate in spec");
+            }
+            Err(e) => {
+                warn!(state_id = %hex::encode(&req.state_id), err = %e, "spec leaf insert failed");
+            }
         }
-        out
     }
 
-    // ── Disk-backed path ──────────────────────────────────────────────────────
+    // ── UC arrival ────────────────────────────────────────────────────────────
+
+    /// Handle the UC result for the current in-flight round.
+    ///
+    /// Case A (success): commits the proposed snapshot to `certified_smt` (briefly
+    /// locking the mutex), builds `FinalizedRecord`s (no pre-computed paths),
+    /// finalizes the block, then immediately promotes the speculative snapshot
+    /// as the next round (if non-empty).
+    ///
+    /// Case B (failure): discards both snapshots, re-queues all requests.
+    async fn on_uc_result(&mut self, uc_result: anyhow::Result<Vec<u8>>) {
+        let inf = match self.inflight.take() {
+            Some(i) => i,
+            None => { warn!("UC arrived but no inflight round"); return; }
+        };
+
+        match uc_result {
+            Ok(uc_cbor) => {
+                // Commit the proposed snapshot to the shared certified SMT.
+                // Proof generation in HTTP handlers will see this new root
+                // = inf.new_root = what the UC certifies.
+                {
+                    let mut smt = self.certified_smt.lock().await;
+                    inf.proposed_snap.commit(&mut *smt);
+                }
+                self.current_root = inf.new_root;
+
+                // Build FinalizedRecord for each successfully inserted request.
+                // merkle_path_cbor is None — generated on-demand at query time.
+                let finalized: Vec<FinalizedRecord> = inf.inserted.iter()
+                    .map(|req| FinalizedRecord {
+                        state_id_hex: hex::encode(&req.state_id),
+                        block_number: inf.block_number,
+                        cert_data: CertDataFields {
+                            predicate_cbor:    req.predicate_cbor.clone(),
+                            source_state_hash: req.source_state_hash.clone(),
+                            transaction_hash:  req.transaction_hash.clone(),
+                            witness:           req.witness.clone(),
+                        },
+                        merkle_path_cbor: None,
+                    })
+                    .collect();
+
+                let certified_count = finalized.len();
+                let submitted_count = inf.submitted_batch.len();
+                let spec_count      = inf.spec_batch.len();
+
+                self.state.finalize_round(BlockInfo {
+                    block_number: inf.block_number,
+                    root_hash: inf.new_root,
+                    uc_cbor,
+                }, finalized).await;
+
+                info!(
+                    block      = inf.block_number,
+                    root       = %hex::encode(inf.new_root),
+                    certified  = certified_count,
+                    submitted  = submitted_count,
+                    spec_queued = spec_count,
+                    "round finalized"
+                );
+
+                // Promote speculative work: immediately start the next round.
+                if !inf.spec_batch.is_empty() {
+                    let next_block = self.state.current_block_number().await;
+                    self.start_round_from_spec(
+                        next_block, inf.spec_snap, inf.spec_batch, inf.spec_inserted,
+                    ).await;
+                } else {
+                    inf.spec_snap.discard();
+                }
+            }
+            Err(e) => {
+                // UC failed (repeat UC / rollback) — discard speculative work.
+                error!(block = inf.block_number, err = %e, "UC failed — rolling back");
+                inf.proposed_snap.discard();
+                inf.spec_snap.discard();
+                self.pending.extend(inf.submitted_batch);
+                self.pending.extend(inf.spec_batch);
+            }
+        }
+    }
+
+    // ── Disk-backed path (sequential, no speculative execution) ───────────────
 
     #[cfg(feature = "rocksdb-storage")]
     async fn process_round_disk(
@@ -509,6 +719,7 @@ impl RoundManager {
         block_number: u64,
     ) -> crate::smt_disk::DiskBackedSmt {
         use crate::smt_disk::DiskSmtSnapshot;
+        use crate::smt::proof::merkle_path_to_cbor;
 
         let mut snapshot = DiskSmtSnapshot::create(&mut store);
         let mut processed: Vec<ProcessedRecord> = Vec::with_capacity(batch.len());
@@ -540,7 +751,6 @@ impl RoundManager {
                     transaction_hash:  req.transaction_hash.clone(),
                     witness:           req.witness.clone(),
                 },
-                merkle_path: MerkleTreePath { root: String::new(), steps: vec![] },
             });
         }
 
@@ -579,13 +789,15 @@ impl RoundManager {
         }
         self.current_root = new_root;
 
-        // Generate inclusion proofs.
+        // Generate and store inclusion proofs (disk path: precomputed, cached).
         let finalized = self.generate_proofs_disk(&store, &processed, block_number);
+        let certified_count = finalized.len();
+        let submitted_count = batch.len();
         self.state.finalize_round(BlockInfo {
             block_number, root_hash: new_root, uc_cbor,
         }, finalized).await;
 
-        info!(block = block_number, root = %hex::encode(new_root), "round finalized (disk)");
+        info!(block = block_number, root = %hex::encode(new_root), certified = certified_count, submitted = submitted_count, "round finalized (disk)");
         store
     }
 
@@ -597,6 +809,7 @@ impl RoundManager {
         block_number: u64,
     ) -> Vec<FinalizedRecord> {
         use crate::smt_disk::overlay::Overlay;
+        use crate::smt::proof::merkle_path_to_cbor;
         let empty = Overlay::new();
         let mut out = Vec::with_capacity(processed.len());
 
@@ -616,7 +829,7 @@ impl RoundManager {
                 state_id_hex: pr.state_id_hex.clone(),
                 block_number,
                 cert_data: pr.cert_data.clone(),
-                merkle_path_cbor,
+                merkle_path_cbor: Some(merkle_path_cbor),
             });
         }
         out

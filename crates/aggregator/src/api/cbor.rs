@@ -125,10 +125,10 @@ pub fn parse_certification_request(hex_cbor: &str) -> Result<ParsedCertification
 pub fn parse_certification_request_bytes(raw: &[u8]) -> Result<ParsedCertificationRequest, CborError> {
     let val = decode_cbor_value(raw)?;
     let arr = val_as_array(&val, "CertificationRequest")?;
-    if arr.len() < 4 {
+    if arr.len() < 3 {
         return Err(CborError::TypeMismatch {
             path: "CertificationRequest".into(),
-            msg: format!("expected ≥4 elements, got {}", arr.len()),
+            msg: format!("expected ≥3 elements, got {}", arr.len()),
         });
     }
 
