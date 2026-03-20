@@ -251,26 +251,32 @@ cargo test -p smt-store disk::tests::proof_equivalence
 Measures raw insertion throughput and proof-generation latency for each SMT backend in isolation, with no BFT Core or HTTP overhead.
 
 ```bash
-# In-memory (default)
+# Pure in-memory (fastest, no DB overhead)
 cargo run --release -p uni-aggregator --bin perf-test -- \
-  --rounds 6 --batch-sizes 1000,5000,10000
+  --backend mem --rounds 6 --batch-sizes 1000,5000,10000
 
-# Disk-backed
+# In-memory + leaf persistence (commit = leaf CF write)
 cargo run --release -p uni-aggregator --bin perf-test -- \
-  --backend disk --cache-capacity 500000 \
-  --rounds 6 --batch-sizes 1000,5000,10000
+  --backend mem-leaves --rounds 6 --batch-sizes 1000,5000,10000
 
-# In-memory with full node persistence
+# In-memory + full node persistence (commit = full node tree write)
 cargo run --release -p uni-aggregator --bin perf-test -- \
-  --backend mem-full \
-  --rounds 6 --batch-sizes 1000,5000,10000
+  --backend mem-full --rounds 6 --batch-sizes 1000,5000,10000
 
-# CSV output for plotting
+# Disk-backed (insert = materialise+insert+overlay; commit = RocksDB write)
+cargo run --release -p uni-aggregator --bin perf-test -- \
+  --backend disk --cache-capacity 500000 --rounds 6 --batch-sizes 1000,5000,10000
+
+# Small cache to force disk I/O on every round
+cargo run --release -p uni-aggregator --bin perf-test -- \
+  --backend disk --cache-capacity 1000 --rounds 6 --batch-sizes 10000
+
+# CSV output for all backends
 cargo run --release -p uni-aggregator --bin perf-test -- \
   --backend disk --rounds 8 --batch-sizes 1000,5000,10000,25000 --csv
 ```
 
-Each run inserts batches cumulatively so tree size grows across rounds, revealing how throughput degrades as the working set grows.
+If db file is specified `--db-path <fn>` then each run inserts batches cumulatively so tree size grows across rounds. Mixing different backends between runs (ie, converting db format) may work incidentally but is not in the scope right now.
 
 Reported columns:
 
@@ -384,44 +390,43 @@ The spec snapshot reads `own_overlay → parent_overlay → LRU cache → RocksD
 ```
 rugregator/
 ├── Cargo.toml                    # Workspace root
-├── crates/
-│   ├── rsmt/                     # Standalone SMT library
-│   │   └── src/
-│   │       ├── tree.rs           # Core insertion, hash caching
-│   │       ├── path.rs           # 272-bit sentinel-encoded paths
-│   │       ├── hash.rs           # Go-compatible SHA-256 / CBOR hashing
-│   │       ├── snapshot.rs       # O(1) copy-on-write snapshots (fork/commit/discard)
-│   │       ├── consistency.rs    # batch_insert_with_proof, ProofOp, CBOR encoding
-│   │       ├── proof.rs          # get_path, MerkleTreePath, CBOR wire format
-│   │       ├── node_serde.rs     # Compact binary node serialisation
-│   │       └── types.rs          # Branch, LeafBranch, NodeBranch, Stub
-│   ├── smt-store/                # SMT storage backends
-│   │   └── src/
-│   │       ├── traits.rs         # SmtStore + SmtStoreSnapshot traits
-│   │       ├── mem.rs            # MemSmt — fully in-memory (PersistMode: None/LeavesOnly/Full)
-│   │       └── disk/
-│   │           ├── store.rs      # DiskSmt — main disk-backed entry point
-│   │           ├── materializer.rs # Partial tree loading from RocksDB
-│   │           ├── persister.rs  # Post-mutation write-back
-│   │           ├── overlay.rs    # Speculative write buffer
-│   │           ├── cache.rs      # LRU node cache
-│   │           ├── snapshot.rs   # DiskSmtSnapshot (layered overlays)
-│   │           ├── node_key.rs   # Absolute bit-path DB keys
-│   │           └── tests.rs      # Equivalence, rollback, restart, proof tests
-│   └── aggregator/
-│       └── src/
-│           ├── main.rs           # Entry point, CLI, SMT backend wiring
-│           ├── config.rs         # Config (--smt-backend and all other flags)
-│           ├── storage.rs        # AggregatorState, on-demand proof generation
-│           ├── storage_rocksdb.rs# RocksDB Store impl (records, blocks, meta CFs)
-│           ├── api/              # HTTP server, JSON-RPC handlers, CBOR types
-│           ├── round/
-│           │   ├── manager.rs    # RoundManager<S: SmtStore>, speculative execution
-│           │   ├── live_committer.rs  # libp2p BFT Core connectivity
-│           │   └── state.rs      # ProcessedRecord
-│           ├── validation/       # Predicate, StateID, signature checks
-│           └── bin/
-│               └── perf_test.rs  # SMT benchmark across all backends
-├── aggregator-go/                # Go reference implementation
-└── state-transition-sdk/         # TypeScript client SDK
+├── scripts/...                   # Setup and testing scripts
+└── crates/
+    ├── rsmt/                     # Standalone SMT library
+    │   └── src/
+    │       ├── tree.rs           # Core insertion, hash caching
+    │       ├── path.rs           # 272-bit sentinel-encoded paths
+    │       ├── hash.rs           # Go-compatible SHA-256 / CBOR hashing
+    │       ├── snapshot.rs       # O(1) copy-on-write snapshots (fork/commit/discard)
+    │       ├── consistency.rs    # batch_insert_with_proof, ProofOp, CBOR encoding
+    │       ├── proof.rs          # get_path, MerkleTreePath, CBOR wire format
+    │       ├── node_serde.rs     # Compact binary node serialisation
+    │       └── types.rs          # Branch, LeafBranch, NodeBranch, Stub
+    ├── smt-store/                # SMT storage backends
+    │   └── src/
+    │       ├── traits.rs         # SmtStore + SmtStoreSnapshot traits
+    │       ├── mem.rs            # MemSmt — fully in-memory (PersistMode: None/LeavesOnly/Full)
+    │       └── disk/
+    │           ├── store.rs      # DiskSmt — main disk-backed entry point
+    │           ├── materializer.rs # Partial tree loading from RocksDB
+    │           ├── persister.rs  # Post-mutation write-back
+    │           ├── overlay.rs    # Speculative write buffer
+    │           ├── cache.rs      # LRU node cache
+    │           ├── snapshot.rs   # DiskSmtSnapshot (layered overlays)
+    │           ├── node_key.rs   # Absolute bit-path DB keys
+    │           └── tests.rs      # Equivalence, rollback, restart, proof tests
+    └── aggregator/
+        └── src/
+            ├── main.rs           # Entry point, CLI, SMT backend wiring
+            ├── config.rs         # Config (--smt-backend and all other flags)
+            ├── storage.rs        # AggregatorState, on-demand proof generation
+            ├── storage_rocksdb.rs# RocksDB Store impl (records, blocks, meta CFs)
+            ├── api/              # HTTP server, JSON-RPC handlers, CBOR types
+            ├── round/
+            │   ├── manager.rs    # RoundManager<S: SmtStore>, speculative execution
+            │   ├── live_committer.rs  # libp2p BFT Core connectivity
+            │   └── state.rs      # ProcessedRecord
+            ├── validation/       # Predicate, StateID, signature checks
+            └── bin/
+                └── perf_test.rs  # SMT benchmark across all backends
 ```

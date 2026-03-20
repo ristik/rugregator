@@ -9,17 +9,16 @@ use rsmt::{
     consistency_proof_to_cbor, KEY_LENGTH, calc_leaf_hash, calc_node_hash,
 };
 use rsmt::consistency::batch_insert;
-use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node};
-use rsmt::path::path_len;
+use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node, serialize_leaf, serialize_node};
+use rsmt::path::{bit_at, path_len};
 
 use crate::traits::{SmtStore, SmtStoreSnapshot};
 use crate::disk::materializer::{CF_SMT_NODES, extract_node_prefix_bits};
 use crate::disk::node_key::NodeKey;
 use crate::disk::overlay::Overlay;
-use crate::disk::persister::persist_tree;
 
-const CF_SMT_META:   &str = "smt_meta";
-const CF_SMT_LEAVES: &str = "smt_leaves";
+const CF_SMT_META:       &str = "smt_meta";
+pub const CF_SMT_LEAVES: &str = "smt_leaves";
 const KEY_ROOT_HASH: &[u8] = b"root_hash";
 
 // ─── PersistMode ──────────────────────────────────────────────────────────────
@@ -194,10 +193,10 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
             }
 
             PersistMode::Full => {
-                let old_keys = collect_all_node_keys(&store.tree);
+                let paths: Vec<SmtPath> = pending.iter().map(|(p, _)| p.clone()).collect();
                 inner.commit(&mut store.tree);
                 store.current_root = store.tree.root_hash_imprint();
-                persist_full(&db, &pending, &old_keys, &mut store.tree, store.current_root)?;
+                persist_full(&db, &pending, &paths, &mut store.tree, store.current_root)?;
             }
         }
         Ok(())
@@ -259,12 +258,15 @@ fn persist_leaves_and_root(
     Ok(())
 }
 
-/// Serialize all tree nodes into `CF_SMT_NODES`, tombstone orphaned nodes,
+/// Serialize nodes along the insertion paths into `CF_SMT_NODES`,
 /// append leaves to `CF_SMT_LEAVES`, and update `CF_SMT_META` — all atomically.
+///
+/// Only nodes on the insertion paths are written (O(batch_size × depth)),
+/// leaving untouched subtrees (Stubs) in the DB as-is.
 fn persist_full(
     db: &DB,
     pending: &[(SmtPath, Vec<u8>)],
-    old_keys: &[NodeKey],
+    paths: &[SmtPath],
     tree: &mut SparseMerkleTree,
     root: [u8; 34],
 ) -> anyhow::Result<()> {
@@ -275,9 +277,9 @@ fn persist_full(
     let cf_meta = db.cf_handle(CF_SMT_META)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_META))?;
 
-    // Walk the post-commit tree: serialize all nodes and compute tombstones.
+    // Walk post-commit tree along insertion paths only.
     let mut overlay = Overlay::new();
-    persist_tree(tree, old_keys, &mut overlay);
+    persist_along_paths(tree, paths, &mut overlay);
 
     let mut batch = WriteBatch::default();
     for (path, value) in pending {
@@ -294,52 +296,104 @@ fn persist_full(
     Ok(())
 }
 
-// ─── Node-key collection ──────────────────────────────────────────────────────
+// ─── Path-guided persistence ──────────────────────────────────────────────────
 
-/// Collect all `NodeKey`s currently in the tree (pre-commit snapshot).
-/// Used by `Full` mode to determine which nodes became orphaned after a round.
-fn collect_all_node_keys(tree: &SparseMerkleTree) -> Vec<NodeKey> {
-    let mut keys = Vec::new();
-    keys.push(NodeKey::root());
+/// Serialize only the nodes that lie on insertion paths into `overlay`.
+///
+/// NodeKeys encode absolute positions in key space.  Since MemSmt is
+/// insert-only, path splits reuse or create NodeKeys but never orphan them,
+/// so no tombstoning is required.  Untouched subtrees (Stub branches) are
+/// left in the DB as-is.
+fn persist_along_paths(
+    tree:    &mut SparseMerkleTree,
+    paths:   &[SmtPath],
+    overlay: &mut Overlay,
+) {
+    // Always fill root hash cache and write root — its hash changes every round.
+    calc_node_hash(&mut tree.root);
+    let root_nk = NodeKey::root();
+    overlay.put(&root_nk, serialize_node(&tree.root));
 
-    let n_path = path_len(&tree.root.path);
-    let acc    = extract_node_prefix_bits(&tree.root.path, n_path);
-    let split  = n_path;
-
-    if let Some(left) = &tree.root.left {
-        collect_branch_keys(left, false, split, &acc, &mut keys);
+    if paths.is_empty() {
+        return;
     }
-    if let Some(right) = &tree.root.right {
-        collect_branch_keys(right, true, split, &acc, &mut keys);
+
+    let n_path      = path_len(&tree.root.path);
+    let prefix_bits = extract_node_prefix_bits(&tree.root.path, n_path);
+    let base_acc    = prefix_bits;
+    let split       = n_path;
+
+    if let Some(left) = &mut tree.root.left {
+        let left_paths: Vec<_> = paths.iter()
+            .filter(|p| bit_at(p, split) == 0)
+            .cloned().collect();
+        if !left_paths.is_empty() {
+            persist_branch_guided(Arc::make_mut(left), false, split, &base_acc, &left_paths, overlay);
+        }
     }
-    keys
+    if let Some(right) = &mut tree.root.right {
+        let right_paths: Vec<_> = paths.iter()
+            .filter(|p| bit_at(p, split) == 1)
+            .cloned().collect();
+        if !right_paths.is_empty() {
+            persist_branch_guided(Arc::make_mut(right), true, split, &base_acc, &right_paths, overlay);
+        }
+    }
 }
 
-fn collect_branch_keys(
-    branch:   &Arc<Branch>,
+fn persist_branch_guided(
+    branch:   &mut Branch,
     is_right: bool,
     split:    usize,
     acc:      &BigUint,
-    keys:     &mut Vec<NodeKey>,
+    paths:    &[SmtPath],
+    overlay:  &mut Overlay,
 ) {
     let child_acc = if is_right {
         acc | (BigUint::from(1u8) << split)
     } else {
         acc.clone()
     };
-    keys.push(NodeKey::from_depth_and_prefix(split + 1, &child_acc));
+    let nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
 
-    if let Branch::Node(n) = branch.as_ref() {
-        let n_path      = path_len(&n.path);
-        let prefix_bits = extract_node_prefix_bits(&n.path, n_path);
-        let base_acc    = &child_acc | (prefix_bits << split);
-        let node_split  = split + n_path;
-
-        if let Some(left) = &n.left {
-            collect_branch_keys(left, false, node_split, &base_acc, keys);
+    match branch {
+        Branch::Leaf(l) => {
+            if l.hash_cache.is_none() {
+                l.hash_cache = Some(calc_leaf_hash(l));
+            }
+            overlay.put(&nk, serialize_leaf(l));
         }
-        if let Some(right) = &n.right {
-            collect_branch_keys(right, true, node_split, &base_acc, keys);
+
+        Branch::Node(n) => {
+            calc_node_hash(n);
+
+            let n_path      = path_len(&n.path);
+            let prefix_bits = extract_node_prefix_bits(&n.path, n_path);
+            let base_acc    = &child_acc | (prefix_bits << split);
+            let node_split  = split + n_path;
+
+            overlay.put(&nk, serialize_node(n));
+
+            if let Some(left) = &mut n.left {
+                let left_paths: Vec<_> = paths.iter()
+                    .filter(|p| bit_at(p, node_split) == 0)
+                    .cloned().collect();
+                if !left_paths.is_empty() {
+                    persist_branch_guided(Arc::make_mut(left), false, node_split, &base_acc, &left_paths, overlay);
+                }
+            }
+            if let Some(right) = &mut n.right {
+                let right_paths: Vec<_> = paths.iter()
+                    .filter(|p| bit_at(p, node_split) == 1)
+                    .cloned().collect();
+                if !right_paths.is_empty() {
+                    persist_branch_guided(Arc::make_mut(right), true, node_split, &base_acc, &right_paths, overlay);
+                }
+            }
+        }
+
+        Branch::Stub(_) => {
+            // Untouched subtree: already in DB, nothing to write.
         }
     }
 }
