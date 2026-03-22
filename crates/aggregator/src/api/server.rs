@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use tracing::info;
+use tracing::debug;
 
 use crate::storage::AggregatorState;
 use super::handlers::{
@@ -54,7 +54,7 @@ async fn jsonrpc_handler(
         return (StatusCode::OK, Json(serde_json::to_value(resp).unwrap()));
     }
 
-    info!(method = %req.method, "JSON-RPC request");
+    debug!(method = %req.method, "JSON-RPC request");
 
     let result = match req.method.as_str() {
         "certification_request" => {

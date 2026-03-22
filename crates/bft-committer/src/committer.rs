@@ -148,7 +148,8 @@ impl BftCommitter {
             version: 1,
             round_number, // Use BFT Core's round number from TechnicalRecord
             epoch,        // Use epoch from LUC
-            previous_hash, // CRITICAL: STATE HASH from LUC.InputRecord.Hash, or None for first block
+            previous_hash, // Currently: state hash from LUC.InputRecord.Hash, or None for first block
+               // TODO: make it actually match the last round's hash or FAIL
             hash: Some(new_state_root.as_bytes().to_vec()), // New state hash to be certified
             summary_value: Some(vec![]),                    // TODO: Calculate summary value
             timestamp,    // Timestamp from LUC.UnicitySeal

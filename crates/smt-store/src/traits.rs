@@ -21,6 +21,12 @@ pub trait SmtStore: Send + 'static {
             .map(|p| self.get_path(p))
             .collect()
     }
+
+    /// Persist internal state for graceful shutdown.
+    /// Default: no-op.  Override for backends that defer node persistence.
+    fn shutdown_persist(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A speculative snapshot of an [`SmtStore`].

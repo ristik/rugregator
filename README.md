@@ -97,6 +97,7 @@ Use `--smt-backend` to choose how the SMT tree is stored and recovered. All four
 |---------|------|---------------------|-------------------|
 | Pure in-memory | `--smt-backend mem` | No | State lost on restart; BFT partition state must be reset too |
 | In-memory + leaf persistence | `--smt-backend mem-leaves` | Yes | Replays all leaves from `smt_leaves` CF to rebuild tree; verifies root hash |
+| In-memory + leaf persistence + shutdown snapshot | `--smt-backend mem-leaves-x` | Yes | Like `mem-leaves` during operation; on graceful shutdown (ctrl+c / SIGTERM) saves full internal nodes for faster recovery on next start |
 | In-memory + full persistence | `--smt-backend mem-full` | Yes | Loads complete node tree from `smt_nodes` CF directly; faster restart than `mem-leaves` |
 | Fully disk-backed | `--smt-backend disk` | Yes | Only root hash loaded at start; nodes materialised on demand from RocksDB |
 
@@ -109,6 +110,12 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --db-path /var/lib/aggregator/db \
   --smt-backend mem-leaves
 
+# In-memory with leaf persistence + shutdown snapshot (best balance)
+cargo run --release -p uni-aggregator --bin aggregator -- \
+  --bft-mode stub \
+  --db-path /var/lib/aggregator/db \
+  --smt-backend mem-leaves-x
+
 # In-memory with full node persistence (fastest restart)
 cargo run --release -p uni-aggregator --bin aggregator -- \
   --bft-mode stub \
@@ -120,7 +127,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --bft-mode stub \
   --db-path /var/lib/aggregator/db \
   --smt-backend disk \
-  --cache-capacity 1000000
+  --cache-mb 256
 ```
 
 ### Live BFT Core
@@ -151,8 +158,8 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--bft-mode` | `AGGREGATOR_BFT_MODE` | `stub` | `stub` or `live` |
 | `--consistency-proofs` | `AGGREGATOR_CONSISTENCY_PROOFS` | `false` | Attach consistency proof to each CR |
 | `--db-path` | `AGGREGATOR_DB_PATH` | _(empty)_ | RocksDB directory; empty = in-memory only |
-| `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-full`, or `disk` |
-| `--cache-capacity` | `AGGREGATOR_CACHE_CAPACITY` | `500000` | Disk-SMT LRU node cache size (nodes) |
+| `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, or `disk` |
+| `--cache-mb` | `AGGREGATOR_CACHE_MB` | `0` | RocksDB block cache size in MB (0 = RocksDB default ~8 MB) |
 | `--partition-id` | `AGGREGATOR_PARTITION_ID` | `1` | BFT Core partition ID |
 | `--bft-peer-id` | `AGGREGATOR_BFT_PEER_ID` | | BFT Core root node peer ID |
 | `--bft-addr` | `AGGREGATOR_BFT_ADDR` | `/ip4/127.0.0.1/tcp/26652` | BFT Core multiaddr |
@@ -265,18 +272,18 @@ cargo run --release -p uni-aggregator --bin perf-test -- \
 
 # Disk-backed (insert = materialise+insert+overlay; commit = RocksDB write)
 cargo run --release -p uni-aggregator --bin perf-test -- \
-  --backend disk --cache-capacity 500000 --rounds 6 --batch-sizes 1000,5000,10000
+  --backend disk --cache-mb 256 --rounds 6 --batch-sizes 1000,5000,10000
 
 # Small cache to force disk I/O on every round
 cargo run --release -p uni-aggregator --bin perf-test -- \
-  --backend disk --cache-capacity 1000 --rounds 6 --batch-sizes 10000
+  --backend disk --cache-mb 1 --rounds 6 --batch-sizes 10000
 
 # CSV output for all backends
 cargo run --release -p uni-aggregator --bin perf-test -- \
   --backend disk --rounds 8 --batch-sizes 1000,5000,10000,25000 --csv
 ```
 
-If db file is specified `--db-path <fn>` then each run inserts batches cumulatively so tree size grows across rounds. Mixing different backends between runs (ie, converting db format) may work incidentally but is not in the scope right now.
+If db file is specified `--db-path <fn>` then each run inserts batches cumulatively so tree size grows across runs. Mixing backends on different runs works on sensible cases, for example, it is possible to start with `mem-leaves-x`, write internal nodes at exit, and then switch to `disk`.
 
 Reported columns:
 
@@ -329,11 +336,12 @@ All four SMT backends (`mem`, `mem-leaves`, `mem-full`, `disk`) share a single `
 
 ### Configurable SMT persistence
 
-`MemSmt` supports three persistence modes, selectable at startup:
+`MemSmt` supports four persistence modes, selectable at startup:
 
 - **`None`** (`--smt-backend mem`): no writes to RocksDB; fastest per-round commit, but no crash recovery. BFT Core partition state must also be reset on restart.
 - **`LeavesOnly`** (`--smt-backend mem-leaves`): leaf values are appended to the `smt_leaves` column family on every commit. On restart, all leaves are replayed through `batch_insert` to reconstruct the tree, and the resulting root is compared against the last certified root stored in `smt_meta`. Recovery time is O(n × log n) in the number of leaves.
-- **`Full`** (`--smt-backend mem-full`): leaves and all internal nodes are written to `smt_nodes` on every commit. Nodes that become orphaned during a round (when an existing node is pushed down by a new sibling) are **immediately tombstoned** at commit time by diffing the pre-commit and post-commit node-key sets. On restart, the full tree is loaded directly from `smt_nodes` — O(n) I/O, no recomputation.
+- **`LeavesWithShutdownSnapshot`** (`--smt-backend mem-leaves-x`): identical to `LeavesOnly` during normal operation (low per-round commit overhead). On graceful shutdown (SIGINT / SIGTERM), the entire in-memory tree is persisted to `smt_nodes` in a single atomic write. On next startup, if `smt_nodes` contains data, the tree is loaded directly (O(n) I/O) instead of replaying leaves; the node data is then cleaned up so subsequent per-round commits remain leaves-only. Both `mem-leaves` and `mem-leaves-x` automatically detect and use full-node data if present (e.g. from a previous `mem-full` or `mem-leaves-x` run).
+- **`Full`** (`--smt-backend mem-full`): leaves and all internal nodes are written to `smt_nodes` on every commit. On restart, the full tree is loaded directly from `smt_nodes` — O(n) I/O, no recomputation.
 
 ### Consistency proofs for trustless operation
 
@@ -405,7 +413,7 @@ rugregator/
     ├── smt-store/                # SMT storage backends
     │   └── src/
     │       ├── traits.rs         # SmtStore + SmtStoreSnapshot traits
-    │       ├── mem.rs            # MemSmt — fully in-memory (PersistMode: None/LeavesOnly/Full)
+    │       ├── mem.rs            # MemSmt — fully in-memory (PersistMode: None/LeavesOnly/LeavesWithShutdownSnapshot/Full)
     │       └── disk/
     │           ├── store.rs      # DiskSmt — main disk-backed entry point
     │           ├── materializer.rs # Partial tree loading from RocksDB

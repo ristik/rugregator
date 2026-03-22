@@ -13,16 +13,17 @@
 //!   cargo run --release --bin perf-test [options]
 //!
 //! Options:
-//!   --backend NAME        mem | mem-leaves | mem-full | disk  (default: mem)
+//!   --backend NAME        mem | mem-leaves | mem-leaves-x | mem-full | disk  (default: mem)
 //!   --rounds N            Rounds per batch-size run            (default: 6)
 //!   --seed S              PRNG seed                            (default: random)
 //!   --proof-sample N      Proofs sampled per round             (default: 200)
 //!   --batch-sizes X,Y,..  Comma-separated sizes                (default: 1000,5000,10000)
-//!   --cache-capacity N    RocksDB block cache bytes for SMT CF  (default: 0 = RocksDB default)
+//!   --cache-mb N          RocksDB block cache size in MB         (default: 0 = RocksDB default)
 //!   --db-path PATH        Fixed DB directory; default = fresh temp dir per sweep
 //!   --csv                 Also emit CSV rows
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
@@ -32,6 +33,26 @@ use smt_store::{SmtStore, SmtStoreSnapshot};
 use uni_aggregator::smt::{SmtPath, state_id_to_smt_path};
 use uni_aggregator::validation::state_id::compute_cert_data_hash_imprint;
 
+// ─── Ctrl+C ──────────────────────────────────────────────────────────────────
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn interrupted() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+fn install_ctrl_c_handler() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async { tokio::signal::ctrl_c().await.ok(); });
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        eprintln!("\nctrl+c received, finishing current round...");
+    });
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 struct Config {
@@ -40,7 +61,7 @@ struct Config {
     seed:           u64,
     proof_sample:   usize,
     batch_sizes:    Vec<usize>,
-    cache_capacity: usize,
+    cache_mb: usize,
     db_path:        String,
     csv:            bool,
 }
@@ -53,7 +74,7 @@ impl Default for Config {
             seed:           0, // resolved in parse_args
             proof_sample:   200,
             batch_sizes:    vec![1_000, 5_000, 10_000],
-            cache_capacity: 0,
+            cache_mb: 0,
             db_path:        String::new(),
             csv:            false,
         }
@@ -70,7 +91,7 @@ fn parse_args() -> Config {
             "--rounds"          => { if let Some(v) = args.next() { cfg.rounds          = v.parse().unwrap_or(cfg.rounds); } }
             "--seed"            => { if let Some(v) = args.next() { seed_override       = v.parse().ok(); } }
             "--proof-sample"    => { if let Some(v) = args.next() { cfg.proof_sample    = v.parse().unwrap_or(cfg.proof_sample); } }
-            "--cache-capacity"  => { if let Some(v) = args.next() { cfg.cache_capacity  = v.parse().unwrap_or(cfg.cache_capacity); } }
+            "--cache-mb"        => { if let Some(v) = args.next() { cfg.cache_mb        = v.parse().unwrap_or(cfg.cache_mb); } }
             "--db-path"         => { if let Some(v) = args.next() { cfg.db_path = v; } }
             "--batch-sizes"     => {
                 if let Some(v) = args.next() {
@@ -232,6 +253,16 @@ fn print_row(row: &Row, csv: bool) {
     }
 }
 
+fn do_shutdown_persist<S: SmtStore>(store: &mut S) {
+    print!("persisting SMT state for faster recovery...");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let t = Instant::now();
+    match store.shutdown_persist() {
+        Ok(()) => println!("  done in {}", fmt_dur(t.elapsed())),
+        Err(e) => println!("  FAILED: {e}"),
+    }
+}
+
 // ─── Generic runner ───────────────────────────────────────────────────────────
 
 /// Run all batch-size sweeps against a single store instance.
@@ -248,10 +279,12 @@ fn run_sweeps<S: SmtStore>(store: &mut S, cfg: &Config, label: &str, initial_pre
     let mut pre_fill = initial_prefill;
 
     for &batch_size in &cfg.batch_sizes {
+        if interrupted() { break; }
         print_header(label, batch_size);
         let mut rng = StdRng::seed_from_u64(cfg.seed);
 
         for round in 0..cfg.rounds {
+            if interrupted() { break; }
             let batch = gen_leaves(batch_size, &mut rng);
             let mut proof_rng = StdRng::seed_from_u64(
                 cfg.seed.wrapping_add(round as u64 * 999_983)
@@ -282,13 +315,15 @@ fn temp_db_path(tag: &str, sweep: usize) -> std::path::PathBuf {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
+    install_ctrl_c_handler();
     let cfg = parse_args();
+    let cache_bytes = cfg.cache_mb * 1024 * 1024;
 
     println!("SMT Performance Benchmark  [{}]", cfg.backend);
     println!("  rounds={}, seed={}, proof_sample={}", cfg.rounds, cfg.seed, cfg.proof_sample);
     println!("  batch_sizes={:?}", cfg.batch_sizes);
     if cfg.backend != "mem" {
-        println!("  cache_capacity={}", cfg.cache_capacity);
+        println!("  cache_mb={}", cfg.cache_mb);
         if !cfg.db_path.is_empty() {
             println!("  db_path={}", cfg.db_path);
         }
@@ -304,23 +339,29 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Persistent in-memory backends ─────────────────────────────────────
-        "mem-leaves" | "mem-full" => {
+        "mem-leaves" | "mem-leaves-x" | "mem-full" => {
             use smt_store::mem::PersistMode;
-            let mode  = if cfg.backend == "mem-leaves" { PersistMode::LeavesOnly } else { PersistMode::Full };
+            let mode = match cfg.backend.as_str() {
+                "mem-leaves"   => PersistMode::LeavesOnly,
+                "mem-leaves-x" => PersistMode::LeavesWithShutdownSnapshot,
+                _              => PersistMode::Full,
+            };
             let label = cfg.backend.as_str();
 
             if cfg.db_path.is_empty() {
                 // Temp mode: fresh DB per batch-size sweep, cleaned up after.
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
+                    if interrupted() { break; }
                     let tmp = temp_db_path(label, sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
-                    let arc_db = open_db(&db_path, cfg.cache_capacity)?;
+                    let arc_db = open_db(&db_path, cache_bytes)?;
                     let mut store = smt_store::MemSmt::open(arc_db, mode)?;
 
                     print_header(label, batch_size);
                     let mut pre_fill = 0usize;
                     let mut rng = StdRng::seed_from_u64(cfg.seed);
                     for round in 0..cfg.rounds {
+                        if interrupted() { break; }
                         let batch = gen_leaves(batch_size, &mut rng);
                         let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
                         let row = measure_round(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
@@ -328,11 +369,15 @@ fn main() -> anyhow::Result<()> {
                         pre_fill += row.inserted;
                     }
                     println!();
+                    if interrupted() {
+                        do_shutdown_persist(&mut store);
+                        break;
+                    }
                     let _ = std::fs::remove_dir_all(&db_path);
                 }
             } else {
                 // Persistent mode: load once, run all sweeps on the same tree, keep DB.
-                let arc_db = open_db(&cfg.db_path, cfg.cache_capacity)?;
+                let arc_db = open_db(&cfg.db_path, cache_bytes)?;
                 let existing = count_leaves_in_db(&arc_db);
 
                 print!("Loading {} leaves from '{}'...", existing, cfg.db_path);
@@ -345,6 +390,7 @@ fn main() -> anyhow::Result<()> {
                 println!();
 
                 run_sweeps(&mut store, &cfg, label, existing);
+                do_shutdown_persist(&mut store);
             }
         }
 
@@ -353,15 +399,17 @@ fn main() -> anyhow::Result<()> {
             if cfg.db_path.is_empty() {
                 // Temp mode: fresh DB per batch-size sweep, cleaned up after.
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
+                    if interrupted() { break; }
                     let tmp = temp_db_path("disk", sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
-                    let arc_db = open_db(&db_path, cfg.cache_capacity)?;
-                    let mut store = smt_store::DiskSmt::open(arc_db, cfg.cache_capacity)?;
+                    let arc_db = open_db(&db_path, cache_bytes)?;
+                    let mut store = smt_store::DiskSmt::open(arc_db, cache_bytes)?;
 
                     print_header("disk", batch_size);
                     let mut pre_fill = 0usize;
                     let mut rng = StdRng::seed_from_u64(cfg.seed);
                     for round in 0..cfg.rounds {
+                        if interrupted() { break; }
                         let batch = gen_leaves(batch_size, &mut rng);
                         let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
                         let row = measure_round(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
@@ -370,16 +418,17 @@ fn main() -> anyhow::Result<()> {
                     }
                     println!();
                     let _ = std::fs::remove_dir_all(&db_path);
+                    if interrupted() { break; }
                 }
             } else {
                 // Persistent mode: open once (root hash only; nodes are lazy), keep DB.
-                let arc_db = open_db(&cfg.db_path, cfg.cache_capacity)?;
+                let arc_db = open_db(&cfg.db_path, cache_bytes)?;
                 let existing = count_leaves_in_db(&arc_db);
 
                 print!("Opening disk-SMT '{}' ({} persisted leaves)...", cfg.db_path, existing);
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 let t_open = Instant::now();
-                let mut store = smt_store::DiskSmt::open(Arc::clone(&arc_db), cfg.cache_capacity)?;
+                let mut store = smt_store::DiskSmt::open(Arc::clone(&arc_db), cache_bytes)?;
                 let open_dur = t_open.elapsed();
                 println!("  done in {}", fmt_dur(open_dur));
                 println!("  root = {}", hex::encode(smt_store::SmtStore::root_hash_imprint(&store)));
@@ -390,7 +439,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         other => anyhow::bail!(
-            "unknown backend '{other}' — supported: mem, mem-leaves, mem-full, disk"
+            "unknown backend '{other}' — supported: mem, mem-leaves, mem-leaves-x, mem-full, disk"
         ),
     }
 

@@ -46,7 +46,7 @@ pub struct InputRecord {
     pub block_hash: Option<Vec<u8>>,        // Hash of the block (can be nil)
     pub sum_of_earned_fees: u64,    // Sum of fees
     #[serde(with = "option_bytes_helper")]
-    pub et_hash: Option<Vec<u8>>,           // Hash of executed transactions (can be nil)
+    pub et_hash: Option<Vec<u8>>,           // WTF is that?
 }
 
 impl InputRecord {

@@ -52,10 +52,10 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_DB_PATH", default_value = "")]
     pub db_path: String,
 
-    /// RocksDB block cache size in bytes for the SMT nodes column family.
+    /// RocksDB block cache size in megabytes for the SMT nodes column family.
     /// Set to 0 to use RocksDB's default (~8 MB).
-    #[arg(long, env = "AGGREGATOR_CACHE_CAPACITY", default_value_t = 0)]
-    pub cache_capacity: usize,
+    #[arg(long, env = "AGGREGATOR_CACHE_MB", default_value_t = 0)]
+    pub cache_mb: usize,
 
     /// Send a consistency proof (zk_proof) to BFT Core with each round.
     ///
@@ -67,12 +67,14 @@ pub struct Config {
 
     /// SMT backend selection.
     ///
-    /// - `"mem"`        — pure in-memory; state lost on restart
-    /// - `"mem-leaves"` — in-memory + persist leaf values (requires `--db-path`);
-    ///                    on restart replays all leaves to rebuild the tree
-    /// - `"mem-full"`   — in-memory + persist leaves and internal nodes (requires `--db-path`);
-    ///                    on restart loads the full node tree directly
-    /// - `"disk"`       — fully disk-backed SMT (default when `--db-path` is set)
+    /// - `"mem"`          — pure in-memory; state lost on restart
+    /// - `"mem-leaves"`   — in-memory + persist leaf values (requires `--db-path`);
+    ///                      on restart replays all leaves to rebuild the tree
+    /// - `"mem-leaves-x"` — like `mem-leaves`, but on graceful shutdown (SIGINT/SIGTERM)
+    ///                      saves internal nodes for faster recovery on next startup
+    /// - `"mem-full"`     — in-memory + persist leaves and internal nodes (requires `--db-path`);
+    ///                      on restart loads the full node tree directly
+    /// - `"disk"`         — fully disk-backed SMT (default when `--db-path` is set)
     ///
     /// Defaults to `"disk"` when `--db-path` is non-empty, `"mem"` otherwise.
     #[arg(long, env = "AGGREGATOR_SMT_BACKEND", default_value = "")]

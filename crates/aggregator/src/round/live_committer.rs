@@ -124,6 +124,8 @@ struct PendingCert {
     new_hash: Vec<u8>,
     state_changed: bool,
     zk_proof: Option<Vec<u8>>,
+    block_size: u64,
+    state_size: u64,
     uc_tx: oneshot::Sender<Vec<u8>>,
     /// BFT round used when this cert request was sent.
     bft_round_used: u64,
@@ -141,6 +143,8 @@ struct CertReqData {
     new_hash: Vec<u8>,
     state_changed: bool,
     zk_proof: Option<Vec<u8>>,
+    block_size: u64,
+    state_size: u64,
     /// Deliver the raw UC CBOR bytes to this sender once the UC arrives.
     uc_tx: oneshot::Sender<Vec<u8>>,
 }
@@ -248,7 +252,7 @@ impl LiveBftCommitter {
         let mut swarm = Swarm::new(
             transport, behaviour, local_peer,
             libp2p::swarm::Config::with_tokio_executor()
-                .with_idle_connection_timeout(std::time::Duration::from_secs(120)),
+                .with_idle_connection_timeout(std::time::Duration::from_secs(86400)),
         );
         swarm.listen_on(cfg.listen_addr.clone())?;
 
@@ -291,6 +295,8 @@ impl BftCommitter for LiveBftCommitter {
         new_root: &[u8; 34],
         prev_root: &[u8; 34],
         zk_proof: Option<Vec<u8>>,
+        block_size: u64,
+        state_size: u64,
     ) -> anyhow::Result<()> {
         self.wait_init().await;
 
@@ -311,6 +317,8 @@ impl BftCommitter for LiveBftCommitter {
             new_hash,
             state_changed,
             zk_proof,
+            block_size,
+            state_size,
             uc_tx: tx,
         };
 
@@ -470,7 +478,7 @@ fn make_cert_cbor(
     let mut req = BlockCertReq {
         partition_id, shard_id: vec![0x80], node_id: node_id.to_string(),
         input_record: ir, zk_proof: pending.zk_proof.clone(),
-        block_size: 0, state_size: 0, signature: None,
+        block_size: pending.block_size, state_size: pending.state_size, signature: None,
     };
     // Sign: compute digest of unsigned CBOR, then set signature
     req.signature = None;
@@ -492,7 +500,12 @@ async fn network_loop(
     sig_key: SecretKey,
 ) {
     let secp = Secp256k1::new();
-    let _ = swarm.dial(bft_addr.clone());
+    let _ = swarm.dial(
+        libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+            .address(bft_addr.clone())
+            .allocate_new_port()
+            .build(),
+    );
     info!("Dialing BFT Core at {}", bft_addr);
     let mut hs_sent = false;
     // Cert request currently in flight (awaiting UC from BFT Core).
@@ -593,7 +606,12 @@ async fn network_loop(
             } => {
                 reconnect_delay = None;
                 info!("Reconnecting to BFT Core at {}", bft_addr);
-                let _ = swarm.dial(bft_addr.clone());
+                let _ = swarm.dial(
+                    libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+                        .address(bft_addr.clone())
+                        .allocate_new_port()
+                        .build(),
+                );
             }
             // Accept a new Submit only when no cert request is in flight.
             // `biased` above guarantees all pending UCs are drained first,
@@ -614,6 +632,8 @@ async fn network_loop(
                             new_hash: data.new_hash,
                             state_changed: data.state_changed,
                             zk_proof: data.zk_proof,
+                            block_size: data.block_size,
+                            state_size: data.state_size,
                             uc_tx: data.uc_tx,
                             bft_round_used: bft_round,
                         };

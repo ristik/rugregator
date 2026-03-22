@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time;
 use tracing::{debug, info, warn, error};
 
@@ -42,6 +42,8 @@ pub trait BftCommitter: Send + Sync {
         new_root: &[u8; 34],
         prev_root: &[u8; 34],
         zk_proof: Option<Vec<u8>>,
+        block_size: u64,
+        state_size: u64,
     ) -> anyhow::Result<()>;
 
     /// Wait for the UnicityCertificate for `block_number`.
@@ -71,6 +73,8 @@ impl BftCommitter for BftCommitterStub {
         new_root: &[u8; 34],
         _prev_root: &[u8; 34],
         _zk_proof: Option<Vec<u8>>,
+        _block_size: u64,
+        _state_size: u64,
     ) -> anyhow::Result<()> {
         info!(block = block_number, root = %hex::encode(new_root), "BftCommitterStub: commit_block");
         *self.pending_root.lock().unwrap() = *new_root;
@@ -260,11 +264,14 @@ pub struct RoundManager<S: SmtStore> {
     pending:      Vec<ValidatedRequest>,
     smt:          S,
     current_root: [u8; 34],
+    /// Total number of leaves committed to the SMT (across all rounds).
+    leaf_count:   u64,
     state:        Arc<AggregatorState>,
     bft:          Arc<dyn BftCommitter>,
     inflight:     Option<InFlightRound<S>>,
     uc_tx:        mpsc::Sender<anyhow::Result<Vec<u8>>>,
     uc_rx:        mpsc::Receiver<anyhow::Result<Vec<u8>>>,
+    shutdown_notify: Arc<Notify>,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -275,7 +282,7 @@ impl RoundManager<smt_store::MemSmt> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
     ) -> Self {
-        Self::with_smt(config, request_rx, state, bft, smt_store::MemSmt::new())
+        Self::with_smt(config, request_rx, state, bft, smt_store::MemSmt::new(), 0)
     }
 }
 
@@ -287,8 +294,9 @@ impl RoundManager<smt_store::DiskSmt> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
         store: smt_store::DiskSmt,
+        initial_leaf_count: u64,
     ) -> Self {
-        Self::with_smt(config, request_rx, state, bft, store)
+        Self::with_smt(config, request_rx, state, bft, store, initial_leaf_count)
     }
 }
 
@@ -300,6 +308,7 @@ impl<S: SmtStore> RoundManager<S> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
         smt: S,
+        initial_leaf_count: u64,
     ) -> Self {
         let current_root = smt.root_hash_imprint();
         let (uc_tx, uc_rx) = mpsc::channel(4);
@@ -309,12 +318,19 @@ impl<S: SmtStore> RoundManager<S> {
             pending: Vec::new(),
             smt,
             current_root,
+            leaf_count: initial_leaf_count,
             state,
             bft,
             inflight: None,
             uc_tx,
             uc_rx,
+            shutdown_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Get a handle that can be used to signal graceful shutdown.
+    pub fn shutdown_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown_notify)
     }
 
     fn no_round_inflight(&self) -> bool {
@@ -339,7 +355,24 @@ impl<S: SmtStore> RoundManager<S> {
                 Some(uc_result) = self.uc_rx.recv() => {
                     self.on_uc_result(uc_result).await;
                 }
+                _ = self.shutdown_notify.notified() => {
+                    info!("shutdown signal received, stopping round manager");
+                    break;
+                }
             }
+        }
+
+        // Discard any in-flight round — its state hasn't been committed.
+        if let Some(inf) = self.inflight.take() {
+            warn!(block = inf.block_number, "discarding in-flight round on shutdown");
+            inf.proposed_snap.discard();
+            inf.spec_snap.discard();
+        }
+
+        // Persist SMT state (meaningful for mem-leaves-x shutdown snapshot).
+        match self.smt.shutdown_persist() {
+            Ok(()) => info!("SMT shutdown persist completed"),
+            Err(e) => error!(err = %e, "SMT shutdown persist failed"),
         }
     }
 
@@ -413,7 +446,11 @@ impl<S: SmtStore> RoundManager<S> {
         // Fork for speculative next-round work.
         let spec_snap = proposed_snap.fork();
 
-        if let Err(e) = self.bft.commit_block(block_number, &new_root, &prev_root, zk_proof).await {
+        let new_leaves = inserted.len() as u64;
+        let state_size = self.leaf_count + new_leaves;
+        if let Err(e) = self.bft.commit_block(
+            block_number, &new_root, &prev_root, zk_proof, new_leaves, state_size,
+        ).await {
             error!(block = block_number, err = %e, "commit_block failed — rolling back");
             proposed_snap.discard();
             spec_snap.discard();
@@ -468,7 +505,11 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_spec_snap = spec_snap.fork();
 
-        if let Err(e) = self.bft.commit_block(block_number, &new_root, &prev_root, None).await {
+        let new_leaves = spec_inserted.len() as u64;
+        let state_size = self.leaf_count + new_leaves;
+        if let Err(e) = self.bft.commit_block(
+            block_number, &new_root, &prev_root, None, new_leaves, state_size,
+        ).await {
             error!(block = block_number, err = %e, "commit_block (spec promotion) failed — rolling back");
             spec_snap.discard();
             new_spec_snap.discard();
@@ -560,6 +601,7 @@ impl<S: SmtStore> RoundManager<S> {
                     return;
                 }
                 self.current_root = inf.new_root;
+                self.leaf_count += inf.inserted.len() as u64;
 
                 // Generate proofs from committed store.
                 let finalized = self.generate_proofs(inf.inserted, inf.block_number);

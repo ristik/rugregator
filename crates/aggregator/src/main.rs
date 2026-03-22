@@ -21,8 +21,17 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(&cfg.log_level)
         .init();
 
+    // Resolve effective SMT backend early so we can log it.
+    let smt_backend = if cfg.smt_backend.is_empty() {
+        if cfg.db_path.is_empty() { "mem" } else { "disk" }
+    } else {
+        cfg.smt_backend.as_str()
+    };
+    let db_display = if cfg.db_path.is_empty() { "none" } else { &cfg.db_path };
+
     info!("Unicity Aggregator starting (Rust)");
-    info!(listen = %cfg.listen, round_ms = cfg.round_duration_ms, batch = cfg.batch_limit, mode = %cfg.bft_mode);
+    info!(listen = %cfg.listen, round_ms = cfg.round_duration_ms, batch = cfg.batch_limit,
+          mode = %cfg.bft_mode, smt = %smt_backend, db = %db_display);
 
     let (req_tx, req_rx) = mpsc::channel(10_000);
 
@@ -59,35 +68,37 @@ async fn main() -> anyhow::Result<()> {
 
     let round_cfg = RoundConfig::from(&cfg);
 
-    // Resolve the effective backend: default to "disk" when a DB path is set,
-    // "mem" when no DB path is provided.
-    let smt_backend = if cfg.smt_backend.is_empty() {
-        if cfg.db_path.is_empty() { "mem" } else { "disk" }
-    } else {
-        cfg.smt_backend.as_str()
-    };
-
     // Backends that require a DB path.
-    if matches!(smt_backend, "disk" | "mem-leaves" | "mem-full") && cfg.db_path.is_empty() {
+    if matches!(smt_backend, "disk" | "mem-leaves" | "mem-leaves-x" | "mem-full") && cfg.db_path.is_empty() {
         anyhow::bail!("smt-backend '{}' requires --db-path to be set", smt_backend);
     }
 
-    let state = if cfg.db_path.is_empty() {
+    // Helper: spawn a RoundManager and return (state, shutdown_notify).
+    macro_rules! spawn_rm {
+        ($rm:expr, $state:expr) => {{
+            let notify = $rm.shutdown_notify();
+            tokio::spawn(async move { $rm.run().await; });
+            ($state, notify)
+        }};
+    }
+
+    let (state, shutdown_notify) = if cfg.db_path.is_empty() {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
-        tokio::spawn(async move { rm.run().await; });
-        state
+        spawn_rm!(rm, state)
     } else {
         use uni_aggregator::storage_rocksdb::RocksDbStore;
         use smt_store::{DiskSmt, MemSmt};
         use smt_store::mem::PersistMode;
 
+        let recover_t0 = std::time::Instant::now();
         info!(path = %cfg.db_path, "opening RocksDB");
-        let (store, arc_db) = RocksDbStore::open(&cfg.db_path, cfg.cache_capacity)?;
+        let (store, arc_db) = RocksDbStore::open(&cfg.db_path, cfg.cache_mb * 1024 * 1024)?;
         let store = Arc::new(store);
 
         let recovered = store.recover()?;
+        let initial_leaf_count = recovered.records.len() as u64;
         info!(records = recovered.records.len(), blocks = recovered.blocks.len(),
               block_number = recovered.block_number, "recovered from RocksDB");
 
@@ -96,39 +107,62 @@ async fn main() -> anyhow::Result<()> {
 
         match smt_backend {
             "disk" => {
-                let disk_smt = DiskSmt::open(arc_db, cfg.cache_capacity)?;
-                info!(root = %hex::encode(disk_smt.root_hash_imprint()), "disk-backed SMT ready");
-                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt);
-                tokio::spawn(async move { rm.run().await; });
+                let disk_smt = DiskSmt::open(arc_db, cfg.cache_mb * 1024 * 1024)?;
+                info!(root = %hex::encode(disk_smt.root_hash_imprint()),
+                      recovered_ms = recover_t0.elapsed().as_millis() as u64, "disk-backed SMT ready");
+                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt, initial_leaf_count);
+                spawn_rm!(rm, state)
             }
             "mem-leaves" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesOnly)?;
-                info!(root = %hex::encode(mem_smt.root_hash_imprint()), "in-memory SMT (leaves-only) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
-                tokio::spawn(async move { rm.run().await; });
+                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                      recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves-only) ready");
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                spawn_rm!(rm, state)
+            }
+            "mem-leaves-x" => {
+                let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesWithShutdownSnapshot)?;
+                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                      recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves + shutdown snapshot) ready");
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                spawn_rm!(rm, state)
             }
             "mem-full" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::Full)?;
-                info!(root = %hex::encode(mem_smt.root_hash_imprint()), "in-memory SMT (full-nodes) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
-                tokio::spawn(async move { rm.run().await; });
+                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                      recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (full-nodes) ready");
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                spawn_rm!(rm, state)
             }
             "mem" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::None)?;
-                info!("in-memory SMT (no persistence) with DB ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
-                tokio::spawn(async move { rm.run().await; });
+                info!(recovered_ms = recover_t0.elapsed().as_millis() as u64,
+                      "in-memory SMT (no persistence) with DB ready");
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                spawn_rm!(rm, state)
             }
-            other => anyhow::bail!("unknown smt-backend: '{other}' (supported: disk, mem, mem-leaves, mem-full)"),
+            other => anyhow::bail!("unknown smt-backend: '{other}' (supported: disk, mem, mem-leaves, mem-leaves-x, mem-full)"),
         }
-
-        state
     };
 
     let router = build_router(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "HTTP server ready");
-    axum::serve(listener, router).await?;
+
+    // Run HTTP server until SIGINT (ctrl+c).
+    tokio::select! {
+        result = axum::serve(listener, router) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT, initiating graceful shutdown");
+        }
+    }
+
+    // Signal the round manager to shut down (persists SMT state if needed).
+    shutdown_notify.notify_one();
+    // Give the round manager a moment to persist and exit.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
 }
