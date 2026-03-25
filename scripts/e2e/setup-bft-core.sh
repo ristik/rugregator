@@ -68,6 +68,7 @@ echo "==> Generating shard config (partition $PARTITION_ID, epoch=$SHARD_EPOCH, 
   --shard-id "$SHARD_ID" \
   --epoch "$SHARD_EPOCH" \
   --epoch-start 1 \
+  --t2-timeout 50000 \
   --node-info "$AGG_HOME/node-info.json" \
   --home "$ROOT_HOME"
 

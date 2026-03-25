@@ -8,7 +8,9 @@ Focus areas:
 - Consistency proofs for every round of operation
 - Scaling beyond available system memory (fully disk-backed SMT)
 - Speculative execution of the next round while waiting for BFT certification
-- Configurable persistence — trade off restart speed vs. memory footprint
+- Configurable persistence — trade off restart speed vs. memory footprint vs. performance
+- NOT low level optimizations, all single-threaded for measurability
+- NOT Radix SMT structure optimizations (done elsewhere)
 
 ---
 
@@ -91,7 +93,7 @@ The stub BFT committer signs its own UCs with a hardcoded test key — no BFT Co
 
 ### SMT backend selection
 
-Use `--smt-backend` to choose how the SMT tree is stored and recovered. All four modes share the same `RoundManager<S: SmtStore>` code path.
+Use `--smt-backend` to choose how the SMT tree is stored and recovered. All five modes share the same `RoundManager<S: SmtStore>` code path.
 
 | Backend | Flag | Requires `--db-path` | Restart behaviour |
 |---------|------|---------------------|-------------------|
@@ -274,10 +276,6 @@ cargo run --release -p uni-aggregator --bin perf-test -- \
 cargo run --release -p uni-aggregator --bin perf-test -- \
   --backend disk --cache-mb 256 --rounds 6 --batch-sizes 1000,5000,10000
 
-# Small cache to force disk I/O on every round
-cargo run --release -p uni-aggregator --bin perf-test -- \
-  --backend disk --cache-mb 1 --rounds 6 --batch-sizes 10000
-
 # CSV output for all backends
 cargo run --release -p uni-aggregator --bin perf-test -- \
   --backend disk --rounds 8 --batch-sizes 1000,5000,10000,25000 --csv
@@ -307,9 +305,9 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --listen 0.0.0.0:8080
 
 # Terminal 2 — run load generator (TypeScript SDK)
-cd state-transition-sdk
-npm install && npm run build
-node dist/examples/load-test.js --url http://localhost:8080 --concurrency 200 --requests 10000
+cd scripts/perf-test
+npm install
+npm run perf-test -- --workers 1 --duration 5
 ```
 
 Watch round size and certified throughput in the aggregator logs:
@@ -318,7 +316,7 @@ INFO round finalized  block=12 root=0x… certified=847 submitted=847 spec_queue
 ```
 
 `certified` = requests included in the finalized block.
-`spec_queued` = requests already inserted speculatively into the next block (zero idle time between rounds).
+`spec_queued` = requests already inserted speculatively into the next block.
 
 ---
 
@@ -332,11 +330,11 @@ Peak memory during a speculative round is roughly 1× tree size + O(batch). With
 
 ### Generic `RoundManager<S: SmtStore>`
 
-All four SMT backends (`mem`, `mem-leaves`, `mem-full`, `disk`) share a single `RoundManager<S>` implementation. The `SmtStore` / `SmtStoreSnapshot` trait pair abstracts over snapshot creation, speculative fork/commit/discard, batch insertion, and proof generation. Switching backends is a one-line config change with zero code duplication.
+All five SMT backends (`mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, `disk`) share a single `RoundManager<S>` implementation. The `SmtStore` / `SmtStoreSnapshot` trait pair abstracts over snapshot creation, speculative fork/commit/discard, batch insertion, and proof generation. Switching backends is a one-line config change with zero code duplication.
 
 ### Configurable SMT persistence
 
-`MemSmt` supports four persistence modes, selectable at startup:
+`MemSmt` supports five persistence modes, selectable at startup:
 
 - **`None`** (`--smt-backend mem`): no writes to RocksDB; fastest per-round commit, but no crash recovery. BFT Core partition state must also be reset on restart.
 - **`LeavesOnly`** (`--smt-backend mem-leaves`): leaf values are appended to the `smt_leaves` column family on every commit. On restart, all leaves are replayed through `batch_insert` to reconstruct the tree, and the resulting root is compared against the last certified root stored in `smt_meta`. Recovery time is O(n × log n) in the number of leaves.
@@ -345,13 +343,13 @@ All four SMT backends (`mem`, `mem-leaves`, `mem-full`, `disk`) share a single `
 
 ### Consistency proofs for trustless operation
 
-Every Certification Request sent to BFT Core can optionally carry a **consistency proof** — a compact CBOR-encoded witness that the new SMT root was derived from the previous certified root by appending only the declared leaves, with no deletions or modifications.
+Every Certification Request sent to BFT Core can optionally carry a cryptographic **consistency proof** — a compact CBOR-encoded witness that the new SMT root was derived from the previous certified root by appending only the declared leaves, with no deletions or modifications.
 
 Enable with `--consistency-proofs`:
 
 **What it proves:** Let `h₀` be the root certified in the last UC and `h₁` be the root in the current Certification Request. The proof witnesses the exact set of (StateID, value) leaves appended to the tree going from `h₀` to `h₁`. A verifier can replay the proof to independently compute both `h₀` and `h₁` and confirm they match the Input Record hashes in consecutive UCs.
 
-**How it works:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat pre-order opcode sequence (`ProofOp`):
+**How:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat pre-order opcode sequence (`ProofOp`):
 
 | Opcode | Meaning |
 |--------|---------|
@@ -387,7 +385,7 @@ proposed_snap  ──fork()──>  spec_snap
 
 The spec snapshot reads `own_overlay → parent_overlay → LRU cache → RocksDB`, seeing the proposed round's uncommitted mutations without any DB writes.
 
-**Memory usage is bounded by batch size + cache size**, not total tree size. A 50 000-leaf batch against a 500 million-leaf tree materialises only ~50 000 × tree_depth ≈ 14 million nodes.
+**Memory usage is bounded by batch size + cache size**, not total tree size. A 10 000-leaf batch against a 500 million-leaf tree materialises only ~10 000 × tree_depth ≈ 300 000 nodes.
 
 **Startup:** reads only the committed root hash from `smt_meta` — no leaf replay, no tree reconstruction.
 
