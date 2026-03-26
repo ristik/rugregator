@@ -143,6 +143,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --auth-key-hex <32-byte-hex-secp256k1-auth-key> \
   --sig-key-hex  <32-byte-hex-secp256k1-signing-key> \
   --partition-id 1 \
+  --uc-timeout-ms 15000 \
   --db-path      /var/lib/aggregator/db \
   --smt-backend  disk \
   --consistency-proofs
@@ -168,6 +169,8 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--p2p-addr` | `AGGREGATOR_P2P_ADDR` | `/ip4/0.0.0.0/tcp/0` | Our libp2p listen multiaddr |
 | `--auth-key-hex` | `AGGREGATOR_AUTH_KEY` | | secp256k1 key for libp2p identity |
 | `--sig-key-hex` | `AGGREGATOR_SIG_KEY` | | secp256k1 key for signing CRs |
+| `--uc-timeout-ms` | `AGGREGATOR_UC_TIMEOUT_MS` | `15000` | UC inactivity timeout (ms); re-sends handshake to BFT Core when no UC arrives within this period; set to ≥3× BFT Core's T2 for this partition |
+| `--fake-state-transitions` | `AGGREGATOR_FAKE_STATE_TRANSITIONS` | `false` | Use last UC's hash as PreviousHash instead of the real SMT root |
 | `--log-level` | `RUST_LOG` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 
 ---

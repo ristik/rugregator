@@ -1,15 +1,17 @@
 //! Live BFT Core committer using libp2p.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{
     core::upgrade,
-    identify,
-    identity,
+    identify, identity,
     request_response::{self, Codec, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Transport,
@@ -68,11 +70,18 @@ struct Handshake {
 mod opt_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        match v { Some(b) => serde_bytes::serialize(b.as_slice(), s), None => s.serialize_none() }
+    where
+        S: Serializer,
+    {
+        match v {
+            Some(b) => serde_bytes::serialize(b.as_slice(), s),
+            None => s.serialize_none(),
+        }
     }
     pub fn deserialize<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         #[derive(Deserialize)]
         struct H(#[serde(with = "serde_bytes")] Vec<u8>);
         let opt: Option<H> = Option::deserialize(d)?;
@@ -122,12 +131,13 @@ struct UcEvent {
 
 struct PendingCert {
     new_hash: Vec<u8>,
-    state_changed: bool,
+    /// Aggregator's actual previous SMT root (for re-deriving prev_hash_ir on re-send).
+    prev_hash: Vec<u8>,
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
     uc_tx: oneshot::Sender<Vec<u8>>,
-    /// BFT round used when this cert request was sent.
+    /// BFT round used when this cert request was (last) sent.
     bft_round_used: u64,
 }
 
@@ -141,7 +151,8 @@ const TAG_INPUT_RECORD: u64 = 1008;
 /// Data for a cert request, sans round/epoch (filled in at transmission time).
 struct CertReqData {
     new_hash: Vec<u8>,
-    state_changed: bool,
+    /// Aggregator's actual previous SMT root (34-byte imprint).
+    prev_hash: Vec<u8>,
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
@@ -149,7 +160,9 @@ struct CertReqData {
     uc_tx: oneshot::Sender<Vec<u8>>,
 }
 
-enum NetCmd { Submit(CertReqData), }
+enum NetCmd {
+    Submit(CertReqData),
+}
 
 #[derive(Debug, Clone, Default)]
 struct BftCodec;
@@ -160,20 +173,50 @@ impl Codec for BftCodec {
     type Request = Vec<u8>;
     type Response = Vec<u8>;
     async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Vec<u8>>
-    where T: AsyncRead + Unpin + Send { read_uvi(io).await }
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_uvi(io).await
+    }
     async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Vec<u8>>
-    where T: AsyncRead + Unpin + Send { read_uvi(io).await }
-    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Vec<u8>) -> std::io::Result<()>
-    where T: AsyncWrite + Unpin + Send { write_uvi(io, &req).await }
-    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Vec<u8>) -> std::io::Result<()>
-    where T: AsyncWrite + Unpin + Send { write_uvi(io, &res).await }
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_uvi(io).await
+    }
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        req: Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_uvi(io, &req).await
+    }
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        res: Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_uvi(io, &res).await
+    }
 }
 
 async fn read_uvi<R: AsyncRead + Unpin + Send>(r: &mut R) -> std::io::Result<Vec<u8>> {
-    let len = unsigned_varint::aio::read_u64(&mut *r).await
+    let len = unsigned_varint::aio::read_u64(&mut *r)
+        .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if len == 0 || len > 10 * 1024 * 1024 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad len"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad len",
+        ));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
@@ -208,6 +251,12 @@ pub struct LiveBftConfig {
     pub auth_key_bytes: Vec<u8>,
     /// Raw secp256k1 bytes (32) for signing BlockCertificationRequests
     pub sig_key_bytes: Vec<u8>,
+    /// When true, use luc.InputRecord.Hash as PreviousHash (test mode).
+    /// When false (default), use the aggregator's actual previous SMT root.
+    pub fake_state_transitions: bool,
+    /// UC inactivity timeout — re-send handshake after this many milliseconds
+    /// without a UC.  Should be ~2× BFT Core's T2 for this partition.
+    pub uc_timeout_ms: u64,
 }
 
 // ─── LiveBftCommitter ─────────────────────────────────────────────────────────
@@ -219,8 +268,9 @@ pub struct LiveBftCommitter {
 
 impl LiveBftCommitter {
     pub fn start(cfg: LiveBftConfig) -> anyhow::Result<Self> {
-        let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(cfg.auth_key_bytes.clone())
-            .map_err(|e| anyhow::anyhow!("auth key: {e}"))?;
+        let secret =
+            libp2p::identity::secp256k1::SecretKey::try_from_bytes(cfg.auth_key_bytes.clone())
+                .map_err(|e| anyhow::anyhow!("auth key: {e}"))?;
         let kp = identity::Keypair::from(libp2p::identity::secp256k1::Keypair::from(secret));
         let local_peer = PeerId::from(kp.public());
         let node_id = local_peer.to_string();
@@ -246,11 +296,16 @@ impl LiveBftCommitter {
             cert: mk_rr(PROTO_CERT, ProtocolSupport::Outbound),
             uc: mk_rr(PROTO_UC, ProtocolSupport::Inbound),
             hs: mk_rr(PROTO_HS, ProtocolSupport::Outbound),
-            identify: identify::Behaviour::new(identify::Config::new("/ipfs/0.1.0".into(), kp.public())),
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ipfs/0.1.0".into(),
+                kp.public(),
+            )),
         };
 
         let mut swarm = Swarm::new(
-            transport, behaviour, local_peer,
+            transport,
+            behaviour,
+            local_peer,
             libp2p::swarm::Config::with_tokio_executor()
                 .with_idle_connection_timeout(std::time::Duration::from_secs(86400)),
         );
@@ -271,9 +326,23 @@ impl LiveBftCommitter {
         let node_id2 = node_id.clone();
         let sig_key2 = SecretKey::from_slice(&cfg.sig_key_bytes)
             .map_err(|e| anyhow::anyhow!("sig key (net): {e}"))?;
+        let fake_st = cfg.fake_state_transitions;
+        let uc_timeout_ms = cfg.uc_timeout_ms;
 
         tokio::spawn(async move {
-            network_loop(swarm, cmd_rx, shared2, bft_peer, bft_addr, partition_id, node_id2, sig_key2).await;
+            network_loop(
+                swarm,
+                cmd_rx,
+                shared2,
+                bft_peer,
+                bft_addr,
+                partition_id,
+                node_id2,
+                sig_key2,
+                fake_st,
+                uc_timeout_ms,
+            )
+            .await;
         });
 
         Ok(Self { cmd_tx, shared })
@@ -281,7 +350,9 @@ impl LiveBftCommitter {
 
     async fn wait_init(&self) {
         loop {
-            if self.shared.initialized.load(Ordering::Acquire) { return; }
+            if self.shared.initialized.load(Ordering::Acquire) {
+                return;
+            }
             self.shared.init_notify.notified().await;
         }
     }
@@ -303,38 +374,52 @@ impl BftCommitter for LiveBftCommitter {
         // Use the full 34-byte DataHash imprint (2 algo bytes + 32 hash bytes).
         // BFT Core echoes InputRecord.Hash verbatim; the SDK reads it as a DataHash imprint.
         let new_hash = new_root.to_vec();
-        let state_changed = new_root != prev_root;
+        let prev_hash = prev_root.to_vec();
 
         // Register the block → UC receiver BEFORE queuing the Submit command so
         // the network task can fill the sender side at transmission time.
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        self.shared.blk_receivers.lock().unwrap().insert(block_number, rx);
+        self.shared
+            .blk_receivers
+            .lock()
+            .unwrap()
+            .insert(block_number, rx);
 
-        // The round number and prev_hash are read by the network task at the moment
-        // of actual transmission. prev_hash comes from the latest sync UC; if none
-        // has arrived yet, we send None (matching BFT Core's nil initial state).
         let data = CertReqData {
             new_hash,
-            state_changed,
+            prev_hash,
             zk_proof,
             block_size,
             state_size,
             uc_tx: tx,
         };
 
-        self.cmd_tx.send(NetCmd::Submit(data)).await
+        self.cmd_tx
+            .send(NetCmd::Submit(data))
+            .await
             .map_err(|_| anyhow::anyhow!("net task closed"))?;
 
-        info!(block = block_number, "cert request queued (round resolved at send time)");
+        info!(
+            block = block_number,
+            "cert request queued (round resolved at send time)"
+        );
         Ok(())
     }
 
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
-        let rx = self.shared.blk_receivers.lock().unwrap().remove(&block_number);
+        let rx = self
+            .shared
+            .blk_receivers
+            .lock()
+            .unwrap()
+            .remove(&block_number);
         let rx = match rx {
             Some(r) => r,
             None => {
-                warn!(block = block_number, "no UC receiver registered; returning stub");
+                warn!(
+                    block = block_number,
+                    "no UC receiver registered; returning stub"
+                );
                 return Ok(vec![]);
             }
         };
@@ -370,8 +455,9 @@ fn cbor_handshake(h: &Handshake) -> anyhow::Result<Vec<u8>> {
 fn strip_tags(val: &ciborium::value::Value) -> ciborium::value::Value {
     match val {
         ciborium::value::Value::Tag(_, inner) => strip_tags(inner),
-        ciborium::value::Value::Array(arr) =>
-            ciborium::value::Value::Array(arr.iter().map(strip_tags).collect()),
+        ciborium::value::Value::Array(arr) => {
+            ciborium::value::Value::Array(arr.iter().map(strip_tags).collect())
+        }
         other => other.clone(),
     }
 }
@@ -388,25 +474,38 @@ fn cbor_u64(val: &ciborium::value::Value) -> Option<u64> {
 /// Parse CertificationResponse CBOR → UcEvent (or None on parse error).
 fn parse_uc(data: &[u8]) -> Option<UcEvent> {
     let val: ciborium::value::Value = ciborium::from_reader(data)
-        .map_err(|e| error!("UC parse error: {e}")).ok()?;
+        .map_err(|e| error!("UC parse error: {e}"))
+        .ok()?;
     let arr = match val {
         ciborium::value::Value::Array(a) => a,
-        _ => { error!("UC not array"); return None; }
+        _ => {
+            error!("UC not array");
+            return None;
+        }
     };
-    if arr.len() < 4 { error!("UC array too short"); return None; }
+    if arr.len() < 4 {
+        error!("UC array too short");
+        return None;
+    }
 
     // TechnicalRecord at index 2: [round, epoch, leader, stat_hash, fee_hash]
     let (next_round, epoch) = match strip_tags(&arr[2]) {
         ciborium::value::Value::Array(tr) if tr.len() >= 2 => {
             (cbor_u64(&tr[0]).unwrap_or(0), cbor_u64(&tr[1]).unwrap_or(0))
         }
-        _ => { warn!("UC: bad TechnicalRecord"); return None; }
+        _ => {
+            warn!("UC: bad TechnicalRecord");
+            return None;
+        }
     };
 
     // UC at index 3 — extract IR round_number and IR hash
     let uc_arr = match strip_tags(&arr[3]) {
         ciborium::value::Value::Array(a) => a,
-        _ => { warn!("UC: bad UC value"); return None; }
+        _ => {
+            warn!("UC: bad UC value");
+            return None;
+        }
     };
     // UC structure: [version, input_record, tr_hash, ...]
     // InputRecord: [version, round_number, epoch, previous_hash, hash, ...]
@@ -414,7 +513,10 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
         match strip_tags(&uc_arr[1]) {
             ciborium::value::Value::Array(ir) if ir.len() >= 5 => {
                 let rnd = cbor_u64(&ir[1]).unwrap_or(0);
-                let h = match &ir[4] { ciborium::value::Value::Bytes(b) => Some(b.clone()), _ => None };
+                let h = match &ir[4] {
+                    ciborium::value::Value::Bytes(b) => Some(b.clone()),
+                    _ => None,
+                };
                 (rnd, h)
             }
             _ => (0, None),
@@ -433,17 +535,26 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
     let timestamp = if uc_arr.len() >= 7 {
         match strip_tags(&uc_arr[6]) {
             ciborium::value::Value::Array(seal) if seal.len() >= 5 => {
-                cbor_u64(&seal[4]).unwrap_or(0)  // seal[4] = Timestamp
+                cbor_u64(&seal[4]).unwrap_or(0) // seal[4] = Timestamp
             }
             _ => 0,
         }
-    } else { 0 };
+    } else {
+        0
+    };
 
     // Serialize UC element for storage/delivery
     let mut uc_cbor = Vec::new();
     let _ = ciborium::into_writer(&arr[3], &mut uc_cbor);
 
-    Some(UcEvent { uc_round, next_round, epoch, prev_hash: uc_hash, timestamp, uc_cbor })
+    Some(UcEvent {
+        uc_round,
+        next_round,
+        epoch,
+        prev_hash: uc_hash,
+        timestamp,
+        uc_cbor,
+    })
 }
 
 // ─── Network loop ─────────────────────────────────────────────────────────────
@@ -463,22 +574,45 @@ fn make_cert_cbor(
     secp: &Secp256k1<secp256k1::All>,
     sig_key: &SecretKey,
 ) -> anyhow::Result<Vec<u8>> {
-    let block_hash = if pending.state_changed { Some(pending.new_hash.clone()) } else { None };
-    let ts = if timestamp > 0 { timestamp } else {
-        SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    // State changed = new hash differs from the PreviousHash we're sending.
+    let state_changed = match &prev_hash_ir {
+        Some(ph) => pending.new_hash != *ph,
+        None => true, // first block (genesis) — state is always "new"
+    };
+    let block_hash = if state_changed {
+        Some(pending.new_hash.clone())
+    } else {
+        None
+    };
+    let ts = if timestamp > 0 {
+        timestamp
+    } else {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     };
     let ir = InputRecord {
-        version: 1, round_number: bft_round, epoch,
+        version: 1,
+        round_number: bft_round,
+        epoch,
         previous_hash: prev_hash_ir,
         hash: Some(pending.new_hash.clone()),
         summary_value: Some(vec![]),
-        timestamp: ts, block_hash,
-        sum_of_earned_fees: 0, et_hash: Some(vec![]),
+        timestamp: ts,
+        block_hash,
+        sum_of_earned_fees: 0,
+        et_hash: Some(vec![]),
     };
     let mut req = BlockCertReq {
-        partition_id, shard_id: vec![0x80], node_id: node_id.to_string(),
-        input_record: ir, zk_proof: pending.zk_proof.clone(),
-        block_size: pending.block_size, state_size: pending.state_size, signature: None,
+        partition_id,
+        shard_id: vec![0x80],
+        node_id: node_id.to_string(),
+        input_record: ir,
+        zk_proof: pending.zk_proof.clone(),
+        block_size: pending.block_size,
+        state_size: pending.state_size,
+        signature: None,
     };
     // Sign: compute digest of unsigned CBOR, then set signature
     req.signature = None;
@@ -498,6 +632,8 @@ async fn network_loop(
     partition_id: u32,
     node_id: String,
     sig_key: SecretKey,
+    fake_state_transitions: bool,
+    uc_timeout_ms: u64,
 ) {
     let secp = Secp256k1::new();
     let _ = swarm.dial(
@@ -515,6 +651,15 @@ async fn network_loop(
     // Single source of truth for building the next cert request.
     // Updated from EVERY valid UC (sync, cert response, repeat).
     let mut last_uc: Option<LastUc> = None;
+    // BFT Core sends repeat UCs every T2 interval as a natural keepalive.
+    // The heartbeat is a safety net: if repeat UCs stop arriving (e.g. silent
+    // connection loss or subscription quota exhausted), re-send the handshake
+    // to refresh the subscription.  The timeout must be well above T2 (default
+    // 15s vs typical T2 of ~6s) so normal repeat-UC gaps don't trigger it.
+    let inactivity_timeout = std::time::Duration::from_millis(uc_timeout_ms);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_uc_time = std::time::Instant::now();
 
     loop {
         // `biased` ensures swarm events (including incoming UCs) are always
@@ -546,6 +691,7 @@ async fn network_loop(
                         debug!("UC arrived ({} bytes)", request.len());
                         let _ = swarm.behaviour_mut().uc.send_response(channel, vec![]);
 
+                        last_uc_time = std::time::Instant::now();
                         let ev = match parse_uc(&request) { Some(e) => e, None => continue };
                         info!(uc_round = ev.uc_round, next_round = ev.next_round, epoch = ev.epoch, "UC received from BFT Core");
 
@@ -562,23 +708,61 @@ async fn network_loop(
                             shared.init_notify.notify_waiters();
                         }
 
-                        // Handle pending cert: check match first, then stale detection.
-                        if let Some(ref p) = pending {
+                        // Handle pending cert request.
+                        if let Some(ref mut p) = pending {
                             if ev.uc_round > 0 && ev.uc_round == p.bft_round_used {
                                 // Our cert request was certified.
                                 info!(bft_round = ev.uc_round, "UC matched — cert request certified");
                                 let p = pending.take().unwrap();
                                 let _ = p.uc_tx.send(ev.uc_cbor);
-                            } else if ev.next_round > p.bft_round_used {
-                                // BFT Core moved past our round — pending is stale.
+                            } else if ev.uc_round > 0 && ev.uc_round > p.bft_round_used {
+                                // A higher partition round was certified — our request
+                                // was superseded (should not happen in single-aggregator setup).
                                 warn!(
                                     our_round = p.bft_round_used,
-                                    bft_next_round = ev.next_round,
-                                    "pending cert stale — dropping"
+                                    uc_round = ev.uc_round,
+                                    "pending cert superseded — dropping"
                                 );
                                 let p = pending.take().unwrap();
-                                // uc_tx dropped → wait_for_uc error → round manager re-queues.
                                 drop(p);
+                            } else if ev.next_round > p.bft_round_used {
+                                // Repeat UC with an advanced partition round —
+                                // BFT Core timed out on our round and moved on.
+                                // Re-send the same cert request with the new round number.
+                                let old_round = p.bft_round_used;
+                                let new_round = ev.next_round;
+                                p.bft_round_used = new_round;
+
+                                let lu = last_uc.as_ref().unwrap();
+                                let prev_hash_ir = if fake_state_transitions {
+                                    lu.prev_hash.clone()
+                                } else if p.prev_hash.iter().all(|&b| b == 0) {
+                                    None
+                                } else {
+                                    Some(p.prev_hash.clone())
+                                };
+
+                                match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
+                                                     lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
+                                    Ok(cbor) => {
+                                        info!(
+                                            old_round, new_round,
+                                            "repeat UC advanced round — re-sending cert request"
+                                        );
+                                        swarm.behaviour_mut().cert.send_request(&bft_peer, cbor);
+                                    }
+                                    Err(e) => {
+                                        error!("failed to rebuild cert req on round advance: {e}");
+                                    }
+                                }
+                            } else {
+                                // Repeat UC at same round — still waiting.
+                                debug!(
+                                    our_round = p.bft_round_used,
+                                    uc_round = ev.uc_round,
+                                    next_round = ev.next_round,
+                                    "repeat UC while cert pending — still waiting"
+                                );
                             }
                         }
                     }
@@ -593,6 +777,24 @@ async fn network_loop(
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("p2p listening on {}", address);
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Uc(
+                        request_response::Event::InboundFailure { error, .. },
+                    )) => {
+                        warn!("UC inbound failure: {:?}", error);
+                    }
+                    // BFT Core uses fire-and-forget for cert and handshake protocols
+                    // (closes the stream without sending a response).  The OutboundFailure
+                    // is expected and harmless — the request was delivered.
+                    SwarmEvent::Behaviour(BehaviourEvent::Cert(
+                        request_response::Event::OutboundFailure { error, .. },
+                    )) => {
+                        debug!("cert outbound failure (expected — fire-and-forget): {:?}", error);
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Hs(
+                        request_response::Event::OutboundFailure { error, .. },
+                    )) => {
+                        debug!("handshake outbound failure (expected — fire-and-forget): {:?}", error);
                     }
                     _ => {}
                 }
@@ -613,6 +815,20 @@ async fn network_loop(
                         .build(),
                 );
             }
+            // Heartbeat: re-subscribe if no UC received within inactivity timeout.
+            _ = heartbeat.tick() => {
+                if hs_sent && last_uc_time.elapsed() > inactivity_timeout {
+                    warn!(
+                        idle_secs = last_uc_time.elapsed().as_secs(),
+                        "UC inactivity timeout — re-sending handshake"
+                    );
+                    let h = Handshake { partition_id, shard_id: vec![0x80], node_id: node_id.clone() };
+                    if let Ok(cbor) = cbor_handshake(&h) {
+                        swarm.behaviour_mut().hs.send_request(&bft_peer, cbor);
+                        last_uc_time = std::time::Instant::now();
+                    }
+                }
+            }
             // Accept a new Submit only when no cert request is in flight.
             // `biased` above guarantees all pending UCs are drained first,
             // so `last_uc` holds the freshest state.
@@ -628,9 +844,46 @@ async fn network_loop(
                         };
 
                         let bft_round = lu.next_round;
+
+                        // Check whether our SMT root matches what BFT Core certified.
+                        // An all-zeros SMT root (empty tree) is semantically nil —
+                        // BFT Core genesis UC has prev_hash = None.
+                        let smt_prev = if data.prev_hash.iter().all(|&b| b == 0) {
+                            None
+                        } else {
+                            Some(data.prev_hash.clone())
+                        };
+                        if smt_prev != lu.prev_hash {
+                            let smt_hex = hex::encode(&data.prev_hash);
+                            let uc_hex = lu.prev_hash.as_ref()
+                                .map(|h| hex::encode(h))
+                                .unwrap_or_else(|| "nil".to_string());
+                            if fake_state_transitions {
+                                warn!(
+                                    smt_prev = %smt_hex, uc_prev = %uc_hex,
+                                    "PreviousHash mismatch — using UC hash (fake-state-transitions)"
+                                );
+                            } else {
+                                error!(
+                                    smt_prev = %smt_hex, uc_prev = %uc_hex,
+                                    "PreviousHash mismatch — SMT root diverged from certified chain, cert request will fail"
+                                );
+                            }
+                        }
+
+                        // In real mode, PreviousHash = aggregator's actual previous
+                        // SMT root — it MUST form a continuous chain with BFT Core.
+                        // In fake mode, PreviousHash = luc.InputRecord.Hash (whatever
+                        // BFT Core last certified), allowing divergent state.
+                        let prev_hash_ir = if fake_state_transitions {
+                            lu.prev_hash.clone()
+                        } else {
+                            smt_prev
+                        };
+
                         let p = PendingCert {
                             new_hash: data.new_hash,
-                            state_changed: data.state_changed,
+                            prev_hash: data.prev_hash,
                             zk_proof: data.zk_proof,
                             block_size: data.block_size,
                             state_size: data.state_size,
@@ -638,7 +891,7 @@ async fn network_loop(
                             bft_round_used: bft_round,
                         };
 
-                        match make_cert_cbor(&p, bft_round, lu.epoch, lu.prev_hash.clone(),
+                        match make_cert_cbor(&p, bft_round, lu.epoch, prev_hash_ir,
                                              lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
                             Ok(cbor) => {
                                 info!(bft_round, "sending cert request to BFT Core");

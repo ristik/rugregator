@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use clap::Parser;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use uni_aggregator::{
     api::build_router,
@@ -42,6 +42,9 @@ async fn main() -> anyhow::Result<()> {
         }
         "live" => {
             info!("BFT mode: live — connecting to BFT Core");
+            if cfg.fake_state_transitions {
+                warn!("fake-state-transitions enabled — PreviousHash from UC, not SMT root");
+            }
             let peer_id: libp2p::PeerId = cfg.bft_peer_id.parse()
                 .map_err(|e| anyhow::anyhow!("invalid bft_peer_id '{}': {e}", cfg.bft_peer_id))?;
             let bft_addr: libp2p::Multiaddr = cfg.bft_addr.parse()
@@ -60,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
                 listen_addr: p2p_addr,
                 auth_key_bytes: auth_key,
                 sig_key_bytes: sig_key,
+                fake_state_transitions: cfg.fake_state_transitions,
+                uc_timeout_ms: cfg.uc_timeout_ms,
             };
             Arc::new(LiveBftCommitter::start(live_cfg)?)
         }
@@ -98,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
         let store = Arc::new(store);
 
         let recovered = store.recover()?;
-        let initial_leaf_count = recovered.records.len() as u64;
         info!(records = recovered.records.len(), blocks = recovered.blocks.len(),
               block_number = recovered.block_number, "recovered from RocksDB");
 
@@ -110,35 +114,35 @@ async fn main() -> anyhow::Result<()> {
                 let disk_smt = DiskSmt::open(arc_db, cfg.cache_mb * 1024 * 1024)?;
                 info!(root = %hex::encode(disk_smt.root_hash_imprint()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "disk-backed SMT ready");
-                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt, initial_leaf_count);
+                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt);
                 spawn_rm!(rm, state)
             }
             "mem-leaves" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesOnly)?;
                 info!(root = %hex::encode(mem_smt.root_hash_imprint()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves-only) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             "mem-leaves-x" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesWithShutdownSnapshot)?;
                 info!(root = %hex::encode(mem_smt.root_hash_imprint()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves + shutdown snapshot) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             "mem-full" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::Full)?;
                 info!(root = %hex::encode(mem_smt.root_hash_imprint()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (full-nodes) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             "mem" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::None)?;
                 info!(recovered_ms = recover_t0.elapsed().as_millis() as u64,
                       "in-memory SMT (no persistence) with DB ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt, initial_leaf_count);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             other => anyhow::bail!("unknown smt-backend: '{other}' (supported: disk, mem, mem-leaves, mem-leaves-x, mem-full)"),

@@ -17,15 +17,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
-use crate::config::RoundConfig;
-use crate::smt::{state_id_to_smt_path};
-use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord};
-use crate::validation::ValidatedRequest;
-use crate::validation::state_id::compute_cert_data_hash_imprint;
-use crate::api::cbor::CertDataFields;
 use super::state::ProcessedRecord;
+use crate::api::cbor::CertDataFields;
+use crate::config::RoundConfig;
+use crate::smt::state_id_to_smt_path;
+use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord};
+use crate::validation::state_id::compute_cert_data_hash_imprint;
+use crate::validation::ValidatedRequest;
 use async_trait::async_trait;
 
 use smt_store::{SmtStore, SmtStoreSnapshot};
@@ -61,7 +61,9 @@ impl BftCommitterStub {
     const NODE_ID: &'static str = "NODE";
 
     pub fn new() -> Self {
-        Self { pending_root: Mutex::new([0u8; 34]) }
+        Self {
+            pending_root: Mutex::new([0u8; 34]),
+        }
     }
 }
 
@@ -84,28 +86,48 @@ impl BftCommitter for BftCommitterStub {
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
         let root = *self.pending_root.lock().unwrap();
         info!(block = block_number, "BftCommitterStub: generating stub UC");
-        Ok(stub_generate_uc(block_number, &root, Self::PRIVATE_KEY, Self::NODE_ID))
+        Ok(stub_generate_uc(
+            block_number,
+            &root,
+            Self::PRIVATE_KEY,
+            Self::NODE_ID,
+        ))
     }
 }
 
 // ─── Stub UC generation ───────────────────────────────────────────────────────
 
 fn cbor_uint(n: u64) -> Vec<u8> {
-    if n < 24 { vec![n as u8] }
-    else if n < 0x100 { vec![0x18, n as u8] }
-    else if n < 0x10000 { vec![0x19, (n >> 8) as u8, n as u8] }
-    else if n < 0x1_0000_0000 {
-        vec![0x1A, (n >> 24) as u8, (n >> 16) as u8, (n >> 8) as u8, n as u8]
+    if n < 24 {
+        vec![n as u8]
+    } else if n < 0x100 {
+        vec![0x18, n as u8]
+    } else if n < 0x10000 {
+        vec![0x19, (n >> 8) as u8, n as u8]
+    } else if n < 0x1_0000_0000 {
+        vec![
+            0x1A,
+            (n >> 24) as u8,
+            (n >> 16) as u8,
+            (n >> 8) as u8,
+            n as u8,
+        ]
     } else {
-        let mut v = vec![0x1B]; v.extend_from_slice(&n.to_be_bytes()); v
+        let mut v = vec![0x1B];
+        v.extend_from_slice(&n.to_be_bytes());
+        v
     }
 }
 
 fn cbor_bytes(data: &[u8]) -> Vec<u8> {
     let n = data.len();
-    let mut hdr = if n < 24 { vec![0x40 | n as u8] }
-        else if n < 0x100 { vec![0x58, n as u8] }
-        else { vec![0x59, (n >> 8) as u8, n as u8] };
+    let mut hdr = if n < 24 {
+        vec![0x40 | n as u8]
+    } else if n < 0x100 {
+        vec![0x58, n as u8]
+    } else {
+        vec![0x59, (n >> 8) as u8, n as u8]
+    };
     hdr.extend_from_slice(data);
     hdr
 }
@@ -113,20 +135,31 @@ fn cbor_bytes(data: &[u8]) -> Vec<u8> {
 fn cbor_text(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let n = b.len();
-    let mut hdr = if n < 24 { vec![0x60 | n as u8] }
-        else if n < 0x100 { vec![0x78, n as u8] }
-        else { vec![0x79, (n >> 8) as u8, n as u8] };
+    let mut hdr = if n < 24 {
+        vec![0x60 | n as u8]
+    } else if n < 0x100 {
+        vec![0x78, n as u8]
+    } else {
+        vec![0x79, (n >> 8) as u8, n as u8]
+    };
     hdr.extend_from_slice(b);
     hdr
 }
 
-fn cbor_null() -> Vec<u8> { vec![0xF6] }
+fn cbor_null() -> Vec<u8> {
+    vec![0xF6]
+}
 
 fn cbor_array(items: &[&[u8]]) -> Vec<u8> {
     let n = items.len();
-    let mut v = if n < 24 { vec![0x80 | n as u8] }
-        else { vec![0x98, n as u8] };
-    for item in items { v.extend_from_slice(item); }
+    let mut v = if n < 24 {
+        vec![0x80 | n as u8]
+    } else {
+        vec![0x98, n as u8]
+    };
+    for item in items {
+        v.extend_from_slice(item);
+    }
     v
 }
 
@@ -138,10 +171,21 @@ fn cbor_map1(k: &[u8], val: &[u8]) -> Vec<u8> {
 }
 
 fn cbor_tag(tag: u64, data: &[u8]) -> Vec<u8> {
-    let mut hdr = if tag < 24 { vec![0xC0 | tag as u8] }
-        else if tag < 0x100 { vec![0xD8, tag as u8] }
-        else if tag < 0x10000 { vec![0xD9, (tag >> 8) as u8, tag as u8] }
-        else { vec![0xDA, (tag >> 24) as u8, (tag >> 16) as u8, (tag >> 8) as u8, tag as u8] };
+    let mut hdr = if tag < 24 {
+        vec![0xC0 | tag as u8]
+    } else if tag < 0x100 {
+        vec![0xD8, tag as u8]
+    } else if tag < 0x10000 {
+        vec![0xD9, (tag >> 8) as u8, tag as u8]
+    } else {
+        vec![
+            0xDA,
+            (tag >> 24) as u8,
+            (tag >> 16) as u8,
+            (tag >> 8) as u8,
+            tag as u8,
+        ]
+    };
     hdr.extend_from_slice(data);
     hdr
 }
@@ -151,7 +195,12 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-fn stub_generate_uc(block_number: u64, new_root: &[u8; 34], private_key: [u8; 32], node_id: &str) -> Vec<u8> {
+fn stub_generate_uc(
+    block_number: u64,
+    new_root: &[u8; 34],
+    private_key: [u8; 32],
+    node_id: &str,
+) -> Vec<u8> {
     use secp256k1::{Message, Secp256k1, SecretKey};
 
     let input_record_inner = cbor_array(&[
@@ -218,16 +267,9 @@ fn stub_generate_uc(block_number: u64, new_root: &[u8; 34], private_key: [u8; 32
     ]);
     let seal_cbor = cbor_tag(1001, &seal_inner);
 
-    let shard_tree_cert = cbor_array(&[
-        &cbor_bytes(&[]),
-        &cbor_array(&[]),
-    ]);
+    let shard_tree_cert = cbor_array(&[&cbor_bytes(&[]), &cbor_array(&[])]);
 
-    let utc_inner = cbor_array(&[
-        &cbor_uint(0),
-        &cbor_uint(0),
-        &cbor_array(&[]),
-    ]);
+    let utc_inner = cbor_array(&[&cbor_uint(0), &cbor_uint(0), &cbor_array(&[])]);
     let unicity_tree_cert = cbor_tag(1014, &utc_inner);
 
     let uc_inner = cbor_array(&[
@@ -246,31 +288,31 @@ fn stub_generate_uc(block_number: u64, new_root: &[u8; 34], private_key: [u8; 32
 
 /// State of a round that has been proposed to BFT Core and is awaiting its UC.
 struct InFlightRound<S: SmtStore> {
-    block_number:    u64,
-    new_root:        [u8; 34],
-    proposed_snap:   S::Snapshot,
-    spec_snap:       S::Snapshot,
+    block_number: u64,
+    new_root: [u8; 34],
+    proposed_snap: S::Snapshot,
+    spec_snap: S::Snapshot,
     submitted_batch: Vec<ValidatedRequest>,
-    inserted:        Vec<ProcessedRecord>,
-    spec_batch:      Vec<ValidatedRequest>,
-    spec_inserted:   Vec<ProcessedRecord>,
+    inserted: Vec<ProcessedRecord>,
+    spec_batch: Vec<ValidatedRequest>,
+    spec_inserted: Vec<ProcessedRecord>,
 }
 
 // ─── RoundManager ─────────────────────────────────────────────────────────────
 
 pub struct RoundManager<S: SmtStore> {
-    config:       RoundConfig,
-    request_rx:   mpsc::Receiver<ValidatedRequest>,
-    pending:      Vec<ValidatedRequest>,
-    smt:          S,
+    config: RoundConfig,
+    request_rx: mpsc::Receiver<ValidatedRequest>,
+    pending: Vec<ValidatedRequest>,
+    smt: S,
     current_root: [u8; 34],
     /// Total number of leaves committed to the SMT (across all rounds).
-    leaf_count:   u64,
-    state:        Arc<AggregatorState>,
-    bft:          Arc<dyn BftCommitter>,
-    inflight:     Option<InFlightRound<S>>,
-    uc_tx:        mpsc::Sender<anyhow::Result<Vec<u8>>>,
-    uc_rx:        mpsc::Receiver<anyhow::Result<Vec<u8>>>,
+    leaf_count: u64,
+    state: Arc<AggregatorState>,
+    bft: Arc<dyn BftCommitter>,
+    inflight: Option<InFlightRound<S>>,
+    uc_tx: mpsc::Sender<anyhow::Result<Vec<u8>>>,
+    uc_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
     shutdown_notify: Arc<Notify>,
 }
 
@@ -282,7 +324,7 @@ impl RoundManager<smt_store::MemSmt> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
     ) -> Self {
-        Self::with_smt(config, request_rx, state, bft, smt_store::MemSmt::new(), 0)
+        Self::with_smt(config, request_rx, state, bft, smt_store::MemSmt::new())
     }
 }
 
@@ -294,9 +336,8 @@ impl RoundManager<smt_store::DiskSmt> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
         store: smt_store::DiskSmt,
-        initial_leaf_count: u64,
     ) -> Self {
-        Self::with_smt(config, request_rx, state, bft, store, initial_leaf_count)
+        Self::with_smt(config, request_rx, state, bft, store)
     }
 }
 
@@ -308,7 +349,6 @@ impl<S: SmtStore> RoundManager<S> {
         state: Arc<AggregatorState>,
         bft: Arc<dyn BftCommitter>,
         smt: S,
-        initial_leaf_count: u64,
     ) -> Self {
         let current_root = smt.root_hash_imprint();
         let (uc_tx, uc_rx) = mpsc::channel(4);
@@ -318,7 +358,7 @@ impl<S: SmtStore> RoundManager<S> {
             pending: Vec::new(),
             smt,
             current_root,
-            leaf_count: initial_leaf_count,
+            leaf_count: 0, // TODO: recover from DB, currently not done because brute force counting is rather slow
             state,
             bft,
             inflight: None,
@@ -364,7 +404,10 @@ impl<S: SmtStore> RoundManager<S> {
 
         // Discard any in-flight round — its state hasn't been committed.
         if let Some(inf) = self.inflight.take() {
-            warn!(block = inf.block_number, "discarding in-flight round on shutdown");
+            warn!(
+                block = inf.block_number,
+                "discarding in-flight round on shutdown"
+            );
             inf.proposed_snap.discard();
             inf.spec_snap.discard();
         }
@@ -391,43 +434,54 @@ impl<S: SmtStore> RoundManager<S> {
 
     async fn start_round(&mut self) {
         let batch = std::mem::take(&mut self.pending);
-        if batch.is_empty() { return; }
+        if batch.is_empty() {
+            return;
+        }
 
         let block_number = self.state.current_block_number().await;
         info!(block = block_number, count = batch.len(), "starting round");
 
         // Build (path, leaf_value) pairs.
-        let pairs: Vec<(crate::smt::SmtPath, Vec<u8>)> = batch.iter().map(|req| {
-            (
-                state_id_to_smt_path(&req.state_id),
-                compute_cert_data_hash_imprint(
-                    &req.predicate_cbor, &req.source_state_hash,
-                    &req.transaction_hash, &req.witness,
-                ).to_vec(),
-            )
-        }).collect();
+        let pairs: Vec<(crate::smt::SmtPath, Vec<u8>)> = batch
+            .iter()
+            .map(|req| {
+                (
+                    state_id_to_smt_path(&req.state_id),
+                    compute_cert_data_hash_imprint(
+                        &req.predicate_cbor,
+                        &req.source_state_hash,
+                        &req.transaction_hash,
+                        &req.witness,
+                    )
+                    .to_vec(),
+                )
+            })
+            .collect();
 
         let mut proposed_snap = self.smt.create_snapshot();
 
-        let (flags, zk_proof) = match proposed_snap.insert_batch(&pairs, self.config.consistency_proofs) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
-                proposed_snap.discard();
-                self.pending.extend(batch);
-                return;
-            }
-        };
+        let (flags, zk_proof) =
+            match proposed_snap.insert_batch(&pairs, self.config.consistency_proofs) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
+                    proposed_snap.discard();
+                    self.pending.extend(batch);
+                    return;
+                }
+            };
 
-        let inserted: Vec<ProcessedRecord> = batch.iter().zip(flags.iter())
+        let inserted: Vec<ProcessedRecord> = batch
+            .iter()
+            .zip(flags.iter())
             .filter(|(_, &inserted)| inserted)
             .map(|(req, _)| ProcessedRecord {
                 state_id_hex: hex::encode(&req.state_id),
                 cert_data: CertDataFields {
-                    predicate_cbor:    req.predicate_cbor.clone(),
+                    predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
-                    transaction_hash:  req.transaction_hash.clone(),
-                    witness:           req.witness.clone(),
+                    transaction_hash: req.transaction_hash.clone(),
+                    witness: req.witness.clone(),
                 },
             })
             .collect();
@@ -448,9 +502,18 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
-        if let Err(e) = self.bft.commit_block(
-            block_number, &new_root, &prev_root, zk_proof, new_leaves, state_size,
-        ).await {
+        if let Err(e) = self
+            .bft
+            .commit_block(
+                block_number,
+                &new_root,
+                &prev_root,
+                zk_proof,
+                new_leaves,
+                state_size,
+            )
+            .await
+        {
             error!(block = block_number, err = %e, "commit_block failed — rolling back");
             proposed_snap.discard();
             spec_snap.discard();
@@ -459,7 +522,7 @@ impl<S: SmtStore> RoundManager<S> {
         }
 
         // Spawn a task to await the UC.
-        let bft   = Arc::clone(&self.bft);
+        let bft = Arc::clone(&self.bft);
         let uc_tx = self.uc_tx.clone();
         tokio::spawn(async move {
             let result = bft.wait_for_uc(block_number).await;
@@ -478,7 +541,7 @@ impl<S: SmtStore> RoundManager<S> {
             spec_snap,
             submitted_batch: batch,
             inserted,
-            spec_batch:    Vec::new(),
+            spec_batch: Vec::new(),
             spec_inserted: Vec::new(),
         });
     }
@@ -507,9 +570,18 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_leaves = spec_inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
-        if let Err(e) = self.bft.commit_block(
-            block_number, &new_root, &prev_root, None, new_leaves, state_size,
-        ).await {
+        if let Err(e) = self
+            .bft
+            .commit_block(
+                block_number,
+                &new_root,
+                &prev_root,
+                None,
+                new_leaves,
+                state_size,
+            )
+            .await
+        {
             error!(block = block_number, err = %e, "commit_block (spec promotion) failed — rolling back");
             spec_snap.discard();
             new_spec_snap.discard();
@@ -517,7 +589,7 @@ impl<S: SmtStore> RoundManager<S> {
             return;
         }
 
-        let bft   = Arc::clone(&self.bft);
+        let bft = Arc::clone(&self.bft);
         let uc_tx = self.uc_tx.clone();
         tokio::spawn(async move {
             let result = bft.wait_for_uc(block_number).await;
@@ -532,12 +604,12 @@ impl<S: SmtStore> RoundManager<S> {
         self.inflight = Some(InFlightRound {
             block_number,
             new_root,
-            proposed_snap:   spec_snap,
-            spec_snap:       new_spec_snap,
+            proposed_snap: spec_snap,
+            spec_snap: new_spec_snap,
             submitted_batch: spec_batch,
-            inserted:        spec_inserted,
-            spec_batch:      Vec::new(),
-            spec_inserted:   Vec::new(),
+            inserted: spec_inserted,
+            spec_batch: Vec::new(),
+            spec_inserted: Vec::new(),
         });
 
         // Drain any pending requests into the new speculative layer.
@@ -552,13 +624,18 @@ impl<S: SmtStore> RoundManager<S> {
     fn insert_speculative(&mut self, req: ValidatedRequest) {
         let inf = match self.inflight.as_mut() {
             Some(i) => i,
-            None => { self.pending.push(req); return; }
+            None => {
+                self.pending.push(req);
+                return;
+            }
         };
 
-        let path  = state_id_to_smt_path(&req.state_id);
+        let path = state_id_to_smt_path(&req.state_id);
         let value = compute_cert_data_hash_imprint(
-            &req.predicate_cbor, &req.source_state_hash,
-            &req.transaction_hash, &req.witness,
+            &req.predicate_cbor,
+            &req.source_state_hash,
+            &req.transaction_hash,
+            &req.witness,
         );
 
         match inf.spec_snap.add_leaf(path, value.to_vec()) {
@@ -566,10 +643,10 @@ impl<S: SmtStore> RoundManager<S> {
                 inf.spec_inserted.push(ProcessedRecord {
                     state_id_hex: hex::encode(&req.state_id),
                     cert_data: CertDataFields {
-                        predicate_cbor:    req.predicate_cbor.clone(),
+                        predicate_cbor: req.predicate_cbor.clone(),
                         source_state_hash: req.source_state_hash.clone(),
-                        transaction_hash:  req.transaction_hash.clone(),
-                        witness:           req.witness.clone(),
+                        transaction_hash: req.transaction_hash.clone(),
+                        witness: req.witness.clone(),
                     },
                 });
                 inf.spec_batch.push(req);
@@ -588,7 +665,10 @@ impl<S: SmtStore> RoundManager<S> {
     async fn on_uc_result(&mut self, uc_result: anyhow::Result<Vec<u8>>) {
         let inf = match self.inflight.take() {
             Some(i) => i,
-            None => { warn!("UC arrived but no inflight round"); return; }
+            None => {
+                warn!("UC arrived but no inflight round");
+                return;
+            }
         };
 
         match uc_result {
@@ -608,13 +688,18 @@ impl<S: SmtStore> RoundManager<S> {
 
                 let certified_count = finalized.len();
                 let submitted_count = inf.submitted_batch.len();
-                let spec_count      = inf.spec_batch.len();
+                let spec_count = inf.spec_batch.len();
 
-                self.state.finalize_round(BlockInfo {
-                    block_number: inf.block_number,
-                    root_hash: inf.new_root,
-                    uc_cbor,
-                }, finalized).await;
+                self.state
+                    .finalize_round(
+                        BlockInfo {
+                            block_number: inf.block_number,
+                            root_hash: inf.new_root,
+                            uc_cbor,
+                        },
+                        finalized,
+                    )
+                    .await;
 
                 info!(
                     block       = inf.block_number,
@@ -628,8 +713,12 @@ impl<S: SmtStore> RoundManager<S> {
                 if !inf.spec_batch.is_empty() {
                     let next_block = self.state.current_block_number().await;
                     self.start_round_from_spec(
-                        next_block, inf.spec_snap, inf.spec_batch, inf.spec_inserted,
-                    ).await;
+                        next_block,
+                        inf.spec_snap,
+                        inf.spec_batch,
+                        inf.spec_inserted,
+                    )
+                    .await;
                 } else {
                     inf.spec_snap.discard();
                     // Start a new round if there are pending requests.
@@ -652,7 +741,11 @@ impl<S: SmtStore> RoundManager<S> {
 
     // ── Proof generation ──────────────────────────────────────────────────────
 
-    fn generate_proofs(&mut self, processed: Vec<ProcessedRecord>, block_number: u64) -> Vec<FinalizedRecord> {
+    fn generate_proofs(
+        &mut self,
+        processed: Vec<ProcessedRecord>,
+        block_number: u64,
+    ) -> Vec<FinalizedRecord> {
         use rsmt::proof::merkle_path_to_cbor;
 
         // Decode state_ids and build paths up front; track which indices are valid.
@@ -664,7 +757,9 @@ impl<S: SmtStore> RoundManager<S> {
                     paths.push(state_id_to_smt_path(&b));
                     valid.push((i, b));
                 }
-                Err(e) => { warn!("invalid state_id_hex: {e}"); }
+                Err(e) => {
+                    warn!("invalid state_id_hex: {e}");
+                }
             }
         }
 
@@ -682,7 +777,10 @@ impl<S: SmtStore> RoundManager<S> {
         for (j, (orig_idx, _state_id)) in valid.into_iter().enumerate() {
             let merkle_path_cbor = match merkle_path_to_cbor(&merkle_paths[j]) {
                 Ok(c) => c,
-                Err(e) => { warn!(err = %e, "merkle_path_to_cbor failed"); continue; }
+                Err(e) => {
+                    warn!(err = %e, "merkle_path_to_cbor failed");
+                    continue;
+                }
             };
             out.push(FinalizedRecord {
                 state_id_hex: processed_vec[orig_idx].state_id_hex.clone(),

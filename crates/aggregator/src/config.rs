@@ -80,6 +80,27 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_SMT_BACKEND", default_value = "")]
     pub smt_backend: String,
 
+    /// UC inactivity timeout in milliseconds.  If no UnicityCertificate is
+    /// received within this period the aggregator re-sends the handshake to
+    /// BFT Core to refresh its subscription.
+    ///
+    /// BFT Core sends repeat UCs every T2 interval; this timeout is a safety
+    /// net for when those stop arriving (e.g. silent connection loss).  Set to
+    /// at least 3× T2 so normal repeat-UC delivery is never mistaken for
+    /// inactivity.
+    #[arg(long, env = "AGGREGATOR_UC_TIMEOUT_MS", default_value_t = 15000)]
+    pub uc_timeout_ms: u64,
+
+    /// Use InputRecord.Hash from the last UC as PreviousHash in cert requests,
+    /// instead of the aggregator's actual previous SMT root.
+    ///
+    /// Without this flag the aggregator sends its real previous root hash as
+    /// PreviousHash, which MUST form a continuous chain with the hashes
+    /// certified by BFT Core.  Enable this flag only for testing scenarios
+    /// where we're too lazy to reset the BFT Core between stateless aggr. runs.
+    #[arg(long, env = "AGGREGATOR_FAKE_STATE_TRANSITIONS", default_value_t = false)]
+    pub fake_state_transitions: bool,
+
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,

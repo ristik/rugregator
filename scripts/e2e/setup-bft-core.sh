@@ -84,6 +84,12 @@ AGGREGATOR_BFT_ADDR=/ip4/127.0.0.1/tcp/26652
 AGGREGATOR_P2P_ADDR=/ip4/0.0.0.0/tcp/0
 AGGREGATOR_AUTH_KEY=$(jq -r '.authKey.privateKey' "$AGG_HOME/keys.json" | sed 's/0x//')
 AGGREGATOR_SIG_KEY=$(jq -r '.sigKey.privateKey' "$AGG_HOME/keys.json" | sed 's/0x//')
+AGGREGATOR_DB_PATH=$AGG_HOME/db
+AGGREGATOR_SMT_BACKEND=disk
+AGGREGATOR_ROUND_DURATION_MS=1000
+AGGREGATOR_BATCH_LIMIT=50000
+AGGREGATOR_UC_TIMEOUT_MS=15000
+RUST_LOG=info
 EOF
 echo "    Aggregator env: $E2E_DATA/aggregator.env"
 
