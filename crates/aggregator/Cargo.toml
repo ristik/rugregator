@@ -36,10 +36,6 @@ rsmt.workspace       = true
 # SMT store (disk + memory backends)
 smt-store.workspace  = true
 
-# BigInt for SMT paths
-num-bigint.workspace = true
-num-traits.workspace = true
-
 # Serialization
 serde.workspace = true
 serde_json.workspace = true

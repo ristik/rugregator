@@ -112,28 +112,28 @@ async fn main() -> anyhow::Result<()> {
         match smt_backend {
             "disk" => {
                 let disk_smt = DiskSmt::open(arc_db, cfg.cache_mb * 1024 * 1024)?;
-                info!(root = %hex::encode(disk_smt.root_hash_imprint()),
+                info!(root = %disk_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "disk-backed SMT ready");
                 let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt);
                 spawn_rm!(rm, state)
             }
             "mem-leaves" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesOnly)?;
-                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves-only) ready");
                 let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             "mem-leaves-x" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesWithShutdownSnapshot)?;
-                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves + shutdown snapshot) ready");
                 let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)
             }
             "mem-full" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::Full)?;
-                info!(root = %hex::encode(mem_smt.root_hash_imprint()),
+                info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (full-nodes) ready");
                 let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
                 spawn_rm!(rm, state)

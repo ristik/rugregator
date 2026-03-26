@@ -133,8 +133,9 @@ fn encode_record(block_number: u64, cert: &CertDataFields, merkle_path_cbor: &[u
 }
 
 fn encode_block(b: &BlockInfo) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34 + 4 + b.uc_cbor.len());
-    buf.extend_from_slice(&b.root_hash);
+    let root = b.root_hash.unwrap_or([0u8; 32]);
+    let mut buf = Vec::with_capacity(32 + 4 + b.uc_cbor.len());
+    buf.extend_from_slice(&root);
     write_var(&mut buf, &b.uc_cbor);
     buf
 }
@@ -166,8 +167,9 @@ fn decode_record(key: &[u8], val: &[u8]) -> anyhow::Result<(String, RecordInfo)>
 
 fn decode_block(key: &[u8], val: &[u8]) -> anyhow::Result<BlockInfo> {
     let block_number = u64::from_be_bytes(key.try_into()?);
-    let root_hash: [u8; 34] = val[..34].try_into()?;
-    let mut p = 34usize;
+    let raw: [u8; 32] = val[..32].try_into()?;
+    let root_hash = if raw == [0u8; 32] { None } else { Some(raw) };
+    let mut p = 32usize;
     let uc_cbor = read_var(val, &mut p)?;
     Ok(BlockInfo { block_number, root_hash, uc_cbor })
 }

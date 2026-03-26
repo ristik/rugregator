@@ -184,7 +184,7 @@ pub fn parse_certification_request_bytes(raw: &[u8]) -> Result<ParsedCertificati
 ///   blockNumber: uint,
 ///   CBOR_ARRAY(3) [           -- InclusionProofV2
 ///     certificationData: null | CBOR_ARRAY(4)[predicate, ssh, txh, witness],
-///     merkleTreePath: CBOR_ARRAY(2)[root_bytes, [[path_bytes, data|null], ...]],
+///     inclusionProof: bytes,  -- raw InclusionProof bytes
 ///     unicityCertificate: bytes,
 ///   ]
 /// ]
@@ -192,11 +192,10 @@ pub fn parse_certification_request_bytes(raw: &[u8]) -> Result<ParsedCertificati
 pub fn encode_inclusion_proof_response(
     block_number: u64,
     cert_data: Option<&CertDataFields>,
-    merkle_path_cbor: &[u8],  // already CBOR-encoded MerkleTreePath
+    merkle_path_cbor: &[u8],  // raw InclusionProof bytes
     uc_cbor: &[u8],           // raw CBOR bytes of the UnicityCertificate
 ) -> Result<String, CborError> {
-    // Decode the already-encoded MerkleTreePath CBOR back to Value for embedding.
-    let path_val = decode_cbor_value(merkle_path_cbor)?;
+    let path_val = Value::Bytes(merkle_path_cbor.to_vec());
 
     let cert_val = match cert_data {
         None => Value::Null,

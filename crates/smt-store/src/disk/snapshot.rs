@@ -3,10 +3,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use rocksdb::DB;
-use rsmt::path::SmtPath;
+use rsmt::path::SmtKey;
 use rsmt::tree::SmtError;
-use rsmt::hash::build_imprint;
-use rsmt::tree::calc_node_hash;
 use rsmt::consistency::batch_insert;
 
 use super::store::DiskSmt;
@@ -17,12 +15,11 @@ use super::persister::persist_modified;
 /// Speculative working copy of the disk-backed SMT for one round.
 pub struct DiskSmtSnapshot {
     db:             Arc<DB>,
-    key_length:     usize,
     own_overlay:    Overlay,
     parent_overlay: Option<Arc<Overlay>>,
-    pending_set:    HashSet<SmtPath>,
-    pending:        Vec<(SmtPath, Vec<u8>)>,
-    pub(crate) cached_root: Option<[u8; 34]>,
+    pending_set:    HashSet<SmtKey>,
+    pending:        Vec<(SmtKey, Vec<u8>)>,
+    pub(crate) cached_root: Option<Option<[u8; 32]>>,
 }
 
 impl DiskSmtSnapshot {
@@ -30,30 +27,29 @@ impl DiskSmtSnapshot {
     pub fn create(store: &DiskSmt) -> Self {
         Self {
             db:             Arc::clone(&store.db),
-            key_length:     store.key_length,
             own_overlay:    Overlay::new(),
             parent_overlay: None,
             pending_set:    HashSet::new(),
             pending:        Vec::new(),
-            cached_root:    Some(store.root_hash_imprint()),
+            cached_root:    Some(store.current_root),
         }
     }
 
     /// Add a single leaf to the snapshot (deferred).
-    pub fn add_leaf_inner(&mut self, path: SmtPath, value: Vec<u8>) -> Result<(), SmtError> {
-        if self.pending_set.contains(&path) {
+    pub fn add_leaf_inner(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
+        if self.pending_set.contains(&key) {
             return Err(SmtError::DuplicateLeaf);
         }
-        self.pending_set.insert(path.clone());
-        self.pending.push((path, value));
+        self.pending_set.insert(key);
+        self.pending.push((key, value));
         self.cached_root = None;
         Ok(())
     }
 
-    /// Current working root hash imprint (34 bytes).
-    pub fn root_hash_imprint_inner(&mut self) -> anyhow::Result<[u8; 34]> {
+    /// Current working root hash.
+    pub fn root_hash_inner(&mut self) -> anyhow::Result<Option<[u8; 32]>> {
         self.flush_pending()?;
-        Ok(self.cached_root.unwrap_or_else(|| build_imprint(&[0u8; 32])))
+        Ok(self.cached_root.flatten())
     }
 
     /// Fork this snapshot into a speculative copy for the next round.
@@ -64,7 +60,6 @@ impl DiskSmtSnapshot {
         let parent = Arc::new(self.own_overlay.clone());
         Self {
             db:             Arc::clone(&self.db),
-            key_length:     self.key_length,
             own_overlay:    Overlay::new(),
             parent_overlay: Some(parent),
             pending_set:    HashSet::new(),
@@ -74,17 +69,13 @@ impl DiskSmtSnapshot {
     }
 
     /// Commit this snapshot to `store`.
-    pub fn commit_inner(mut self, store: &mut DiskSmt, new_root: [u8; 34]) -> anyhow::Result<()> {
+    pub fn commit_inner(mut self, store: &mut DiskSmt, new_root: Option<[u8; 32]>) -> anyhow::Result<()> {
         self.flush_pending()?;
         store.commit_overlay(self.own_overlay, new_root)
     }
 
     /// Discard this snapshot without committing.
-    pub fn discard_inner(self) {
-        // own_overlay, pending, and parent_overlay (Arc) are all dropped here.
-    }
-
-    // ── Internal ─────────────────────────────────────────────────────────────
+    pub fn discard_inner(self) {}
 
     fn flush_pending(&mut self) -> anyhow::Result<()> {
         if self.pending.is_empty() {
@@ -99,15 +90,12 @@ impl DiskSmtSnapshot {
             &self.own_overlay,
             parent,
             &pending,
-            self.key_length,
         )?;
 
         batch_insert(&mut smt, &pending)?;
 
-        let raw  = calc_node_hash(&mut smt.root);
-        let root = build_imprint(&raw);
-
-        persist_modified(&mut smt, &mut self.own_overlay);
+        let root = smt.root_hash();
+        persist_modified(&smt, &mut self.own_overlay);
 
         self.cached_root = Some(root);
         Ok(())
@@ -117,12 +105,12 @@ impl DiskSmtSnapshot {
 impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
     type Store = DiskSmt;
 
-    fn add_leaf(&mut self, path: SmtPath, value: Vec<u8>) -> Result<(), SmtError> {
-        self.add_leaf_inner(path, value)
+    fn add_leaf(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
+        self.add_leaf_inner(key, value)
     }
 
-    fn root_hash_imprint(&mut self) -> anyhow::Result<[u8; 34]> {
-        self.root_hash_imprint_inner()
+    fn root_hash(&mut self) -> anyhow::Result<Option<[u8; 32]>> {
+        self.root_hash_inner()
     }
 
     fn fork(&mut self) -> Self {
@@ -130,7 +118,7 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
     }
 
     fn commit(self, store: &mut DiskSmt) -> anyhow::Result<()> {
-        let root = self.cached_root.unwrap_or_else(|| store.root_hash_imprint());
+        let root = self.cached_root.flatten().or(store.current_root);
         self.commit_inner(store, root)
     }
 

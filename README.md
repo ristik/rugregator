@@ -2,15 +2,14 @@
 
 An experimental aggregation node for the [Unicity](https://unicity.network) network. Accepts client transaction certification requests, batches them into rounds, proposes each round's state transition to BFT Core for certification, and returns verifiable inclusion proofs backed by a Radix / Sparse Merkle Tree (SMT).
 
-This is a Rust reimplementation of `aggregator-go`, producing **wire-identical** outputs: same SMT root hashes, same CBOR encoding, same proof structure, but with real secure state transitions and optional consistency proofs for trustless operation.
-
 Focus areas:
+- SMT structure providing efficient consistency proofs for trustless operation
 - Consistency proofs for every round of operation
 - Scaling beyond available system memory (fully disk-backed SMT)
 - Speculative execution of the next round while waiting for BFT certification
 - Configurable persistence — trade off restart speed vs. memory footprint vs. performance
 - NOT low level optimizations, all single-threaded for measurability
-- NOT Radix SMT structure optimizations (done elsewhere)
+
 
 ---
 

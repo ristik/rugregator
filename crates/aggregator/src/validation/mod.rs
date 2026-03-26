@@ -9,7 +9,7 @@ use thiserror::Error;
 pub use predicate::{validate_pay_to_public_key, PredicateError};
 pub use signature::{verify_signature, SignatureError};
 pub use state_id::{
-    compute_cert_data_hash_imprint, compute_sig_data_hash, compute_state_id, validate_state_id,
+    compute_cert_data_hash, compute_sig_data_hash, compute_state_id, validate_state_id,
 };
 
 // ─── Validation status (matches Go ValidationStatus) ─────────────────────────

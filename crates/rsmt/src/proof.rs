@@ -1,300 +1,311 @@
-//! SMT inclusion proof generation.
+//! Bitmap+siblings inclusion proof for the Sparse Merkle Tree.
 //!
-//! Translates `generatePath` from `aggregator-go/internal/smt/smt.go:618-701`
-//! and the CBOR wire format from `aggregator-go/pkg/api/smt_cbor.go`.
+//! An inclusion proof demonstrates that a specific `(key, value)` exists in
+//! a tree with a given root hash.
+//!
+//! ## Format
+//!
+//! - `bitmap`: `[u8; 32]` — set bits indicate node depths on the path.
+//! - `siblings`: `Vec<[u8; 32]>` — sibling hashes ordered leaf-to-root.
+//!
+//! ## Verification
+//!
+//! 1. `h = hash_leaf(key, value)`
+//! 2. For each set bit in `bitmap` (ascending = leaf-to-root):
+//!    - If `key_bit_at(key, depth) == 0`: `h = hash_node(h, sibling, depth)`
+//!    - Else: `h = hash_node(sibling, h, depth)`
+//! 3. Accept iff `h == root`.
 
-use num_bigint::BigUint;
-use num_traits::Zero;
-
-use crate::path::{bit_at, calculate_common_path, path_to_decimal, rsh, SmtPath};
-use crate::tree::{calc_node_hash, SmtError, SparseMerkleTree};
-use crate::types::{Branch, NodeBranch};
+use crate::hash::{hash_leaf, hash_node};
+use crate::path::{key_bit_at, SmtKey};
+use crate::tree::{SmtError, SparseMerkleTree};
+use crate::types::{branch_hash, Branch};
 
 // ─── Proof types ─────────────────────────────────────────────────────────────
 
-/// One step in a Merkle path proof.
-///
-/// `path` is the decimal string of the node's relative path.
-/// `data` is either the sibling's raw 32-byte hash (hex) or the leaf value (hex),
-/// or `None` if the child is absent.
+/// An inclusion proof for a single leaf.
 #[derive(Debug, Clone)]
-pub struct MerkleTreeStep {
-    /// Decimal string of the relative path (base-10 BigUint).
-    pub path: String,
-    /// Hex-encoded data: sibling hash (32 bytes) for nodes, value for leaf.
-    pub data: Option<String>,
+pub struct InclusionProof {
+    /// Bitmap: set bits indicate node depths on the proof path.
+    pub bitmap: [u8; 32],
+    /// Sibling hashes, ordered leaf-to-root (ascending depth order).
+    pub siblings: Vec<[u8; 32]>,
 }
 
-/// A complete inclusion proof from leaf to root.
-///
-/// `root` is the hex-encoded 34-byte imprint of the root hash.
-/// `steps` are ordered leaf-first (deepest first), root-step last.
-#[derive(Debug, Clone)]
-pub struct MerkleTreePath {
-    /// Hex-encoded 34-byte imprint of the SMT root.
-    pub root: String,
-    /// Proof steps, leaf first.
-    pub steps: Vec<MerkleTreeStep>,
+impl InclusionProof {
+    /// Number of siblings (= popcount of bitmap).
+    pub fn sibling_count(&self) -> usize {
+        self.siblings.len()
+    }
+
+    /// Serialize to wire format: `[bitmap_32B, sibling_0_32B, ...]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.siblings.len() * 32);
+        out.extend_from_slice(&self.bitmap);
+        for s in &self.siblings {
+            out.extend_from_slice(s);
+        }
+        out
+    }
+
+    /// Deserialize from wire format.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < 32 {
+            return Err("too short for bitmap");
+        }
+        let mut bitmap = [0u8; 32];
+        bitmap.copy_from_slice(&data[..32]);
+
+        let rest = &data[32..];
+        if rest.len() % 32 != 0 {
+            return Err("sibling data not aligned to 32 bytes");
+        }
+
+        let expected = bitmap.iter().map(|b| b.count_ones()).sum::<u32>() as usize;
+        let actual = rest.len() / 32;
+        if actual != expected {
+            return Err("sibling count does not match bitmap popcount");
+        }
+
+        let siblings: Vec<[u8; 32]> = rest
+            .chunks_exact(32)
+            .map(|c| {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(c);
+                h
+            })
+            .collect();
+
+        Ok(Self { bitmap, siblings })
+    }
 }
 
 // ─── Proof generation ─────────────────────────────────────────────────────────
 
 impl SparseMerkleTree {
-    /// Generate an inclusion proof for the leaf at `path`.
+    /// Generate an inclusion proof for the leaf at `key`.
     ///
-    /// `path` must be the same full path (with sentinel) used during insertion.
-    ///
-    /// Returns `SmtError::LeafNotFound` if no leaf exists at that path.
-    pub fn get_path(&mut self, path: &SmtPath) -> Result<MerkleTreePath, SmtError> {
-        // Validate key length.
-        let kl = path.bits() as usize - 1;
-        if kl != self.key_length {
-            return Err(SmtError::KeyLength { expected: self.key_length, got: kl });
-        }
-        // Validate shard.
-        let cp = calculate_common_path(path, &self.root.path);
-        if cp.bits() as usize != self.root.path.bits() as usize {
-            return Err(SmtError::WrongShard);
-        }
+    /// Returns `Err(LeafNotFound)` if no leaf exists at that key.
+    pub fn get_inclusion_proof(&self, key: &SmtKey) -> Result<InclusionProof, SmtError> {
+        let root = self.root.as_ref().ok_or(SmtError::LeafNotFound)?;
 
-        // Compute root hash (fills caches).
-        let raw_root = calc_node_hash(&mut self.root);
-        let root_hex = hex::encode(super::hash::build_imprint(&raw_root));
+        let mut bitmap = [0u8; 32];
+        let mut siblings: Vec<[u8; 32]> = Vec::new();
 
-        // Generate proof steps (leaf-first).
-        let steps = generate_path(&self.root, path, true);
+        generate_proof(root, key, 0, &mut bitmap, &mut siblings)?;
 
-        Ok(MerkleTreePath { root: root_hex, steps })
+        Ok(InclusionProof { bitmap, siblings })
     }
 }
 
-/// Recursive proof generation.  Translates Go `generatePath`.
-///
-/// Returns steps in leaf-first order (deepest first), to be collected bottom-up.
-fn generate_path(node: &NodeBranch, remaining_path: &SmtPath, is_root: bool) -> Vec<MerkleTreeStep> {
-    // --- Compute effective path for this node (matches Go shard-root adjustment) ---
-    let effective_path: SmtPath = if is_root && node.path.bits() > 1 {
-        let pos = node.path.bits() as usize - 2;
-        let last_bit = bit_at(&node.path, pos);
-        BigUint::from(2u8 + last_bit)
-    } else {
-        node.path.clone()
-    };
-
-    // --- Compute child hashes ---
-    let left_hex: Option<String> = node.left.as_ref().map(|arc| hex::encode(crate::types::branch_hash_cached(arc)));
-    let right_hex: Option<String> = node.right.as_ref().map(|arc| hex::encode(crate::types::branch_hash_cached(arc)));
-
-    // --- Check if path diverges before this node ---
-    let cp = calculate_common_path(remaining_path, &node.path);
-    if !is_root && cp.bits() < node.path.bits() {
-        // Remaining path ends or diverges here — return a 2-step proof.
-        return vec![
-            MerkleTreeStep { path: "0".into(), data: left_hex },
-            MerkleTreeStep { path: path_to_decimal(&effective_path), data: right_hex },
-        ];
-    }
-
-    // --- Descend ---
-    let shift = cp.bits() as usize - 1;
-    let sub_path = rsh(remaining_path, shift);
-    let goes_right = bit_at(&sub_path, 0) == 1;
-
-    if goes_right {
-        // Target is in right subtree; left hash is the sibling.
-        let node_step = MerkleTreeStep {
-            path: path_to_decimal(&effective_path),
-            data: left_hex,
-        };
-        let sub_steps = match node.right.as_ref() {
-            None => vec![MerkleTreeStep { path: "1".into(), data: None }],
-            Some(right) => generate_path_branch(&**right, &sub_path),
-        };
-        let mut steps = sub_steps;
-        steps.push(node_step);
-        steps
-    } else {
-        // Target is in left subtree; right hash is the sibling.
-        let node_step = MerkleTreeStep {
-            path: path_to_decimal(&effective_path),
-            data: right_hex,
-        };
-        let sub_steps = match node.left.as_ref() {
-            None => vec![MerkleTreeStep { path: "0".into(), data: None }],
-            Some(left) => generate_path_branch(&**left, &sub_path),
-        };
-        let mut steps = sub_steps;
-        steps.push(node_step);
-        steps
-    }
-}
-
-fn generate_path_branch(branch: &Branch, remaining_path: &SmtPath) -> Vec<MerkleTreeStep> {
-    match branch {
+/// Walk tree from root to leaf, collecting sibling hashes.
+fn generate_proof(
+    node: &Branch,
+    key: &SmtKey,
+    start_bit: usize,
+    bitmap: &mut [u8; 32],
+    siblings: &mut Vec<[u8; 32]>,
+) -> Result<(), SmtError> {
+    match node {
         Branch::Leaf(l) => {
-            let path_str = path_to_decimal(&l.path);
-            let data = if l.value.is_empty() {
-                None
+            if l.key == *key {
+                Ok(())
             } else {
-                Some(hex::encode(&l.value))
-            };
-            vec![MerkleTreeStep { path: path_str, data }]
-        }
-        Branch::Node(n) => generate_path(n, remaining_path, false),
-        Branch::Stub(_) => panic!("generate_path_branch: Stub on the proof path — materialize this node first"),
-    }
-}
-
-// ─── CBOR wire format ─────────────────────────────────────────────────────────
-
-/// Serialize a `MerkleTreePath` to CBOR bytes.
-///
-/// Wire format (matching Go `merkleTreePathCBOR`):
-/// ```text
-/// CBOR_ARRAY(2) [
-///   CBOR_BYTES(root_raw_bytes),       -- 34 bytes
-///   CBOR_ARRAY(n_steps) [
-///     CBOR_ARRAY(2) [path_bigint_be, data_bytes | null],
-///     ...
-///   ]
-/// ]
-/// ```
-pub fn merkle_path_to_cbor(path: &MerkleTreePath) -> Result<Vec<u8>, anyhow::Error> {
-    use ciborium::Value;
-
-    let root_bytes = hex::decode(&path.root)
-        .map_err(|e| anyhow::anyhow!("invalid root hex: {e}"))?;
-
-    let steps: Vec<Value> = path.steps.iter().map(|step| {
-        let path_n = BigUint::parse_bytes(step.path.as_bytes(), 10)
-            .ok_or_else(|| anyhow::anyhow!("invalid path decimal: {}", step.path));
-
-        let path_bytes = path_n.map(|n| n.to_bytes_be()).unwrap_or_default();
-
-        let data_val = match &step.data {
-            Some(hex_str) => {
-                let data = hex::decode(hex_str).unwrap_or_default();
-                Value::Bytes(data)
+                Err(SmtError::LeafNotFound)
             }
-            None => Value::Null,
-        };
+        }
+        Branch::Node(n) => {
+            let n_path = n.path.path_len();
 
-        Value::Array(vec![Value::Bytes(path_bytes), data_val])
-    }).collect();
+            // Check prefix match.
+            if !n.path.matches_key(key, start_bit) {
+                return Err(SmtError::LeafNotFound);
+            }
 
-    let cbor_val = Value::Array(vec![
-        Value::Bytes(root_bytes),
-        Value::Array(steps),
-    ]);
+            let depth = n.depth as usize;
+            debug_assert_eq!(depth, start_bit + n_path);
 
-    let mut buf = Vec::new();
-    ciborium::ser::into_writer(&cbor_val, &mut buf)
-        .map_err(|e| anyhow::anyhow!("CBOR encode error: {e}"))?;
-    Ok(buf)
+            // Set bit in bitmap at this depth.
+            bitmap[depth / 8] |= 1 << (depth % 8);
+
+            if key_bit_at(key, depth) == 1 {
+                // Target is right; sibling is left.
+                siblings.push(branch_hash(&n.left));
+                generate_proof(&n.right, key, depth + 1, bitmap, siblings)
+            } else {
+                // Target is left; sibling is right.
+                siblings.push(branch_hash(&n.right));
+                generate_proof(&n.left, key, depth + 1, bitmap, siblings)
+            }
+        }
+        Branch::Stub(_) => {
+            panic!("generate_proof: Stub on proof path — materialize first");
+        }
+    }
 }
 
-/// Deserialize a `MerkleTreePath` from CBOR bytes (for testing / SDK compat).
-pub fn merkle_path_from_cbor(data: &[u8]) -> Result<MerkleTreePath, anyhow::Error> {
-    use ciborium::Value;
+// ─── Proof verification ──────────────────────────────────────────────────────
 
-    let val: Value = ciborium::de::from_reader(data)
-        .map_err(|e| anyhow::anyhow!("CBOR decode error: {e}"))?;
+/// Verify an inclusion proof.
+///
+/// Returns `true` if the proof demonstrates that `(key, value)` exists in
+/// a tree with root hash `root`.
+///
+/// Siblings are ordered root-to-leaf (shallowest first). Verification
+/// iterates bitmap bits descending (deepest first) to build up from the
+/// leaf hash to the root hash.
+pub fn verify_inclusion(
+    proof: &InclusionProof,
+    root: &[u8; 32],
+    key: &SmtKey,
+    value: &[u8],
+) -> bool {
+    let mut h = hash_leaf(key, value);
+    // Consume siblings from the end (deepest first).
+    let mut sibling_idx = proof.siblings.len();
 
-    let arr = match val {
-        Value::Array(a) if a.len() == 2 => a,
-        _ => anyhow::bail!("expected 2-element CBOR array for MerkleTreePath"),
-    };
+    // Iterate set bits in bitmap descending (deepest = leaf-to-root).
+    for depth in (0..256usize).rev() {
+        if (proof.bitmap[depth / 8] >> (depth % 8)) & 1 == 0 {
+            continue;
+        }
+        if sibling_idx == 0 {
+            return false;
+        }
+        sibling_idx -= 1;
+        let sibling = &proof.siblings[sibling_idx];
 
-    let root_bytes = match &arr[0] {
-        Value::Bytes(b) => b.clone(),
-        _ => anyhow::bail!("root must be bytes"),
-    };
-    let root = hex::encode(&root_bytes);
-
-    let steps_arr = match &arr[1] {
-        Value::Array(a) => a,
-        _ => anyhow::bail!("steps must be array"),
-    };
-
-    let mut steps = Vec::with_capacity(steps_arr.len());
-    for step_val in steps_arr {
-        let step_arr = match step_val {
-            Value::Array(a) if a.len() == 2 => a,
-            _ => anyhow::bail!("each step must be 2-element array"),
-        };
-        let path_bytes = match &step_arr[0] {
-            Value::Bytes(b) => b.clone(),
-            _ => anyhow::bail!("step path must be bytes"),
-        };
-        let path_n = BigUint::from_bytes_be(&path_bytes);
-        let path_str = if path_n.is_zero() && path_bytes.is_empty() {
-            "0".into()
+        if key_bit_at(key, depth) == 1 {
+            // We went right at this depth, so sibling is left.
+            h = hash_node(sibling, &h, depth as u8);
         } else {
-            path_n.to_str_radix(10)
-        };
-
-        let data = match &step_arr[1] {
-            Value::Bytes(b) if !b.is_empty() => Some(hex::encode(b)),
-            Value::Null | Value::Bytes(_) => None,
-            _ => anyhow::bail!("step data must be bytes or null"),
-        };
-
-        steps.push(MerkleTreeStep { path: path_str, data });
+            // We went left, sibling is right.
+            h = hash_node(&h, sibling, depth as u8);
+        }
     }
 
-    Ok(MerkleTreePath { root, steps })
+    sibling_idx == 0 && h == *root
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
-    use crate::path::state_id_to_smt_path;
+    use super::*;
     use crate::tree::SparseMerkleTree;
 
-    fn id(byte: u8) -> SmtPath {
-        let mut arr = [0u8; 32];
-        arr[31] = byte;
-        state_id_to_smt_path(&arr)
+    fn make_key(byte: u8) -> SmtKey {
+        let mut k = [0u8; 32];
+        k[0] = byte;
+        k
     }
 
     #[test]
     fn single_leaf_proof() {
         let mut tree = SparseMerkleTree::new();
-        let path = id(1);
-        let value = vec![0xabu8; 34];
-        tree.add_leaf(path.clone(), value.clone()).unwrap();
+        let k = make_key(1);
+        let v = vec![0xab; 32];
+        tree.add_leaf(k, v.clone()).unwrap();
 
-        let proof = tree.get_path(&path).unwrap();
-        assert!(!proof.root.is_empty());
-        // First step is the leaf itself
-        assert!(proof.steps[0].data.is_some());
-        assert_eq!(proof.steps[0].data.as_deref(), Some(hex::encode(&value).as_str()));
+        let root = tree.root_hash().unwrap();
+        let proof = tree.get_inclusion_proof(&k).unwrap();
+
+        // Single leaf, no internal nodes — bitmap should be zero.
+        assert_eq!(proof.sibling_count(), 0);
+        assert!(verify_inclusion(&proof, &root, &k, &v));
     }
 
     #[test]
-    fn two_leaf_proof_roundtrip_cbor() {
+    fn two_leaf_proof() {
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf(id(1), vec![1u8; 34]).unwrap();
-        tree.add_leaf(id(2), vec![2u8; 34]).unwrap();
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+        let v1 = vec![1; 32];
+        let v2 = vec![2; 32];
+        tree.add_leaf(k1, v1.clone()).unwrap();
+        tree.add_leaf(k2, v2.clone()).unwrap();
+        let root = tree.root_hash().unwrap();
 
-        let proof = tree.get_path(&id(1)).unwrap();
-        let cbor = merkle_path_to_cbor(&proof).unwrap();
-        let decoded = merkle_path_from_cbor(&cbor).unwrap();
-        assert_eq!(proof.root, decoded.root);
-        assert_eq!(proof.steps.len(), decoded.steps.len());
+        let p1 = tree.get_inclusion_proof(&k1).unwrap();
+        assert!(verify_inclusion(&p1, &root, &k1, &v1));
+
+        let p2 = tree.get_inclusion_proof(&k2).unwrap();
+        assert!(verify_inclusion(&p2, &root, &k2, &v2));
     }
 
     #[test]
     fn missing_leaf_returns_error() {
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf(id(1), vec![1u8; 34]).unwrap();
-        // id(2) was never inserted
-        let r = tree.get_path(&id(2));
-        // The path generation doesn't error on missing leaf - it returns a proof
-        // showing the path does not contain the leaf (the step data will differ).
-        // This is consistent with Go behavior.
-        let _ = r; // just ensure no panic
+        tree.add_leaf(make_key(1), vec![1; 32]).unwrap();
+        let r = tree.get_inclusion_proof(&make_key(2));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn empty_tree_returns_error() {
+        let tree = SparseMerkleTree::new();
+        assert!(tree.get_inclusion_proof(&make_key(1)).is_err());
+    }
+
+    #[test]
+    fn many_leaves_proof() {
+        let mut tree = SparseMerkleTree::new();
+        for i in 0u8..=64 {
+            tree.add_leaf(make_key(i), vec![i; 32]).unwrap();
+        }
+        let root = tree.root_hash().unwrap();
+
+        for i in 0u8..=64 {
+            let k = make_key(i);
+            let v = vec![i; 32];
+            let proof = tree.get_inclusion_proof(&k).unwrap();
+            assert!(
+                verify_inclusion(&proof, &root, &k, &v),
+                "inclusion proof failed for key {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_value_fails_verification() {
+        let mut tree = SparseMerkleTree::new();
+        let k = make_key(42);
+        tree.add_leaf(k, vec![42; 32]).unwrap();
+        let root = tree.root_hash().unwrap();
+        let proof = tree.get_inclusion_proof(&k).unwrap();
+
+        // Wrong value.
+        assert!(!verify_inclusion(&proof, &root, &k, &[99; 32]));
+    }
+
+    #[test]
+    fn wrong_root_fails_verification() {
+        let mut tree = SparseMerkleTree::new();
+        let k = make_key(1);
+        let v = vec![1; 32];
+        tree.add_leaf(k, v.clone()).unwrap();
+        let proof = tree.get_inclusion_proof(&k).unwrap();
+
+        let fake_root = [0xFF; 32];
+        assert!(!verify_inclusion(&proof, &fake_root, &k, &v));
+    }
+
+    #[test]
+    fn proof_serialization_roundtrip() {
+        let mut tree = SparseMerkleTree::new();
+        for i in 1u8..=8 {
+            tree.add_leaf(make_key(i), vec![i; 32]).unwrap();
+        }
+        let root = tree.root_hash().unwrap();
+        let k = make_key(5);
+        let v = vec![5; 32];
+        let proof = tree.get_inclusion_proof(&k).unwrap();
+
+        let bytes = proof.to_bytes();
+        let decoded = InclusionProof::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.bitmap, proof.bitmap);
+        assert_eq!(decoded.siblings, proof.siblings);
+        assert!(verify_inclusion(&decoded, &root, &k, &v));
     }
 }

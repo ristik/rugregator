@@ -3,14 +3,12 @@
 
 use std::sync::Arc;
 use rocksdb::{DB, WriteBatch};
-use rsmt::path::SmtPath;
-use rsmt::proof::MerkleTreePath;
-use rsmt::calc_node_hash;
-use rsmt::hash::build_imprint;
+use rsmt::path::SmtKey;
+use rsmt::proof::InclusionProof;
 use rsmt::consistency::batch_insert;
 
 use super::overlay::Overlay;
-use super::materializer::{CF_SMT_NODES, materialize_for_batch, materialize_for_proof, materialize_for_paths};
+use super::materializer::{CF_SMT_NODES, materialize_for_batch, materialize_for_proof, materialize_for_keys};
 use super::persister::persist_modified;
 
 pub const CF_SMT_META: &str = "smt_meta";
@@ -18,11 +16,9 @@ const KEY_ROOT_HASH: &[u8] = b"root_hash";
 
 // ─── DiskSmt ──────────────────────────────────────────────────────────────────
 
-/// Disk-backed Sparse Merkle Tree: persists leaves and internal nodes in
-/// RocksDB. Relies on RocksDB's built-in block cache for read caching.
+/// Disk-backed Sparse Merkle Tree.
 pub struct DiskSmt {
     pub db:            Arc<DB>,
-    pub key_length:    usize,
     /// Committed root hash (None = empty tree).
     pub current_root:  Option<[u8; 32]>,
 }
@@ -31,64 +27,57 @@ impl DiskSmt {
     /// Open an existing DB, reading the committed root hash from `smt_meta`.
     pub fn open(db: Arc<DB>, _cache_capacity: usize) -> anyhow::Result<Self> {
         let current_root = read_root_hash(&db)?;
-        Ok(Self {
-            db,
-            key_length: rsmt::tree::KEY_LENGTH,
-            current_root,
-        })
+        Ok(Self { db, current_root })
     }
 
     /// Insert a batch without generating a consistency proof.
     ///
-    /// Returns `(new_root_imprint, overlay)`.  The overlay must be committed
-    /// (or discarded) by the caller.
+    /// Returns `(new_root, overlay)`. The overlay must be committed (or discarded).
     pub fn batch_insert_round(
         &self,
-        batch: &[(SmtPath, Vec<u8>)],
-    ) -> anyhow::Result<([u8; 34], Overlay)> {
+        batch: &[(SmtKey, Vec<u8>)],
+    ) -> anyhow::Result<(Option<[u8; 32]>, Overlay)> {
         let empty_overlay = Overlay::new();
 
         let mut smt = materialize_for_batch(
-            &self.db, &empty_overlay, None, batch, self.key_length,
+            &self.db, &empty_overlay, None, batch,
         )?;
 
         batch_insert(&mut smt, batch)?;
 
-        let raw = calc_node_hash(&mut smt.root);
-        let imprint = build_imprint(&raw);
-
+        let root = smt.root_hash();
         let mut overlay = Overlay::new();
-        persist_modified(&mut smt, &mut overlay);
+        persist_modified(&smt, &mut overlay);
 
-        Ok((imprint, overlay))
+        Ok((root, overlay))
     }
 
-    /// Generate an inclusion proof for `leaf_key`.
-    pub fn get_path(
+    /// Generate an inclusion proof for `key`.
+    pub fn get_inclusion_proof(
         &self,
-        leaf_key: &SmtPath,
+        key: &SmtKey,
         overlay: &Overlay,
-    ) -> anyhow::Result<MerkleTreePath> {
-        let mut smt = materialize_for_proof(
-            &self.db, overlay, None, leaf_key, self.key_length,
+    ) -> anyhow::Result<InclusionProof> {
+        let smt = materialize_for_proof(
+            &self.db, overlay, None, key,
         )?;
-        smt.get_path(leaf_key).map_err(|e| anyhow::anyhow!("get_path: {e}"))
+        smt.get_inclusion_proof(key).map_err(|e| anyhow::anyhow!("get_inclusion_proof: {e}"))
     }
 
-    /// Generate inclusion proofs for multiple paths in a single materialization.
-    pub fn get_paths_batch(
+    /// Generate inclusion proofs for multiple keys.
+    pub fn get_inclusion_proofs_batch(
         &mut self,
-        paths: &[SmtPath],
-    ) -> anyhow::Result<Vec<MerkleTreePath>> {
-        if paths.is_empty() {
+        keys: &[SmtKey],
+    ) -> anyhow::Result<Vec<InclusionProof>> {
+        if keys.is_empty() {
             return Ok(vec![]);
         }
         let empty = Overlay::new();
-        let mut smt = materialize_for_paths(
-            &self.db, &empty, None, paths, self.key_length,
+        let smt = materialize_for_keys(
+            &self.db, &empty, None, keys,
         )?;
-        paths.iter()
-            .map(|p| smt.get_path(p).map_err(|e| anyhow::anyhow!("get_path: {e}")))
+        keys.iter()
+            .map(|k| smt.get_inclusion_proof(k).map_err(|e| anyhow::anyhow!("get_inclusion_proof: {e}")))
             .collect()
     }
 
@@ -96,7 +85,7 @@ impl DiskSmt {
     pub fn commit_overlay(
         &mut self,
         overlay: Overlay,
-        new_root: [u8; 34],
+        new_root: Option<[u8; 32]>,
     ) -> anyhow::Result<()> {
         let cf_nodes = self.db.cf_handle(CF_SMT_NODES)
             .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
@@ -107,50 +96,43 @@ impl DiskSmt {
 
         for (key, val_opt) in overlay.into_nodes() {
             match val_opt {
-                Some(val) => {
-                    batch.put_cf(&cf_nodes, &key, &val);
-                }
-                None => {
-                    batch.delete_cf(&cf_nodes, &key);
-                }
+                Some(val) => batch.put_cf(&cf_nodes, &key, &val),
+                None => batch.delete_cf(&cf_nodes, &key),
             }
         }
 
-        batch.put_cf(&cf_meta, KEY_ROOT_HASH, &new_root);
+        if let Some(h) = new_root {
+            batch.put_cf(&cf_meta, KEY_ROOT_HASH, &h);
+        }
         self.db.write(batch)?;
-
-        let raw: [u8; 32] = new_root[2..].try_into().expect("imprint is 34 bytes");
-        self.current_root = Some(raw);
+        self.current_root = new_root;
         Ok(())
     }
 
-    /// Return the committed root hash as a 34-byte imprint.
-    pub fn root_hash_imprint(&self) -> [u8; 34] {
-        match self.current_root {
-            None    => build_imprint(&[0u8; 32]),
-            Some(h) => build_imprint(&h),
-        }
+    /// Return the committed root hash.
+    pub fn root_hash(&self) -> Option<[u8; 32]> {
+        self.current_root
     }
 }
 
 impl crate::traits::SmtStore for DiskSmt {
     type Snapshot = super::snapshot::DiskSmtSnapshot;
 
-    fn root_hash_imprint(&self) -> [u8; 34] {
-        self.root_hash_imprint()
+    fn root_hash(&self) -> Option<[u8; 32]> {
+        self.root_hash()
     }
 
     fn create_snapshot(&self) -> super::snapshot::DiskSmtSnapshot {
         super::snapshot::DiskSmtSnapshot::create(self)
     }
 
-    fn get_path(&mut self, leaf_path: &SmtPath) -> anyhow::Result<MerkleTreePath> {
+    fn get_inclusion_proof(&mut self, key: &SmtKey) -> anyhow::Result<InclusionProof> {
         let empty_overlay = Overlay::new();
-        DiskSmt::get_path(self, leaf_path, &empty_overlay)
+        DiskSmt::get_inclusion_proof(self, key, &empty_overlay)
     }
 
-    fn get_paths_batch(&mut self, paths: &[SmtPath]) -> anyhow::Result<Vec<MerkleTreePath>> {
-        DiskSmt::get_paths_batch(self, paths)
+    fn get_inclusion_proofs_batch(&mut self, keys: &[SmtKey]) -> anyhow::Result<Vec<InclusionProof>> {
+        DiskSmt::get_inclusion_proofs_batch(self, keys)
     }
 }
 
@@ -164,12 +146,11 @@ fn read_root_hash(db: &DB) -> anyhow::Result<Option<[u8; 32]>> {
     match db.get_cf(&cf, KEY_ROOT_HASH)? {
         None => Ok(None),
         Some(v) => {
-            if v.len() == 34 {
-                let raw: [u8; 32] = v[2..].try_into()?;
-                Ok(Some(raw))
-            } else if v.len() == 32 {
-                let raw: [u8; 32] = v[..].try_into()?;
-                Ok(Some(raw))
+            if v.len() == 32 {
+                Ok(Some(v[..].try_into()?))
+            } else if v.len() == 34 {
+                // Legacy 34-byte imprint: skip 2-byte prefix.
+                Ok(Some(v[2..].try_into()?))
             } else {
                 anyhow::bail!("unexpected root hash length: {}", v.len())
             }

@@ -2844,11 +2844,6 @@ dependencies = [
 name = "rsmt"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "ciborium",
- "hex",
- "num-bigint",
- "num-traits",
  "sha2",
  "thiserror 1.0.69",
 ]
@@ -3177,8 +3172,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
- "num-bigint",
- "num-traits",
  "rocksdb",
  "rsmt",
  "tempfile",
@@ -3626,8 +3619,6 @@ dependencies = [
  "hex",
  "libp2p",
  "lru",
- "num-bigint",
- "num-traits",
  "rand 0.8.5",
  "rocksdb",
  "rsmt",

@@ -6,6 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use crate::smt::hash::{cbor_array, cbor_bytes};
+use crate::smt::SmtKey;
 
 /// Compute the raw 32-byte StateID hash from the CBOR-encoded predicate and
 /// the source-state hash.
@@ -48,7 +49,7 @@ pub fn compute_sig_data_hash(source_state_hash: &[u8], transaction_hash: &[u8]) 
     h.finalize().into()
 }
 
-/// Compute the `CertDataHash` imprint (34 bytes) used as the SMT leaf value.
+/// Compute the `CertDataHash` (32 bytes) used as the SMT leaf value.
 ///
 /// ```text
 /// SHA256( CBOR_ARRAY(4)
@@ -58,21 +59,24 @@ pub fn compute_sig_data_hash(source_state_hash: &[u8], transaction_hash: &[u8]) 
 ///         || CBOR_BYTES(witness)
 ///       )
 /// ```
-/// Returns the 34-byte imprint `[0x00, 0x00, ...32_bytes_sha256...]`.
-pub fn compute_cert_data_hash_imprint(
+pub fn compute_cert_data_hash(
     predicate_cbor: &[u8],
     source_state_hash: &[u8],
     transaction_hash: &[u8],
     witness: &[u8],
-) -> [u8; 34] {
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(cbor_array(4));
     h.update(predicate_cbor);         // raw CBOR bytes (not wrapped)
     h.update(cbor_bytes(source_state_hash));
     h.update(cbor_bytes(transaction_hash));
     h.update(cbor_bytes(witness));
-    let raw: [u8; 32] = h.finalize().into();
-    crate::smt::hash::build_imprint(&raw)
+    h.finalize().into()
+}
+
+/// Convert a raw StateID byte slice to an [`SmtKey`].
+pub fn state_id_to_smt_key(state_id: &[u8]) -> SmtKey {
+    crate::smt::state_id_to_smt_key(state_id)
 }
 
 #[cfg(test)]
@@ -121,10 +125,8 @@ mod tests {
     }
 
     #[test]
-    fn cert_data_hash_is_34_bytes() {
-        let imp = compute_cert_data_hash_imprint(&[0x83, 0x01], &[0u8; 32], &[0u8; 32], &[0u8; 65]);
-        assert_eq!(imp.len(), 34);
-        assert_eq!(imp[0], 0x00);
-        assert_eq!(imp[1], 0x00);
+    fn cert_data_hash_is_32_bytes() {
+        let h = compute_cert_data_hash(&[0x83, 0x01], &[0u8; 32], &[0u8; 32], &[0u8; 65]);
+        assert_eq!(h.len(), 32);
     }
 }

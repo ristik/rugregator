@@ -54,8 +54,8 @@ pub struct RecordInfo {
 #[derive(Debug, Clone)]
 pub struct BlockInfo {
     pub block_number: u64,
-    /// 34-byte root hash imprint.
-    pub root_hash: [u8; 34],
+    /// 32-byte root hash (None = empty tree).
+    pub root_hash: Option<[u8; 32]>,
     /// Raw CBOR bytes of the UnicityCertificate.
     pub uc_cbor: Vec<u8>,
 }

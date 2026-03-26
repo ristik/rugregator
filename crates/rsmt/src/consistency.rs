@@ -1,608 +1,617 @@
 //! Consistency proofs for the Sparse Merkle Tree.
 //!
-//! Two public entry-points share a single tree-traversal algorithm:
+//! Two public entry-points:
 //!
 //! - [`batch_insert`]            — fast insert, no proof overhead.
-//! - [`batch_insert_with_proof`] — insert + generate consistency proof.
+//! - [`batch_insert_with_proof`] — insert + generate post-order consistency proof.
 //!
-//! ## Path-encoding note (Go compatibility)
+//! ## Proof format (post-order, 3 opcodes)
 //!
-//! The Go aggregator stores every node's path as the *full remaining prefix*
-//! including the routing bit that directed keys into this subtree.  Concretely,
-//! after a parent node consumes `n_common` data bits at depth `start_bit`, its
-//! children start at `start_bit_child = start_bit + n_common` — the routing bit
-//! at that position is **not** pre-consumed; it becomes the first visible bit
-//! of the child subtree.  This differs from the Python reference (`ndsmt3.py`)
-//! which advances past the routing bit (`start_bit_child = split + 1`).
+//! The proof is a flat stream from LSB-first post-order traversal:
 //!
-//! ## Proof opcodes
+//! | Opcode | Stream encoding | Meaning |
+//! |--------|----------------|---------|
+//! | `S`    | `['S', hash]`  | Unchanged subtree (hash or None for empty). |
+//! | `L`    |  `['L']`       | New leaf — consumer pops from sorted batch. |
+//! | `N`    | `['N', depth]` | Node at depth. Two children precede (left, right). |
 //!
-//! The proof is a flat pre-order sequence of [`ProofOp`] values:
+//! ## Verification (stack machine)
 //!
-//! | Opcode | Meaning |
-//! |--------|---------|
-//! | `S(hash)` | Unchanged subtree carrying its raw hash (None = empty). |
-//! | `N(cp)` | New junction node with common-prefix path `cp`. |
-//! | `L(key)` | New leaf inserted from the batch. |
-//! | `Bl{old_path,key,value}` | Border leaf: existing leaf repositioned. |
-//! | `Bns{old_path,new_path,lh,rh}` | Border node shortened. |
-//!
-//! Verification replays the proof computing both the pre- and post-insertion
-//! root hashes and checks them against the known values.
+//! 1. Sort batch B by LSB-first traversal order (`get_sort_key`).
+//! 2. Scan tokens:
+//!    - `S(h)`: push `(h, h)`.
+//!    - `L`: pop `(k,v)` from sorted batch, push `(None, hash_leaf(k,v))`.
+//!    - `N(depth)`: pop right `(rh0,rh1)`, pop left `(lh0,lh1)`.
+//!      `h0 = resolve_pre_state(lh0, rh0, depth)`,
+//!      `h1 = hash_node(lh1, rh1, depth)`. Push `(h0, h1)`.
+//! 3. Accept iff streams exhausted, stack has one element = `(old_root, new_root)`.
 
-use std::sync::Arc;
 use std::collections::HashMap;
-
-use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use std::sync::Arc;
 
 use crate::hash::{hash_leaf, hash_node};
-use crate::path::{bit_at, path_len, rsh, SmtPath};
-use crate::tree::{calc_node_hash, SmtError};
-use crate::types::{branch_hash_cached, leaf, node, Branch, NodeBranch};
+use crate::path::{get_sort_key, key_bit_at, CompressedPath, SmtKey, KEY_BITS};
+use crate::tree::{SmtError, SparseMerkleTree};
+use crate::types::{branch_hash, make_leaf, make_node, Branch, NodeBranch};
 
 // ─── Proof opcodes ────────────────────────────────────────────────────────────
 
-/// One element of the flat consistency-proof stream.
+/// One element of the flat post-order consistency-proof stream.
 #[derive(Debug, Clone)]
 pub enum ProofOp {
-    /// Unchanged subtree; raw 32-byte SHA-256 hash (None = empty subtree).
+    /// Unchanged subtree hash (`None` = empty subtree).
     S(Option<[u8; 32]>),
-    /// **New** junction node created by this batch (didn't exist before).
-    N(SmtPath),
-    /// **Existing** node being traversed (was already in the tree).
-    Nx(SmtPath),
-    /// New leaf; full sentinel-encoded original key.
-    L(SmtPath),
-    /// Border leaf — existing leaf repositioned by the batch.
-    Bl {
-        old_path: SmtPath,
-        key:      SmtPath,
-        value:    Vec<u8>,
-    },
-    /// Border node shortened — existing node whose common prefix was truncated.
-    Bns {
-        old_path: SmtPath,
-        new_path: SmtPath,
-        lh: Option<[u8; 32]>,
-        rh: Option<[u8; 32]>,
-    },
+    /// New leaf (key/value consumed from sorted batch).
+    L,
+    /// Node at the given depth. Two children precede on the stack.
+    N(u8),
 }
 
-/// Ordered flat consistency proof — a sequence of [`ProofOp`] values.
+/// Ordered flat consistency proof.
 pub type ConsistencyProof = Vec<ProofOp>;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Insert a batch without generating a proof (fast path).
+///
+/// Returns the actually-inserted `(key, value)` pairs (duplicates excluded).
 pub fn batch_insert(
-    tree:  &mut super::tree::SparseMerkleTree,
-    batch: &[(SmtPath, Vec<u8>)],
-) -> Result<Vec<(SmtPath, Vec<u8>)>, SmtError> {
+    tree: &mut SparseMerkleTree,
+    batch: &[(SmtKey, Vec<u8>)],
+) -> Result<Vec<(SmtKey, Vec<u8>)>, SmtError> {
     let (items, _) = run_batch(tree, batch, false)?;
     Ok(items)
 }
 
 /// Insert a batch and generate a consistency proof.
+///
+/// Returns `(inserted_items, proof)`.
 pub fn batch_insert_with_proof(
-    tree:  &mut super::tree::SparseMerkleTree,
-    batch: &[(SmtPath, Vec<u8>)],
-) -> Result<(Vec<(SmtPath, Vec<u8>)>, ConsistencyProof), SmtError> {
+    tree: &mut SparseMerkleTree,
+    batch: &[(SmtKey, Vec<u8>)],
+) -> Result<(Vec<(SmtKey, Vec<u8>)>, ConsistencyProof), SmtError> {
     run_batch(tree, batch, true)
 }
 
 // ─── Core algorithm ───────────────────────────────────────────────────────────
 
 fn run_batch(
-    tree:         &mut super::tree::SparseMerkleTree,
-    batch:        &[(SmtPath, Vec<u8>)],
-    with_proof:   bool,
-) -> Result<(Vec<(SmtPath, Vec<u8>)>, ConsistencyProof), SmtError> {
-    let _depth = tree.key_length;
-
-    let mut seen: HashMap<SmtPath, ()> = HashMap::new();
-    let mut new_items: Vec<(SmtPath, Vec<u8>)> = Vec::new();
+    tree: &mut SparseMerkleTree,
+    batch: &[(SmtKey, Vec<u8>)],
+    with_proof: bool,
+) -> Result<(Vec<(SmtKey, Vec<u8>)>, ConsistencyProof), SmtError> {
+    // Deduplicate and filter already-existing keys.
+    let mut seen: HashMap<SmtKey, ()> = HashMap::new();
+    let mut new_items: Vec<(SmtKey, Vec<u8>)> = Vec::new();
     for (k, v) in batch {
-        if seen.contains_key(k) { continue; }
-        seen.insert(k.clone(), ());
-        match tree.get_leaf(k) {
-            Ok(_)                     => continue,
-            Err(SmtError::LeafNotFound) => {}
-            Err(_)                    => {}
+        if seen.contains_key(k) {
+            continue;
         }
-        new_items.push((k.clone(), v.clone()));
+        seen.insert(*k, ());
+        if tree.find_leaf(k).is_some() {
+            continue;
+        }
+        new_items.push((*k, v.clone()));
     }
 
     if new_items.is_empty() {
         let proof = if with_proof {
-            let h = calc_node_hash(&mut tree.root);
-            vec![ProofOp::S(Some(h))]
+            let h = tree.root_hash();
+            vec![ProofOp::S(h)]
         } else {
             vec![]
         };
         return Ok((vec![], proof));
     }
 
-    new_items.sort_by(|a, b| a.0.cmp(&b.0));
+    // Sort by LSB-first traversal order.
+    new_items.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
 
     let mut proof = Vec::new();
 
-    // Swap out the root, run the recursive algorithm, swap back.
-    let old_root = std::mem::replace(
-        &mut tree.root,
-        NodeBranch::new_root(BigUint::one(), None, None),
-    );
-    let root_arc = Arc::new(Branch::Node(old_root));
-    let proof_out = if with_proof { Some(&mut proof) } else { None };
-    let new_root_arc = insert_node(Some(root_arc), &new_items, 0, proof_out);
-
-    let new_root_branch = Arc::try_unwrap(
-        new_root_arc.expect("root must not disappear")
-    ).unwrap_or_else(|a| (*a).clone());
-
-    match new_root_branch {
-        Branch::Node(mut n) => {
-            n.hash_cache = None; // force lazy recomputation (handles is_root path adj.)
-            tree.root = n;
-        }
-        Branch::Leaf(_) => panic!("tree root became a leaf — logic error"),
-        Branch::Stub(_) => panic!("tree root became a Stub — logic error"),
-    }
+    // Swap out root, run recursive algorithm, swap back.
+    let old_root = tree.root.take();
+    let proof_out = if with_proof {
+        Some(&mut proof)
+    } else {
+        None
+    };
+    let new_root = insert_proof(old_root, &new_items, 0, new_items.len(), 0, proof_out);
+    tree.root = new_root;
 
     Ok((new_items, proof))
 }
 
-// ─── insert_node ─────────────────────────────────────────────────────────────
+// ─── insert_proof ─────────────────────────────────────────────────────────────
 
-fn insert_node(
-    node_opt:  Option<Arc<Branch>>,
-    batch:     &[(SmtPath, Vec<u8>)],
+/// Recursive insertion with optional proof generation.
+///
+/// Operates on the slice `batch[start..end]` which is sorted by `get_sort_key`.
+/// `start_bit` is the current bit position in the key.
+fn insert_proof(
+    node_opt: Option<Arc<Branch>>,
+    batch: &[(SmtKey, Vec<u8>)],
+    start: usize,
+    end: usize,
     start_bit: usize,
     proof_out: Option<&mut Vec<ProofOp>>,
 ) -> Option<Arc<Branch>> {
-    if batch.is_empty() {
+    // No new items for this subtree — emit S and return unchanged.
+    if start == end {
         if let Some(p) = proof_out {
-            let h = node_opt.as_deref().map(|b| branch_hash_cached(b));
+            let h = node_opt.as_deref().map(|b| branch_hash(b));
             p.push(ProofOp::S(h));
         }
         return node_opt;
     }
 
     let Some(arc) = node_opt else {
-        return build_subtree(batch, start_bit, proof_out, None);
+        // Empty subtree — build a new subtree from the batch items.
+        return Some(build_subtree(
+            batch,
+            start,
+            end,
+            start_bit,
+            proof_out,
+            &HashMap::new(),
+        ));
     };
 
-    // CoW: take ownership if sole owner, else clone this branch node.
+    // CoW: take ownership if sole Arc owner, else clone.
     let b = match Arc::try_unwrap(arc) {
         Ok(b) => b,
         Err(a) => (*a).clone(),
     };
 
     match b {
-        // ── Stub: must have been materialized before reaching here ─────────────
-        Branch::Stub(_) => panic!("insert_node: encountered Stub — materialize from disk first"),
+        Branch::Leaf(leaf) => {
+            // Merge existing leaf into the batch and rebuild.
+            let frozen: HashMap<SmtKey, [u8; 32]> =
+                [(leaf.key, leaf.hash)].into_iter().collect();
 
-        // ── Existing leaf ─────────────────────────────────────────────────────
-        Branch::Leaf(l) => {
-            let filtered: Vec<_> = batch
-                .iter()
-                .filter(|(k, _)| k != &l.original_path)
-                .cloned()
-                .collect();
+            // Merge: batch items + existing leaf, sorted.
+            let mut mixed: Vec<(SmtKey, Vec<u8>)> = batch[start..end].to_vec();
+            mixed.push((leaf.key, leaf.value));
+            mixed.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
 
-            if filtered.is_empty() {
-                if let Some(p) = proof_out {
-                    let h = branch_hash_cached(&Branch::Leaf(l.clone()));
-                    p.push(ProofOp::S(Some(h)));
-                }
-                return Some(Arc::new(Branch::Leaf(l)));
-            }
-
-            let old_path = l.path.clone();
-            let border: Option<HashMap<SmtPath, SmtPath>> =
-                proof_out.as_ref().map(|_| {
-                    [(l.original_path.clone(), old_path)].into_iter().collect()
-                });
-
-            let mut all_items: Vec<(SmtPath, Vec<u8>)> =
-                std::iter::once((l.original_path.clone(), l.value.clone()))
-                    .chain(filtered)
-                    .collect();
-            all_items.sort_by(|a, b| a.0.cmp(&b.0));
-
-            build_subtree(&all_items, start_bit, proof_out, border.as_ref())
+            Some(build_subtree(
+                &mixed,
+                0,
+                mixed.len(),
+                start_bit,
+                proof_out,
+                &frozen,
+            ))
         }
 
-        // ── Existing node ─────────────────────────────────────────────────────
-        Branch::Node(mut n) => {
-            let n_path       = path_len(&n.path);
-            let node_prefix: BigUint =
-                &n.path & ((BigUint::one() << n_path) - BigUint::one());
+        Branch::Node(node) => {
+            let n_path = node.path.path_len();
+            let node_prefix_matches = |key: &SmtKey| -> usize {
+                first_divergence_in_prefix(&node.path, key, start_bit)
+            };
 
+            // O(1) divergence check from batch extremes.
             let mut first_div = n_path;
-            for (k, _) in batch {
-                let item_pfx: BigUint =
-                    (k >> start_bit) & ((BigUint::one() << n_path) - BigUint::one());
-                let xor = &item_pfx ^ &node_prefix;
-                if !xor.is_zero() {
-                    let low = xor.trailing_zeros().unwrap() as usize;
-                    if low < first_div { first_div = low; }
-                }
+            let d_start = node_prefix_matches(&batch[start].0);
+            if d_start < first_div {
+                first_div = d_start;
+            }
+            let d_end = node_prefix_matches(&batch[end - 1].0);
+            if d_end < first_div {
+                first_div = d_end;
             }
 
             if first_div < n_path {
-                return Some(node_split(n, batch, start_bit, first_div, proof_out));
+                return Some(node_split_proof(
+                    node, batch, start, end, start_bit, first_div, proof_out,
+                ));
             }
 
-            let split       = start_bit + n_path;
-            let batch_left:  Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, split) == 0).cloned().collect();
-            let batch_right: Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, split) == 1).cloned().collect();
+            // Full prefix match — descend into children.
+            let split = start_bit + n_path;
 
-            n.hash_cache = None;
+            // Binary search for the partition point.
+            let mid = partition_point(batch, start, end, split);
 
             match proof_out {
                 None => {
-                    let old_left  = n.left.take();
-                    n.left  = insert_node(old_left,  &batch_left,  split, None);
-                    let old_right = n.right.take();
-                    n.right = insert_node(old_right, &batch_right, split, None);
+                    let new_left =
+                        insert_proof(Some(node.left), batch, start, mid, split + 1, None);
+                    let new_right =
+                        insert_proof(Some(node.right), batch, mid, end, split + 1, None);
+                    Some(make_node(
+                        node.path,
+                        new_left.expect("left child"),
+                        new_right.expect("right child"),
+                        split as u8,
+                    ))
                 }
                 Some(p) => {
-                    p.push(ProofOp::Nx(n.path.clone()));
-                    let mut left_proof  = Vec::new();
+                    let mut left_proof = Vec::new();
                     let mut right_proof = Vec::new();
-                    let old_left  = n.left.take();
-                    let old_right = n.right.take();
-                    n.left  = insert_node(old_left,  &batch_left,  split, Some(&mut left_proof));
-                    n.right = insert_node(old_right, &batch_right, split, Some(&mut right_proof));
+                    let new_left = insert_proof(
+                        Some(node.left),
+                        batch,
+                        start,
+                        mid,
+                        split + 1,
+                        Some(&mut left_proof),
+                    );
+                    let new_right = insert_proof(
+                        Some(node.right),
+                        batch,
+                        mid,
+                        end,
+                        split + 1,
+                        Some(&mut right_proof),
+                    );
                     p.extend(left_proof);
                     p.extend(right_proof);
+                    p.push(ProofOp::N(split as u8));
+                    Some(make_node(
+                        node.path,
+                        new_left.expect("left child"),
+                        new_right.expect("right child"),
+                        split as u8,
+                    ))
                 }
             }
+        }
 
-            // Recompute hash before wrapping in Arc (invariant).
-            let lh = n.left.as_ref().map(|a| branch_hash_cached(a));
-            let rh = n.right.as_ref().map(|a| branch_hash_cached(a));
-            n.hash_cache = Some(hash_node(&n.path, lh.as_ref(), rh.as_ref()));
-            Some(Arc::new(Branch::Node(n)))
+        Branch::Stub(_) => {
+            panic!("insert_proof: encountered Stub — materialize from disk first");
         }
     }
 }
 
 // ─── build_subtree ────────────────────────────────────────────────────────────
 
+/// Build a fresh subtree from sorted batch items.
+///
+/// `frozen` maps keys of pre-existing leaves to their old hashes (for S opcodes).
 fn build_subtree(
-    batch:            &[(SmtPath, Vec<u8>)],
-    start_bit:        usize,
-    proof_out:        Option<&mut Vec<ProofOp>>,
-    border_old_paths: Option<&HashMap<SmtPath, SmtPath>>,
-) -> Option<Arc<Branch>> {
-    if batch.is_empty() {
-        if let Some(p) = proof_out { p.push(ProofOp::S(None)); }
-        return None;
-    }
+    batch: &[(SmtKey, Vec<u8>)],
+    start: usize,
+    end: usize,
+    start_bit: usize,
+    proof_out: Option<&mut Vec<ProofOp>>,
+    frozen: &HashMap<SmtKey, [u8; 32]>,
+) -> Arc<Branch> {
+    debug_assert!(end > start);
 
-    if batch.len() == 1 {
-        let (k, v) = &batch[0];
-        let new_path = rsh(k, start_bit);
-        let new_leaf = leaf(new_path, v.clone(), k.clone());
+    if end - start == 1 {
+        let (k, v) = &batch[start];
         if let Some(p) = proof_out {
-            match border_old_paths.and_then(|m| m.get(k)) {
-                None           => p.push(ProofOp::L(k.clone())),
-                Some(old_path) => p.push(ProofOp::Bl {
-                    old_path: old_path.clone(),
-                    key:      k.clone(),
-                    value:    v.clone(),
-                }),
+            if let Some(old_hash) = frozen.get(k) {
+                p.push(ProofOp::S(Some(*old_hash)));
+            } else {
+                p.push(ProofOp::L);
             }
         }
-        return Some(new_leaf);
+        return make_leaf(*k, v.clone());
     }
 
-    let keys: Vec<_> = batch.iter().map(|(k, _)| k.clone()).collect();
-    let split = first_split(&keys, start_bit)
-        .expect("multiple distinct keys must diverge somewhere");
+    // Find split point: first diverging bit among the batch items.
+    let xor = xor_keys(&batch[start].0, &batch[end - 1].0);
+    let split = first_set_bit_from(&xor, start_bit);
+
+    // Binary search for partition.
+    let mid = partition_point(batch, start, end, split);
+
+    debug_assert!(mid > start && mid < end, "trivial partition at split={split} start={start} mid={mid} end={end}");
 
     let n_common = split - start_bit;
-    let cbits: BigUint = (&keys[0] >> start_bit)
-        & ((BigUint::one() << n_common) - BigUint::one());
-    let cp = (BigUint::one() << n_common) | cbits;
-
-    let batch_left:  Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, split) == 0).cloned().collect();
-    let batch_right: Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, split) == 1).cloned().collect();
+    let cp = CompressedPath::from_key_range(&batch[start].0, start_bit, n_common);
 
     match proof_out {
         None => {
-            let ln = build_subtree(&batch_left,  split, None, border_old_paths);
-            let rn = build_subtree(&batch_right, split, None, border_old_paths);
-            Some(node(cp, ln, rn))
+            let ln = build_subtree(batch, start, mid, split + 1, None, frozen);
+            let rn = build_subtree(batch, mid, end, split + 1, None, frozen);
+            make_node(cp, ln, rn, split as u8)
         }
         Some(p) => {
-            p.push(ProofOp::N(cp.clone()));
             let mut lp = Vec::new();
             let mut rp = Vec::new();
-            let ln = build_subtree(&batch_left,  split, Some(&mut lp), border_old_paths);
-            let rn = build_subtree(&batch_right, split, Some(&mut rp), border_old_paths);
+            let ln = build_subtree(batch, start, mid, split + 1, Some(&mut lp), frozen);
+            let rn = build_subtree(batch, mid, end, split + 1, Some(&mut rp), frozen);
             p.extend(lp);
             p.extend(rp);
-            Some(node(cp, ln, rn))
+            p.push(ProofOp::N(split as u8));
+            make_node(cp, ln, rn, split as u8)
         }
     }
 }
 
-// ─── node_split ───────────────────────────────────────────────────────────────
+// ─── node_split_proof ────────────────────────────────────────────────────────
 
-fn node_split(
-    mut node_br: NodeBranch,
-    batch:       &[(SmtPath, Vec<u8>)],
-    start_bit:   usize,
-    first_div:   usize,
-    proof_out:   Option<&mut Vec<ProofOp>>,
+/// Split a node when batch items diverge within its common prefix.
+fn node_split_proof(
+    mut node: NodeBranch,
+    batch: &[(SmtKey, Vec<u8>)],
+    start: usize,
+    end: usize,
+    start_bit: usize,
+    first_div: usize,
+    proof_out: Option<&mut Vec<ProofOp>>,
 ) -> Arc<Branch> {
-    let n_path       = path_len(&node_br.path);
-    let node_prefix: BigUint =
-        &node_br.path & ((BigUint::one() << n_path) - BigUint::one());
+    let n_path = node.path.path_len();
+    let n_common = first_div;
+    let new_split = start_bit + n_common;
+    let old_dir = node.path.bit_at(n_common); // which side old node goes
 
-    let n_common    = first_div;
-    let common_bits: BigUint =
-        &node_prefix & ((BigUint::one() << n_common) - BigUint::one());
-    let new_cp      = (BigUint::one() << n_common) | common_bits;
-    let new_split   = start_bit + n_common;
+    // Shorten the old node's path.
+    let remaining = n_path - n_common - 1;
+    node.path =
+        CompressedPath::from_key_range_with_path_bits(&node.path, n_common + 1, remaining);
+    node.hash = None;
+    // Recompute hash for shortened node.
+    let lh = branch_hash(&node.left);
+    let rh = branch_hash(&node.right);
+    node.hash = Some(hash_node(&lh, &rh, node.depth));
 
-    let old_dir = ((node_prefix.clone() >> n_common) & BigUint::one()) == BigUint::one();
+    let new_cp = CompressedPath::from_key_range(&batch[start].0, start_bit, n_common);
 
-    let old_path = node_br.path.clone();
-    let lh: Option<[u8; 32]> = node_br.left.as_ref().map(|a| branch_hash_cached(a));
-    let rh: Option<[u8; 32]> = node_br.right.as_ref().map(|a| branch_hash_cached(a));
+    // Binary search for partition at new_split.
+    let mid = partition_point(batch, start, end, new_split);
 
-    let new_path: SmtPath = {
-        let s = node_br.path.clone() >> n_common;
-        if s.is_zero() { BigUint::one() } else { s }
-    };
-    node_br.path       = new_path.clone();
-    node_br.hash_cache = None;
-
-    let batch_left:  Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, new_split) == 0).cloned().collect();
-    let batch_right: Vec<_> = batch.iter().filter(|(k,_)| bit_at(k, new_split) == 1).cloned().collect();
-
-    // Wrap the (modified) existing node in Arc before passing to insert_node.
-    // Compute its hash since Arc<Branch> invariant requires hash_cache = Some(_).
-    let make_node_arc = |nb: NodeBranch| -> Arc<Branch> {
-        let mut nb = nb;
-        let lh2 = nb.left.as_ref().map(|a| branch_hash_cached(a));
-        let rh2 = nb.right.as_ref().map(|a| branch_hash_cached(a));
-        nb.hash_cache = Some(hash_node(&nb.path, lh2.as_ref(), rh2.as_ref()));
-        Arc::new(Branch::Node(nb))
-    };
+    let old_node: Option<Arc<Branch>> = Some(Arc::new(Branch::Node(node)));
 
     match proof_out {
         None => {
-            let (new_left, new_right) = if !old_dir {
-                let nl = insert_node(Some(make_node_arc(node_br)), &batch_left,  new_split, None);
-                let nr = insert_node(None,                          &batch_right, new_split, None);
+            let (new_left, new_right) = if old_dir == 0 {
+                let nl = insert_proof(old_node, batch, start, mid, new_split + 1, None);
+                let nr = insert_proof(None, batch, mid, end, new_split + 1, None);
                 (nl, nr)
             } else {
-                let nl = insert_node(None,                          &batch_left,  new_split, None);
-                let nr = insert_node(Some(make_node_arc(node_br)), &batch_right, new_split, None);
+                let nl = insert_proof(None, batch, start, mid, new_split + 1, None);
+                let nr = insert_proof(old_node, batch, mid, end, new_split + 1, None);
                 (nl, nr)
             };
-            node(new_cp, new_left, new_right)
+            make_node(
+                new_cp,
+                new_left.expect("left child"),
+                new_right.expect("right child"),
+                new_split as u8,
+            )
         }
         Some(p) => {
-            p.push(ProofOp::N(new_cp.clone()));
-            let bns = ProofOp::Bns { old_path, new_path, lh, rh };
-
             let mut lp = Vec::new();
             let mut rp = Vec::new();
-
-            let (new_left, new_right) = if !old_dir {
-                lp.push(bns);
-                let nl = insert_node(Some(make_node_arc(node_br)), &batch_left,  new_split, Some(&mut lp));
-                let nr = insert_node(None,                          &batch_right, new_split, Some(&mut rp));
+            let (new_left, new_right) = if old_dir == 0 {
+                let nl = insert_proof(old_node, batch, start, mid, new_split + 1, Some(&mut lp));
+                let nr = insert_proof(None, batch, mid, end, new_split + 1, Some(&mut rp));
                 (nl, nr)
             } else {
-                rp.push(bns);
-                let nl = insert_node(None,                          &batch_left,  new_split, Some(&mut lp));
-                let nr = insert_node(Some(make_node_arc(node_br)), &batch_right, new_split, Some(&mut rp));
+                let nl = insert_proof(None, batch, start, mid, new_split + 1, Some(&mut lp));
+                let nr = insert_proof(old_node, batch, mid, end, new_split + 1, Some(&mut rp));
                 (nl, nr)
             };
             p.extend(lp);
             p.extend(rp);
-            node(new_cp, new_left, new_right)
+            p.push(ProofOp::N(new_split as u8));
+            make_node(
+                new_cp,
+                new_left.expect("left child"),
+                new_right.expect("right child"),
+                new_split as u8,
+            )
         }
     }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// First bit position ≥ `start_bit` where adjacent sorted keys diverge.
-fn first_split(keys: &[SmtPath], start_bit: usize) -> Option<usize> {
-    let mut result: Option<usize> = None;
-    for i in 0..keys.len().saturating_sub(1) {
-        let xor = &keys[i] ^ &keys[i + 1];
-        if !xor.is_zero() {
-            let shifted = &xor >> start_bit;
-            if !shifted.is_zero() {
-                let pos = start_bit + shifted.trailing_zeros().unwrap() as usize;
-                result = Some(result.map_or(pos, |r| r.min(pos)));
-            }
-        }
+/// XOR two 32-byte keys.
+#[inline]
+fn xor_keys(a: &SmtKey, b: &SmtKey) -> SmtKey {
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
     }
-    result
+    out
 }
 
-// ─── synchronized_proof_eval ─────────────────────────────────────────────────
+/// Find the first set bit >= `start_bit` in a 256-bit key (LSB-first).
+fn first_set_bit_from(key: &SmtKey, start_bit: usize) -> usize {
+    let byte_idx = start_bit / 8;
+    let bit_off = start_bit % 8;
 
-/// One-pass proof replay computing `(r0, r1)` — pre- and post-insertion hashes.
-pub fn synchronized_proof_eval(
-    proof:      &[ProofOp],
-    depth:      usize,
-    batch_dict: &mut HashMap<SmtPath, Vec<u8>>,
-    pos:        &mut usize,
-    start_bit:  usize,
-) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
-    let _ = depth;
-    if *pos >= proof.len() { return (None, None); }
-
-    match proof[*pos].clone() {
-        ProofOp::S(h) => {
-            *pos += 1;
-            (h, h)
-        }
-
-        ProofOp::N(cp) => {
-            *pos += 1;
-            let n_common = path_len(&cp);
-            let split = start_bit + n_common;
-            let (lh0, lh1) = synchronized_proof_eval(proof, depth, batch_dict, pos, split);
-            let (rh0, rh1) = synchronized_proof_eval(proof, depth, batch_dict, pos, split);
-
-            let h0 = match (lh0, rh0) {
-                (None, None)         => None,
-                (None, rh)           => rh,
-                (lh,   None)         => lh,
-                (Some(lh), Some(rh)) => Some(hash_node(&cp, Some(&lh), Some(&rh))),
-            };
-            let h1 = hash_node(&cp, lh1.as_ref(), rh1.as_ref());
-            (h0, Some(h1))
-        }
-
-        ProofOp::Nx(cp) => {
-            *pos += 1;
-            let n_common = path_len(&cp);
-            let split = start_bit + n_common;
-            let (lh0, lh1) = synchronized_proof_eval(proof, depth, batch_dict, pos, split);
-            let (rh0, rh1) = synchronized_proof_eval(proof, depth, batch_dict, pos, split);
-
-            let h0 = Some(hash_node(&cp, lh0.as_ref(), rh0.as_ref()));
-            let h1 = hash_node(&cp, lh1.as_ref(), rh1.as_ref());
-            (h0, Some(h1))
-        }
-
-        ProofOp::L(k) => {
-            *pos += 1;
-            let v = batch_dict.remove(&k)
-                .expect("proof references key not in batch");
-            let new_path = rsh(&k, start_bit);
-            (None, Some(hash_leaf(&new_path, &v)))
-        }
-
-        ProofOp::Bl { old_path, key, value } => {
-            *pos += 1;
-            let new_path = rsh(&key, start_bit);
-            let h0 = hash_leaf(&old_path, &value);
-            let h1 = hash_leaf(&new_path, &value);
-            (Some(h0), Some(h1))
-        }
-
-        ProofOp::Bns { old_path, new_path, lh, rh } => {
-            *pos += 1;
-            let (inner0, inner1) =
-                synchronized_proof_eval(proof, depth, batch_dict, pos, start_bit);
-            let expected = hash_node(&new_path, lh.as_ref(), rh.as_ref());
-            assert_eq!(inner0, Some(expected), "BNS: inner0 mismatch — forgery?");
-            let h0 = hash_node(&old_path, lh.as_ref(), rh.as_ref());
-            (Some(h0), inner1)
+    // Check the partial first byte.
+    if byte_idx < 32 {
+        let masked = key[byte_idx] >> bit_off;
+        if masked != 0 {
+            return start_bit + masked.trailing_zeros() as usize;
         }
     }
+
+    // Check remaining bytes.
+    for i in (byte_idx + 1)..32 {
+        if key[i] != 0 {
+            return i * 8 + key[i].trailing_zeros() as usize;
+        }
+    }
+
+    KEY_BITS // should not happen for distinct keys
+}
+
+/// Binary search for the partition point: first index in `batch[start..end]`
+/// where the key has bit 1 at position `split`.
+fn partition_point(batch: &[(SmtKey, Vec<u8>)], start: usize, end: usize, split: usize) -> usize {
+    let mut lo = start;
+    let mut hi = end;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if key_bit_at(&batch[mid].0, split) == 1 {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// Check how many bits of a `CompressedPath` match the key starting at
+/// `start_bit`. Returns the number of matching bits (0..=path.path_len()).
+fn first_divergence_in_prefix(
+    path: &CompressedPath,
+    key: &SmtKey,
+    start_bit: usize,
+) -> usize {
+    let n = path.path_len();
+    for i in 0..n {
+        if path.bit_at(i) != key_bit_at(key, start_bit + i) {
+            return i;
+        }
+    }
+    n
 }
 
 // ─── verify_consistency ──────────────────────────────────────────────────────
 
-/// Verify that `proof` witnesses insertion of `batch` into a tree with raw
-/// root hash `old_root`, yielding a tree with raw root hash `new_root`.
+/// Stack-machine verifier for post-order consistency proofs.
+///
+/// Verifies that `proof` witnesses insertion of `batch` into a tree with
+/// root hash `old_root`, yielding root hash `new_root`.
 pub fn verify_consistency(
-    proof:    &ConsistencyProof,
+    proof: &ConsistencyProof,
     old_root: Option<[u8; 32]>,
-    new_root: [u8; 32],
-    batch:    &[(SmtPath, Vec<u8>)],
-    depth:    usize,
+    new_root: Option<[u8; 32]>,
+    batch: &[(SmtKey, Vec<u8>)],
 ) -> bool {
     if batch.is_empty() {
-        return old_root == Some(new_root);
+        return old_root == new_root;
     }
-    let mut dict: HashMap<SmtPath, Vec<u8>> = batch.iter().cloned().collect();
-    let mut pos = 0usize;
-    let (r0, r1) = synchronized_proof_eval(proof, depth, &mut dict, &mut pos, 0);
-    pos == proof.len() && dict.is_empty() && r0 == old_root && r1 == Some(new_root)
+
+    // Sort batch by LSB-first traversal order.
+    let mut sorted_batch: Vec<(SmtKey, Vec<u8>)> = batch.to_vec();
+    sorted_batch.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
+
+    let mut stack: Vec<(Option<[u8; 32]>, Option<[u8; 32]>)> = Vec::new();
+    let mut pi = 0usize; // proof index
+    let mut bi = 0usize; // batch index
+
+    while pi < proof.len() {
+        match &proof[pi] {
+            ProofOp::S(h) => {
+                pi += 1;
+                stack.push((*h, *h));
+            }
+            ProofOp::L => {
+                pi += 1;
+                if bi >= sorted_batch.len() {
+                    return false;
+                }
+                let (k, v) = &sorted_batch[bi];
+                bi += 1;
+                stack.push((None, Some(hash_leaf(k, v))));
+            }
+            ProofOp::N(depth) => {
+                pi += 1;
+                let depth = *depth;
+                if stack.len() < 2 {
+                    return false;
+                }
+                let (rh0, rh1) = stack.pop().unwrap();
+                let (lh0, lh1) = stack.pop().unwrap();
+
+                // Resolve pre-state hash.
+                let h0 = match (lh0, rh0) {
+                    (None, None) => None,
+                    (None, rh) => rh,
+                    (lh, None) => lh,
+                    (Some(l), Some(r)) => Some(hash_node(&l, &r, depth)),
+                };
+
+                // Compute post-state hash.
+                let h1 = match (lh1, rh1) {
+                    (Some(l), Some(r)) => Some(hash_node(&l, &r, depth)),
+                    _ => return false, // post-state must have both children
+                };
+
+                stack.push((h0, h1));
+            }
+        }
+    }
+
+    pi == proof.len()
+        && bi == sorted_batch.len()
+        && stack.len() == 1
+        && stack[0].0 == old_root
+        && stack[0].1 == new_root
 }
 
 // ─── CBOR encoding ───────────────────────────────────────────────────────────
 
-/// Encode a `ConsistencyProof` as CBOR bytes suitable for the BFT Core
-/// `zk_proof` field.
+/// Encode a `ConsistencyProof` as CBOR bytes for the BFT Core `zk_proof` field.
+///
+/// Wire format: CBOR array of opcodes, each opcode is a small array:
+/// - `S(h)`: `[0, h_bytes | null]`
+/// - `L`:    `[1]`
+/// - `N(d)`: `[2, d]`
 pub fn consistency_proof_to_cbor(proof: &ConsistencyProof) -> Vec<u8> {
-    use crate::hash::{cbor_array, cbor_bytes, cbor_null};
-    use crate::path::path_as_bytes;
-
-    fn uint(n: u8) -> Vec<u8> { vec![n] }
-
-    fn hash_or_null(h: &Option<[u8; 32]>) -> Vec<u8> {
-        match h { None => cbor_null(), Some(raw) => cbor_bytes(raw) }
-    }
-
     let mut out = cbor_array(proof.len());
     for op in proof {
-        let mut v = match op {
+        match op {
             ProofOp::S(h) => {
-                let mut v = cbor_array(2); v.extend(uint(0)); v.extend(hash_or_null(h)); v
+                out.extend_from_slice(&cbor_array(2));
+                out.push(0x00); // tag 0
+                match h {
+                    Some(hash) => {
+                        out.push(0x58); // bytes, 1-byte length
+                        out.push(32);
+                        out.extend_from_slice(hash);
+                    }
+                    None => {
+                        out.push(0xf6); // null
+                    }
+                }
             }
-            ProofOp::N(cp) => {
-                let mut v = cbor_array(2); v.extend(uint(1)); v.extend(cbor_bytes(&path_as_bytes(cp))); v
+            ProofOp::L => {
+                out.extend_from_slice(&cbor_array(1));
+                out.push(0x01); // tag 1
             }
-            ProofOp::Nx(cp) => {
-                let mut v = cbor_array(2); v.extend(uint(2)); v.extend(cbor_bytes(&path_as_bytes(cp))); v
+            ProofOp::N(depth) => {
+                out.extend_from_slice(&cbor_array(2));
+                out.push(0x02); // tag 2
+                out.push(0x18); // uint8
+                out.push(*depth);
             }
-            ProofOp::L(key) => {
-                let mut v = cbor_array(2); v.extend(uint(3)); v.extend(cbor_bytes(&path_as_bytes(key))); v
-            }
-            ProofOp::Bl { old_path, key, value } => {
-                let mut v = cbor_array(4);
-                v.extend(uint(4));
-                v.extend(cbor_bytes(&path_as_bytes(old_path)));
-                v.extend(cbor_bytes(&path_as_bytes(key)));
-                v.extend(cbor_bytes(value));
-                v
-            }
-            ProofOp::Bns { old_path, new_path, lh, rh } => {
-                let mut v = cbor_array(5);
-                v.extend(uint(5));
-                v.extend(cbor_bytes(&path_as_bytes(old_path)));
-                v.extend(cbor_bytes(&path_as_bytes(new_path)));
-                v.extend(hash_or_null(lh));
-                v.extend(hash_or_null(rh));
-                v
-            }
-        };
-        out.append(&mut v);
+        }
     }
     out
+}
+
+/// Hand-assembled CBOR array header.
+fn cbor_array(len: usize) -> Vec<u8> {
+    if len < 24 {
+        vec![0x80 | len as u8]
+    } else if len < 256 {
+        vec![0x98, len as u8]
+    } else {
+        let n = len as u16;
+        vec![0x99, (n >> 8) as u8, n as u8]
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
-    use crate::path::state_id_to_smt_path;
-    use crate::tree::{calc_node_hash, SparseMerkleTree, KEY_LENGTH};
+    use super::*;
+    use crate::tree::SparseMerkleTree;
 
-    fn pid(byte: u8) -> SmtPath {
-        let mut id = [0u8; 32];
-        id[31] = byte;
-        state_id_to_smt_path(&id)
+    fn make_key(byte: u8) -> SmtKey {
+        let mut k = [0u8; 32];
+        k[0] = byte;
+        k
     }
 
-    fn raw_root(tree: &mut SparseMerkleTree) -> [u8; 32] {
-        calc_node_hash(&mut tree.root)
-    }
-
-    fn check(tree: &mut SparseMerkleTree, batch: Vec<(SmtPath, Vec<u8>)>, label: &str) {
-        let old = raw_root(tree);
+    fn check(tree: &mut SparseMerkleTree, batch: Vec<(SmtKey, Vec<u8>)>, label: &str) {
+        let old = tree.root_hash();
         let (items, proof) = batch_insert_with_proof(tree, &batch).unwrap();
-        let new = raw_root(tree);
+        let new = tree.root_hash();
         assert!(
-            verify_consistency(&proof, Some(old), new, &items, KEY_LENGTH),
+            verify_consistency(&proof, old, new, &items),
             "{label}: consistency verification failed"
         );
     }
@@ -611,11 +620,16 @@ mod tests {
     fn root_matches_sequential_add_leaf() {
         let mut t1 = SparseMerkleTree::new();
         let mut t2 = SparseMerkleTree::new();
-        let pairs: Vec<_> = (1u8..=8).map(|i| (pid(i), vec![i; 34])).collect();
-        for (k, v) in &pairs { t1.add_leaf(k.clone(), v.clone()).unwrap(); }
-        batch_insert_with_proof(&mut t2, &pairs).unwrap();
+        let pairs: Vec<_> = (1u8..=8)
+            .map(|i| (make_key(i), vec![i; 32]))
+            .collect();
+        for (k, v) in &pairs {
+            t1.add_leaf(*k, v.clone()).unwrap();
+        }
+        batch_insert(&mut t2, &pairs).unwrap();
         assert_eq!(
-            t1.root_hash_imprint(), t2.root_hash_imprint(),
+            t1.root_hash(),
+            t2.root_hash(),
             "batch_insert must produce same root as sequential add_leaf"
         );
     }
@@ -623,44 +637,55 @@ mod tests {
     #[test]
     fn single_leaf_consistency() {
         let mut tree = SparseMerkleTree::new();
-        check(&mut tree, vec![(pid(1), vec![0xab; 34])], "single");
+        check(
+            &mut tree,
+            vec![(make_key(1), vec![0xab; 32])],
+            "single",
+        );
     }
 
     #[test]
     fn two_leaf_consistency() {
         let mut tree = SparseMerkleTree::new();
-        check(&mut tree, vec![(pid(1), vec![1;34]), (pid(2), vec![2;34])], "two");
+        check(
+            &mut tree,
+            vec![
+                (make_key(1), vec![1; 32]),
+                (make_key(2), vec![2; 32]),
+            ],
+            "two",
+        );
     }
 
     #[test]
     fn border_leaf_consistency() {
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf(pid(1), vec![1;34]).unwrap();
-        check(&mut tree, vec![(pid(3), vec![3;34])], "border_leaf");
+        tree.add_leaf(make_key(1), vec![1; 32]).unwrap();
+        check(&mut tree, vec![(make_key(3), vec![3; 32])], "border_leaf");
     }
 
     #[test]
     fn duplicate_skipped() {
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf(pid(5), vec![5;34]).unwrap();
+        tree.add_leaf(make_key(5), vec![5; 32]).unwrap();
+        let old = tree.root_hash();
         let (items, proof) = batch_insert_with_proof(
-            &mut tree, &[(pid(5), vec![99;34]), (pid(7), vec![7;34])],
-        ).unwrap();
+            &mut tree,
+            &[(make_key(5), vec![99; 32]), (make_key(7), vec![7; 32])],
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
-        let new = raw_root(&mut tree);
-        let old_tree_before = {
-            let mut t = SparseMerkleTree::new();
-            t.add_leaf(pid(5), vec![5;34]).unwrap();
-            raw_root(&mut t)
-        };
-        assert!(verify_consistency(&proof, Some(old_tree_before), new, &items, KEY_LENGTH));
+        let new = tree.root_hash();
+        assert!(verify_consistency(&proof, old, new, &items));
     }
 
     #[test]
     fn multi_round_consistency() {
         let mut tree = SparseMerkleTree::new();
         for r in 0u8..5 {
-            let b: Vec<_> = (0u8..10).map(|i| (pid(r*10+i), vec![r*10+i;34])).collect();
+            let b: Vec<_> = (0u8..10)
+                .map(|i| (make_key(r * 10 + i), vec![r * 10 + i; 32]))
+                .collect();
             check(&mut tree, b, &format!("round {r}"));
         }
     }
@@ -669,22 +694,26 @@ mod tests {
     fn fast_batch_insert_matches_with_proof() {
         let mut t1 = SparseMerkleTree::new();
         let mut t2 = SparseMerkleTree::new();
-        let pairs: Vec<_> = (1u8..=16).map(|i| (pid(i), vec![i;34])).collect();
+        let pairs: Vec<_> = (1u8..=16)
+            .map(|i| (make_key(i), vec![i; 32]))
+            .collect();
         batch_insert(&mut t1, &pairs).unwrap();
         batch_insert_with_proof(&mut t2, &pairs).unwrap();
-        assert_eq!(t1.root_hash_imprint(), t2.root_hash_imprint());
+        assert_eq!(t1.root_hash(), t2.root_hash());
     }
 
     #[test]
-    fn proof_cbor_non_empty_and_proof_still_valid() {
+    fn proof_cbor_non_empty() {
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf(pid(1), vec![1; 34]).unwrap();
-        let batch: Vec<_> = (2u8..=6).map(|i| (pid(i), vec![i; 34])).collect();
-        let old = raw_root(&mut tree);
+        tree.add_leaf(make_key(1), vec![1; 32]).unwrap();
+        let batch: Vec<_> = (2u8..=6)
+            .map(|i| (make_key(i), vec![i; 32]))
+            .collect();
+        let old = tree.root_hash();
         let (items, proof) = batch_insert_with_proof(&mut tree, &batch).unwrap();
-        let new = raw_root(&mut tree);
+        let new = tree.root_hash();
 
-        assert!(verify_consistency(&proof, Some(old), new, &items, KEY_LENGTH));
+        assert!(verify_consistency(&proof, old, new, &items));
 
         let cbor = consistency_proof_to_cbor(&proof);
         assert!(!cbor.is_empty());
@@ -692,20 +721,49 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_batch_insert_with_proof() {
-        use crate::snapshot::SmtSnapshot;
-        let mut base = SparseMerkleTree::new();
-        let old = raw_root(&mut base);
-        let mut snap = SmtSnapshot::create(&base);
-        let batch: Vec<_> = (1u8..=5).map(|i| (pid(i), vec![i; 34])).collect();
-        let (items, proof) = snap.batch_insert_with_proof(&batch).unwrap();
-        assert_eq!(items.len(), 5);
-        let new = {
-            let imprint = snap.root_hash_imprint();
-            let mut raw = [0u8; 32];
-            raw.copy_from_slice(&imprint[2..]);
-            raw
-        };
-        assert!(verify_consistency(&proof, Some(old), new, &items, KEY_LENGTH));
+    fn empty_batch_returns_unchanged() {
+        let mut tree = SparseMerkleTree::new();
+        tree.add_leaf(make_key(1), vec![1; 32]).unwrap();
+        let old = tree.root_hash();
+        let (items, proof) = batch_insert_with_proof(&mut tree, &[]).unwrap();
+        assert!(items.is_empty());
+        let new = tree.root_hash();
+        assert_eq!(old, new);
+        assert!(verify_consistency(&proof, old, new, &items));
+    }
+
+    #[test]
+    fn insert_into_empty_tree() {
+        let mut tree = SparseMerkleTree::new();
+        let old = tree.root_hash();
+        assert!(old.is_none());
+        let batch: Vec<_> = (1u8..=3)
+            .map(|i| (make_key(i), vec![i; 32]))
+            .collect();
+        let (items, proof) = batch_insert_with_proof(&mut tree, &batch).unwrap();
+        let new = tree.root_hash();
+        assert!(verify_consistency(&proof, old, new, &items));
+    }
+
+    /// Simple LCG to generate pseudo-random keys without external deps.
+    fn lcg_key(seed: &mut u64) -> SmtKey {
+        let mut key = [0u8; 32];
+        for chunk in key.chunks_exact_mut(8) {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            chunk.copy_from_slice(&seed.to_le_bytes());
+        }
+        key
+    }
+
+    #[test]
+    fn large_random_multi_round_no_panic() {
+        let mut tree = SparseMerkleTree::new();
+        let mut seed: u64 = 0xdeadbeef_cafebabe;
+        for _round in 0..20 {
+            let batch: Vec<(SmtKey, Vec<u8>)> = (0..500)
+                .map(|_| (lcg_key(&mut seed), vec![42u8; 32]))
+                .collect();
+            batch_insert(&mut tree, &batch).unwrap();
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Radix Sparse Merkle Tree — Go-compatible path-compressed Patricia trie.
+//! Radix Sparse Merkle Tree — path-compressed with 256-bit keys.
 
 pub mod consistency;
 pub mod hash;
@@ -11,12 +11,11 @@ pub mod types;
 
 pub use consistency::{
     batch_insert, batch_insert_with_proof, consistency_proof_to_cbor, verify_consistency,
-    ConsistencyProof, ProofOp, synchronized_proof_eval,
+    ConsistencyProof, ProofOp,
 };
-pub use hash::{build_imprint, cbor_array, cbor_bytes, cbor_null, hash_leaf, hash_node};
-pub use path::{calculate_common_path, path_as_bytes, path_len, root_path, state_id_to_smt_path, SmtPath};
-pub use num_bigint::BigUint;
-pub use proof::{merkle_path_from_cbor, merkle_path_to_cbor, MerkleTreePath, MerkleTreeStep};
+pub use hash::{hash_leaf, hash_node};
+pub use path::{get_sort_key, key_bit_at, CompressedPath, SmtKey, KEY_BITS};
+pub use proof::{verify_inclusion, InclusionProof};
 pub use snapshot::SmtSnapshot;
-pub use tree::{SmtError, SparseMerkleTree, KEY_LENGTH, calc_leaf_hash, calc_node_hash};
-pub use types::{Branch, LeafBranch, NodeBranch};
+pub use tree::{SmtError, SparseMerkleTree};
+pub use types::{branch_hash, Branch, LeafBranch, NodeBranch};

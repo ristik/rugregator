@@ -363,18 +363,16 @@ impl BftCommitter for LiveBftCommitter {
     async fn commit_block(
         &self,
         block_number: u64,
-        new_root: &[u8; 34],
-        prev_root: &[u8; 34],
+        new_root: Option<[u8; 32]>,
+        prev_root: Option<[u8; 32]>,
         zk_proof: Option<Vec<u8>>,
         block_size: u64,
         state_size: u64,
     ) -> anyhow::Result<()> {
         self.wait_init().await;
 
-        // Use the full 34-byte DataHash imprint (2 algo bytes + 32 hash bytes).
-        // BFT Core echoes InputRecord.Hash verbatim; the SDK reads it as a DataHash imprint.
-        let new_hash = new_root.to_vec();
-        let prev_hash = prev_root.to_vec();
+        let new_hash = new_root.map(|r| r.to_vec()).unwrap_or_default();
+        let prev_hash = prev_root.map(|r| r.to_vec()).unwrap_or_default();
 
         // Register the block → UC receiver BEFORE queuing the Submit command so
         // the network task can fill the sender side at transmission time.

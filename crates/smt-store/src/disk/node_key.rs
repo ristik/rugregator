@@ -7,12 +7,12 @@
 //! Encoding: `[depth_lo, depth_hi, prefix_bytes...]`
 //! - `depth` (u16, little-endian): number of bits in the prefix
 //! - `prefix_bytes`: `ceil(depth/8)` bytes, LSB of bit-0 is in byte 0 bit 0
-//!   (matches `bit_at` from rsmt::path)
+//!   (matches `key_bit_at` from rsmt::path)
 //!
 //! Root is a special sentinel: `[0xFF, 0xFF]` (depth = u16::MAX).
 
-use num_bigint::BigUint;
-use num_traits::Zero;
+/// A 256-bit prefix accumulator (used as `BigUint` replacement).
+pub type PrefixBits = [u8; 32];
 
 /// Absolute bit-path key for an SMT node in RocksDB.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -34,24 +34,16 @@ impl NodeKey {
     /// `depth` = number of routing bits accumulated from root (exclusive of
     /// root itself, which uses `NodeKey::root()`).
     ///
-    /// `prefix` = BigUint where bit `i` (LSB = 0) is the routing decision at
-    /// tree-depth `i`.  Bits at positions ≥ `depth` are ignored.
-    pub fn from_depth_and_prefix(depth: usize, prefix: &BigUint) -> Self {
-        let mut out = Vec::with_capacity(2 + (depth + 7) / 8);
-        // depth as u16 LE
+    /// `prefix` = bit array where bit `i` (LSB-first) is the routing decision
+    /// at tree-depth `i`. Bits at positions >= `depth` are ignored.
+    pub fn from_depth_and_prefix(depth: usize, prefix: &PrefixBits) -> Self {
+        let byte_count = (depth + 7) / 8;
+        let mut out = Vec::with_capacity(2 + byte_count);
         let d = depth as u16;
         out.push((d & 0xFF) as u8);
         out.push((d >> 8) as u8);
         if depth > 0 {
-            let byte_count = (depth + 7) / 8;
-            if prefix.is_zero() {
-                out.extend(std::iter::repeat(0u8).take(byte_count));
-            } else {
-                // to_bytes_le = LSB-first, matching bit_at's byte layout
-                let mut bytes = prefix.to_bytes_le();
-                bytes.resize(byte_count, 0);
-                out.extend_from_slice(&bytes);
-            }
+            out.extend_from_slice(&prefix[..byte_count]);
         }
         NodeKey(out)
     }
@@ -62,6 +54,29 @@ impl NodeKey {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
+    }
+}
+
+// ─── PrefixBits helpers ─────────────────────────────────────────────────────
+
+/// Set bit at `pos` in a prefix accumulator.
+#[inline]
+pub fn prefix_set_bit(acc: &mut PrefixBits, pos: usize) {
+    acc[pos / 8] |= 1 << (pos % 8);
+}
+
+/// Get bit at `pos` in a prefix accumulator.
+#[inline]
+pub fn prefix_get_bit(acc: &PrefixBits, pos: usize) -> u8 {
+    (acc[pos / 8] >> (pos % 8)) & 1
+}
+
+/// Copy bits from a CompressedPath into the accumulator starting at `start_bit`.
+pub fn prefix_copy_path(acc: &mut PrefixBits, start_bit: usize, path: &rsmt::path::CompressedPath) {
+    for i in 0..path.path_len() {
+        if path.bit_at(i) != 0 {
+            prefix_set_bit(acc, start_bit + i);
+        }
     }
 }
 
@@ -77,28 +92,31 @@ mod tests {
 
     #[test]
     fn depth_zero_not_root() {
-        // depth=0 with empty prefix is NOT the root sentinel
-        let k = NodeKey::from_depth_and_prefix(0, &BigUint::ZERO);
+        let prefix = [0u8; 32];
+        let k = NodeKey::from_depth_and_prefix(0, &prefix);
         assert!(!k.is_root());
         assert_eq!(k.as_bytes(), &[0, 0]);
     }
 
     #[test]
     fn distinct_left_right_depth1() {
-        let left  = NodeKey::from_depth_and_prefix(1, &BigUint::from(0u8)); // bit 0 = 0
-        let right = NodeKey::from_depth_and_prefix(1, &BigUint::from(1u8)); // bit 0 = 1
+        let mut left_p = [0u8; 32];
+        let mut right_p = [0u8; 32];
+        right_p[0] = 1; // bit 0 = 1
+        let left = NodeKey::from_depth_and_prefix(1, &left_p);
+        let right = NodeKey::from_depth_and_prefix(1, &right_p);
         assert_ne!(left, right);
-        // depth bytes: [1, 0]; prefix: [0] vs [1]
-        assert_eq!(left.as_bytes(),  &[1, 0, 0]);
+        assert_eq!(left.as_bytes(), &[1, 0, 0]);
         assert_eq!(right.as_bytes(), &[1, 0, 1]);
     }
 
     #[test]
     fn deeper_key() {
-        // depth=9 prefix = bits 0..8: bit0=1, bit8=1 → value 0b1_0000_0001 = 257
-        let prefix = BigUint::from(257u32);
+        // depth=9 prefix = bit0=1, bit8=1 → byte[0]=1, byte[1]=1
+        let mut prefix = [0u8; 32];
+        prefix[0] = 1; // bit 0
+        prefix[1] = 1; // bit 8
         let k = NodeKey::from_depth_and_prefix(9, &prefix);
-        // depth LE: [9, 0]; prefix: 2 bytes LE of 257 = [1, 1]
         assert_eq!(k.as_bytes(), &[9, 0, 1, 1]);
     }
 }

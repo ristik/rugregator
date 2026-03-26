@@ -30,8 +30,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use smt_store::{SmtStore, SmtStoreSnapshot};
-use uni_aggregator::smt::{SmtPath, state_id_to_smt_path};
-use uni_aggregator::validation::state_id::compute_cert_data_hash_imprint;
+use uni_aggregator::smt::{SmtKey, state_id_to_smt_key};
+use uni_aggregator::validation::state_id::compute_cert_data_hash;
 
 // ─── Ctrl+C ──────────────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ fn fmt_dur(d: Duration) -> String {
     else                     { format!("{:.2}s",   us / 1_000_000.0) }
 }
 
-fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtPath, Vec<u8>)> {
+fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtKey, Vec<u8>)> {
     (0..n).map(|_| {
         let mut state_id = [0u8; 32];
         let mut pred     = [0u8; 38];
@@ -136,9 +136,9 @@ fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtPath, Vec<u8>)> {
         rng.fill(&mut ssh[..]);
         rng.fill(&mut txh[..]);
         rng.fill(&mut wit[..]);
-        let path  = state_id_to_smt_path(&state_id);
-        let value = compute_cert_data_hash_imprint(&pred, &ssh, &txh, &wit);
-        (path, value.to_vec())
+        let key   = state_id_to_smt_key(&state_id);
+        let value = compute_cert_data_hash(&pred, &ssh, &txh, &wit);
+        (key, value.to_vec())
     }).collect()
 }
 
@@ -168,21 +168,16 @@ struct Row {
 fn measure_round<S: SmtStore>(
     store:        &mut S,
     pre_fill:     usize,
-    batch:        &[(SmtPath, Vec<u8>)],
+    batch:        &[(SmtKey, Vec<u8>)],
     proof_sample: usize,
     rng:          &mut StdRng,
 ) -> anyhow::Result<Row> {
     let batch_size = batch.len();
     let mut snap   = store.create_snapshot();
-    // ── Insert + root hash ────────────────────────────────────────────────────
-    // Uses insert_batch (matches the real aggregator's start_round flow).
-    // For DiskSmtSnapshot: defers, then flush_pending() materialises from DB,
-    // runs batch_insert, computes root, and builds the overlay.
-    // For MemSmtSnapshot with batch_insert: sorted single-pass insertion.
     let t_ins = Instant::now();
     let (flags, _proof) = snap.insert_batch(batch, false)?;
     let inserted = flags.iter().filter(|&&f| f).count();
-    let _ = snap.root_hash_imprint()?;
+    let _ = snap.root_hash()?;
     let insert_dur = t_ins.elapsed();
 
     // ── Commit ────────────────────────────────────────────────────────────────
@@ -202,7 +197,7 @@ fn measure_round<S: SmtStore>(
     let mut proof_times: Vec<f64> = Vec::with_capacity(sample.len());
     for &i in &sample {
         let t = Instant::now();
-        let _ = store.get_path(&batch[i].0)?;
+        let _ = store.get_inclusion_proof(&batch[i].0)?;
         proof_times.push(t.elapsed().as_secs_f64() * 1e6);
     }
     proof_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -386,7 +381,7 @@ fn main() -> anyhow::Result<()> {
                 let mut store = smt_store::MemSmt::open(Arc::clone(&arc_db), mode)?;
                 let load_dur = t_load.elapsed();
                 println!("  done in {}", fmt_dur(load_dur));
-                println!("  root = {}", hex::encode(smt_store::SmtStore::root_hash_imprint(&store)));
+                println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
                 println!();
 
                 run_sweeps(&mut store, &cfg, label, existing);
@@ -431,7 +426,7 @@ fn main() -> anyhow::Result<()> {
                 let mut store = smt_store::DiskSmt::open(Arc::clone(&arc_db), cache_bytes)?;
                 let open_dur = t_open.elapsed();
                 println!("  done in {}", fmt_dur(open_dur));
-                println!("  root = {}", hex::encode(smt_store::SmtStore::root_hash_imprint(&store)));
+                println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
                 println!();
 
                 run_sweeps(&mut store, &cfg, "disk", existing);

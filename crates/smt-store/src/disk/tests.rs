@@ -3,8 +3,8 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use rsmt::path::state_id_to_smt_path;
-use rsmt::{SparseMerkleTree, consistency::batch_insert as mem_batch_insert};
+use rsmt::path::SmtKey;
+use rsmt::{SparseMerkleTree, consistency::batch_insert as mem_batch_insert, verify_inclusion};
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, DBCompressionType};
 
 use super::store::{DiskSmt, CF_SMT_META};
@@ -31,14 +31,14 @@ fn open_test_db(dir: &tempfile::TempDir) -> Arc<DB> {
     Arc::new(DB::open_cf_descriptors(&opts, path, cfs.into_iter()).unwrap())
 }
 
-fn make_path(byte: u8) -> rsmt::path::SmtPath {
-    let mut id = [0u8; 32];
-    id[31] = byte;
-    state_id_to_smt_path(&id)
+fn make_key(byte: u8) -> SmtKey {
+    let mut k = [0u8; 32];
+    k[0] = byte;
+    k
 }
 
-fn batch(n: u8) -> Vec<(rsmt::path::SmtPath, Vec<u8>)> {
-    (1..=n).map(|i| (make_path(i), vec![i; 34])).collect()
+fn batch(n: u8) -> Vec<(SmtKey, Vec<u8>)> {
+    (1..=n).map(|i| (make_key(i), vec![i; 32])).collect()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ fn root_hash_equivalence_single_batch() {
     // In-memory reference.
     let mut mem_smt = SparseMerkleTree::new();
     mem_batch_insert(&mut mem_smt, &pairs).unwrap();
-    let expected_root = mem_smt.root_hash_imprint();
+    let expected_root = mem_smt.root_hash();
 
     // Disk-backed.
     let mut disk = DiskSmt::open(db, 10_000).unwrap();
@@ -72,11 +72,11 @@ fn root_hash_equivalence_multi_round() {
     let mut mem_smt = SparseMerkleTree::new();
 
     for r in 0u8..5 {
-        let pairs: Vec<_> = (0u8..10).map(|i| (make_path(r*10+i), vec![r*10+i; 34])).collect();
+        let pairs: Vec<_> = (0u8..10).map(|i| (make_key(r*10+i), vec![r*10+i; 32])).collect();
 
         // In-memory.
         mem_batch_insert(&mut mem_smt, &pairs).unwrap();
-        let expected = mem_smt.root_hash_imprint();
+        let expected = mem_smt.root_hash();
 
         // Disk-backed.
         let (new_root, overlay) = disk.batch_insert_round(&pairs).unwrap();
@@ -97,16 +97,15 @@ fn rollback_leaves_db_unchanged() {
     let (root1, overlay1) = disk.batch_insert_round(&pairs1).unwrap();
     disk.commit_overlay(overlay1, root1).unwrap();
 
-    let committed_root = disk.root_hash_imprint();
+    let committed_root = disk.root_hash();
 
     // Speculative insert — discard.
     let pairs2 = batch(8);
     let (_new_root, _overlay2) = disk.batch_insert_round(&pairs2).unwrap();
-    // Discard: just don't call commit_overlay.
 
     // Re-open from DB.
     let disk2 = DiskSmt::open(db, 10_000).unwrap();
-    assert_eq!(disk2.root_hash_imprint(), committed_root,
+    assert_eq!(disk2.root_hash(), committed_root,
         "root hash must be unchanged after discarded overlay");
 }
 
@@ -127,7 +126,7 @@ fn commit_then_reload_root_survives() {
     {
         let db = open_test_db(&dir);
         let disk = DiskSmt::open(db, 1_000).unwrap();
-        assert_eq!(disk.root_hash_imprint(), committed_root,
+        assert_eq!(disk.root_hash(), committed_root,
             "root hash must survive DB reopen");
     }
 }
@@ -143,6 +142,7 @@ fn proof_equivalence() {
     // In-memory reference.
     let mut mem_smt = SparseMerkleTree::new();
     mem_batch_insert(&mut mem_smt, &pairs).unwrap();
+    let mem_root = mem_smt.root_hash().unwrap();
 
     // Disk-backed insert and commit.
     let (root, overlay) = disk.batch_insert_round(&pairs).unwrap();
@@ -152,17 +152,16 @@ fn proof_equivalence() {
     let empty = Overlay::new();
 
     // Compare proofs for each inserted leaf.
-    for (path, _) in &pairs {
-        let mem_proof  = mem_smt.get_path(path).unwrap();
-        let disk_proof = disk.get_path(path, &empty).unwrap();
+    for (key, value) in &pairs {
+        let mem_proof  = mem_smt.get_inclusion_proof(key).unwrap();
+        let disk_proof = disk.get_inclusion_proof(key, &empty).unwrap();
 
-        assert_eq!(mem_proof.root, disk_proof.root,
-            "proof root mismatch for path");
-        assert_eq!(mem_proof.steps.len(), disk_proof.steps.len(),
-            "proof step count mismatch");
-        for (ms, ds) in mem_proof.steps.iter().zip(disk_proof.steps.iter()) {
-            assert_eq!(ms.path, ds.path, "step path mismatch");
-            assert_eq!(ms.data, ds.data, "step data mismatch");
-        }
+        // Both proofs should verify against the same root.
+        assert!(verify_inclusion(&mem_proof, &mem_root, key, value));
+        assert!(verify_inclusion(&disk_proof, &root.unwrap(), key, value));
+
+        // Proofs should be identical.
+        assert_eq!(mem_proof.bitmap, disk_proof.bitmap, "bitmap mismatch for key");
+        assert_eq!(mem_proof.siblings, disk_proof.siblings, "siblings mismatch for key");
     }
 }
