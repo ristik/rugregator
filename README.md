@@ -382,20 +382,29 @@ Every Certification Request sent to BFT Core can optionally carry a cryptographi
 
 Enable with `--consistency-proofs`:
 
-**What it proves:** Let `h₀` be the root certified in the last UC and `h₁` be the root in the current Certification Request. The proof witnesses the exact set of (StateID, value) leaves appended to the tree going from `h₀` to `h₁`. A verifier can replay the proof to independently compute both `h₀` and `h₁` and confirm they match the Input Record hashes in consecutive UCs.
+**What it proves:** Let `h₀` be the root certified in the last UC and `h₁` be the root in the current Certification Request. The proof witnesses the exact set of (key, value) leaves appended to the tree going from `h₀` to `h₁`. A verifier can replay the proof to independently compute both `h₀` and `h₁` and confirm they match the Input Record hashes in consecutive UCs.
 
-**How:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat pre-order opcode sequence (`ProofOp`):
 
-| Opcode | Meaning |
-|--------|---------|
-| `S(hash)` | Unchanged subtree — carries its hash without traversal |
-| `N(path)` | New junction node created by this batch |
-| `Nx(path)` | Existing node traversed |
-| `L(key)` | New leaf inserted |
-| `Bl{old, key, val}` | Border leaf repositioned by the insertion |
-| `Bns{old, new, lh, rh}` | Border node whose common prefix was shortened |
+**How:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat **post-order** opcode sequence (`ProofOp`):
 
-The opcode stream is CBOR-encoded and attached to the CR as the `zk_proof` field. BFT Core validators can verify it with `verify_consistency` before including the round in the certified ledger.
+| Opcode | CBOR encoding | Meaning |
+|--------|---------------|---------|
+| `S(h)` | `[0, bytes\|null]` | Unchanged subtree — hash, or `null` for empty |
+| `L`    | `[1]`         | New leaf — key/value consumed from sorted batch |
+| `N(d)` | `[2, depth]`  | Internal node at depth `d`; two children precede it on the stack |
+
+The stream is **post-order** (left subtree, right subtree, then node), matching the tree's LSB-first traversal order. Only three opcodes are needed because nodes carry no path data — the verifier reconstructs hashes bottom-up using only the leaf values and the depth at each node.
+
+**Verification** is a stack machine (in `verify_consistency`):
+
+1. Sort the batch by LSB-first key order (`get_sort_key`).
+2. Scan opcodes left to right, maintaining a stack of `(pre_hash, post_hash)` pairs:
+   - `S(h)`: push `(h, h)` — unchanged subtree, same hash in both states.
+   - `L`: pop `(key, value)` from the sorted batch, push `(None, hash_leaf(key, value))`.
+   - `N(depth)`: pop right `(rh₀, rh₁)`, pop left `(lh₀, lh₁)`. Resolve pre-state: if both children existed, `h₀ = hash_node(lh₀, rh₀, depth)`; if only one, propagate that child's hash (new junction). Compute `h₁ = hash_node(lh₁, rh₁, depth)`. Push `(h₀, h₁)`.
+3. Accept iff the stream is exhausted, the batch is consumed, and the stack contains exactly one element `(old_root, new_root)`.
+
+The opcode stream is CBOR-encoded and attached to the CR as the `zk_proof` field. BFT Core validators run `verify_consistency` before including the round in the certified ledger.
 
 ### Scaling beyond RAM (`--smt-backend disk`)
 
