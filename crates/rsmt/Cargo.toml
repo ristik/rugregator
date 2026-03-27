@@ -8,4 +8,9 @@ authors.workspace = true
 sha2.workspace       = true
 thiserror.workspace  = true
 
+[[bench]]
+name    = "smt"
+harness = false
+
 [dev-dependencies]
+criterion.workspace = true

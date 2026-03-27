@@ -257,6 +257,39 @@ cargo test -p smt-store disk::tests::proof_equivalence
 
 ## Performance benchmarks
 
+### Criterion microbenchmarks
+
+Criterion benchmarks are defined in `crates/rsmt/benches/smt.rs` and `crates/smt-store/benches/store.rs`. They measure individual operations in isolation with statistical confidence intervals and HTML reports.
+
+```bash
+# Run all benchmarks (both crates)
+cargo bench --workspace
+
+# Run only rsmt benchmarks (batch_insert, verify_consistency, inclusion_proof)
+cargo bench -p rsmt
+
+# Run only smt-store benchmarks (mem_full_commit, mem_leaves_commit, disk_commit)
+cargo bench -p smt-store
+
+# Run a single group by name filter
+cargo bench -p rsmt -- batch_insert
+cargo bench -p smt-store -- disk_commit
+
+# Save a named baseline, then compare after a code change
+cargo bench -p rsmt -- --save-baseline before
+# ... make changes ...
+cargo bench -p rsmt -- --baseline before
+
+# Cross-branch comparison (baseline on main, compare on current branch)
+git worktree add ../rugregator-main main
+CARGO_TARGET_DIR=/absolute/path/to/rugregator/target \
+  cargo bench -p rsmt --manifest-path ../rugregator-main/Cargo.toml -- --save-baseline main
+cargo bench -p rsmt -- --baseline main
+git worktree remove ../rugregator-main
+```
+
+HTML reports land in `target/criterion/`. Open `target/criterion/report/index.html` for the full comparison view.
+
 ### SMT-only benchmark
 
 Measures raw insertion throughput and proof-generation latency for each SMT backend in isolation, with no BFT Core or HTTP overhead.

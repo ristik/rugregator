@@ -74,4 +74,4 @@ lru.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
+tempfile.workspace = true

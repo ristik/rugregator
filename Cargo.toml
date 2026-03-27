@@ -37,6 +37,8 @@ unsigned-varint = { version = "0.8", features = ["futures", "asynchronous-codec"
 serde_bytes  = "0.11"
 serde_tuple  = "0.5"
 rand         = "0.8"
+criterion    = { version = "0.5", features = ["html_reports"] }
+tempfile     = "3"
 rsmt         = { path = "crates/rsmt" }
 rocksdb      = { version = "0.22", features = ["multi-threaded-cf"] }
 lru          = "0.12"
