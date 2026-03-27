@@ -31,7 +31,7 @@ cargo run --release -p uni-aggregator --bin perf-test -- --rounds 4 --batch-size
 
 ## Architecture
 
-This is a Rust reimplementation of `aggregator-go/`, a blockchain aggregation service for the Unicity network. It must produce wire-identical outputs to the Go implementation (same SMT root hashes, same CBOR encoding, same proof structure).
+This is a Rust reimplementation of `aggregator-go/`, a blockchain nullifier aggregation service for the Unicity network. It is not compatible with the implementation as the SMT tree structure, proof formats are completely different.
 
 ### Workspace crates
 

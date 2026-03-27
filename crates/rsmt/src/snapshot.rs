@@ -4,6 +4,7 @@
 //! replaces the main tree; on failure it is dropped.
 
 use crate::consistency::ConsistencyProof;
+use crate::hash::SmtHasher;
 use crate::path::SmtKey;
 use crate::tree::{SmtError, SparseMerkleTree};
 
@@ -20,12 +21,17 @@ impl SmtSnapshot {
         }
     }
 
-    /// Add a single leaf to the snapshot.
+    /// Add a single leaf to the snapshot (SHA-256 hasher).
     pub fn add_leaf(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
         self.inner.add_leaf(key, value)
     }
 
-    /// Insert a batch without generating a proof (fast path).
+    /// Add a single leaf using a configurable hasher.
+    pub fn add_leaf_with<H: SmtHasher>(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
+        self.inner.add_leaf_with::<H>(key, value)
+    }
+
+    /// Insert a batch without generating a proof (SHA-256 hasher).
     ///
     /// Returns only the actually-inserted `(key, value)` pairs.
     pub fn batch_insert(
@@ -35,7 +41,15 @@ impl SmtSnapshot {
         crate::consistency::batch_insert(&mut self.inner, batch)
     }
 
-    /// Insert a batch and generate a consistency proof.
+    /// Insert a batch without generating a proof, using a configurable hasher.
+    pub fn batch_insert_with<H: SmtHasher>(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+    ) -> Result<Vec<(SmtKey, Vec<u8>)>, SmtError> {
+        crate::consistency::batch_insert_with::<H>(&mut self.inner, batch)
+    }
+
+    /// Insert a batch and generate a consistency proof (SHA-256 hasher).
     ///
     /// Returns `(inserted_items, proof)`.
     pub fn batch_insert_with_proof(
@@ -43,6 +57,14 @@ impl SmtSnapshot {
         batch: &[(SmtKey, Vec<u8>)],
     ) -> Result<(Vec<(SmtKey, Vec<u8>)>, ConsistencyProof), SmtError> {
         crate::consistency::batch_insert_with_proof(&mut self.inner, batch)
+    }
+
+    /// Insert a batch and generate a consistency proof, using a configurable hasher.
+    pub fn batch_insert_with_proof_with<H: SmtHasher>(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+    ) -> Result<(Vec<(SmtKey, Vec<u8>)>, ConsistencyProof), SmtError> {
+        crate::consistency::batch_insert_with_proof_with::<H>(&mut self.inner, batch)
     }
 
     /// Current root hash (`None` for empty tree).

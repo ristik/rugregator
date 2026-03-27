@@ -1,30 +1,94 @@
-//! SMT hash functions — domain-separated SHA-256.
+//! SMT hash functions — domain-separated SHA-256 (default) or Blake3.
 //!
-//! **Leaf:**  `SHA256(0x00 || key_32B || value)`
-//! **Node:**  `SHA256(0x01 || depth_1B || left_hash_32B || right_hash_32B)`
+//! **Leaf:**  `H(0x00 || key_32B || value)`
+//! **Node:**  `H(0x01 || depth_1B || left_hash_32B || right_hash_32B)`
+//!
+//! The hash algorithm is selected via the [`SmtHasher`] trait.  Use
+//! [`Sha256Hasher`] (the default) for compatibility with existing deployments,
+//! or [`Blake3Hasher`] for ~3–4× faster hashing.
 
 use sha2::{Digest, Sha256};
 use crate::path::SmtKey;
 
-/// Hash a leaf: `SHA256(0x00 || key || value)`.
-#[inline]
-pub fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update([0x00]);
-    h.update(key);
-    h.update(value);
-    h.finalize().into()
+// ─── Trait ───────────────────────────────────────────────────────────────────
+
+/// A zero-sized type that provides the two SMT hash functions.
+///
+/// Implementors must be `Copy` so they can be used as type parameters
+/// without any runtime state.
+pub trait SmtHasher: Copy + 'static {
+    /// Hash a leaf: `H(0x00 || key || value)`.
+    fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32];
+    /// Hash an internal node: `H(0x01 || depth || left_hash || right_hash)`.
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32];
 }
 
-/// Hash an internal node: `SHA256(0x01 || depth || left_hash || right_hash)`.
+// ─── SHA-256 (default) ────────────────────────────────────────────────────────
+
+/// Domain-separated SHA-256 hasher.  This is the default and produces the
+/// same hashes as existing deployments.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Sha256Hasher;
+
+impl SmtHasher for Sha256Hasher {
+    #[inline]
+    fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update([0x00]);
+        h.update(key);
+        h.update(value);
+        h.finalize().into()
+    }
+
+    #[inline]
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update([0x01, depth]);
+        h.update(left);
+        h.update(right);
+        h.finalize().into()
+    }
+}
+
+// ─── Blake3 ──────────────────────────────────────────────────────────────────
+
+/// Domain-separated Blake3 hasher.  Produces different hashes than
+/// [`Sha256Hasher`] but is ~3–4× faster on modern hardware.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Blake3Hasher;
+
+impl SmtHasher for Blake3Hasher {
+    #[inline]
+    fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&[0x00]);
+        h.update(key);
+        h.update(value);
+        *h.finalize().as_bytes()
+    }
+
+    #[inline]
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&[0x01, depth]);
+        h.update(left);
+        h.update(right);
+        *h.finalize().as_bytes()
+    }
+}
+
+// ─── Convenience free functions (default SHA-256) ────────────────────────────
+
+/// Hash a leaf with SHA-256: `SHA256(0x00 || key || value)`.
+#[inline]
+pub fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32] {
+    Sha256Hasher::hash_leaf(key, value)
+}
+
+/// Hash an internal node with SHA-256: `SHA256(0x01 || depth || left || right)`.
 #[inline]
 pub fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update([0x01]);
-    h.update([depth]);
-    h.update(left);
-    h.update(right);
-    h.finalize().into()
+    Sha256Hasher::hash_node(left, right, depth)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -33,46 +97,58 @@ pub fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hash_leaf_deterministic() {
+    fn check_hasher<H: SmtHasher>() {
         let key = [1u8; 32];
-        let h1 = hash_leaf(&key, b"hello");
-        let h2 = hash_leaf(&key, b"hello");
-        assert_eq!(h1, h2);
-        let h3 = hash_leaf(&key, b"world");
-        assert_ne!(h1, h3);
-    }
 
-    #[test]
-    fn hash_leaf_domain_separation() {
-        // Leaf and node hashes must never collide even with crafted inputs,
-        // because the first byte differs (0x00 vs 0x01).
-        let key = [0u8; 32];
-        let lh = hash_leaf(&key, &[0u8; 64]);
-        let nh = hash_node(&[0u8; 32], &[0u8; 32], 0);
+        // Deterministic
+        assert_eq!(H::hash_leaf(&key, b"hello"), H::hash_leaf(&key, b"hello"));
+        assert_ne!(H::hash_leaf(&key, b"hello"), H::hash_leaf(&key, b"world"));
+
+        // Domain separation: leaf vs node prefixes differ
+        let lh = H::hash_leaf(&[0u8; 32], &[0u8; 64]);
+        let nh = H::hash_node(&[0u8; 32], &[0u8; 32], 0);
         assert_ne!(lh, nh);
-    }
 
-    #[test]
-    fn hash_node_depth_matters() {
+        // Depth matters
         let l = [1u8; 32];
         let r = [2u8; 32];
-        let h0 = hash_node(&l, &r, 0);
-        let h1 = hash_node(&l, &r, 1);
-        assert_ne!(h0, h1);
-    }
+        assert_ne!(H::hash_node(&l, &r, 0), H::hash_node(&l, &r, 1));
 
-    #[test]
-    fn hash_node_order_matters() {
+        // Order matters
         let a = [1u8; 32];
         let b = [2u8; 32];
-        assert_ne!(hash_node(&a, &b, 5), hash_node(&b, &a, 5));
+        assert_ne!(H::hash_node(&a, &b, 5), H::hash_node(&b, &a, 5));
+
+        // Key matters
+        assert_ne!(H::hash_leaf(&[0u8; 32], b"v"), H::hash_leaf(&[1u8; 32], b"v"));
     }
 
     #[test]
-    fn hash_leaf_key_matters() {
-        let k1 = [0u8; 32];
-        let k2 = [1u8; 32];
-        assert_ne!(hash_leaf(&k1, b"v"), hash_leaf(&k2, b"v"));
+    fn sha256_hasher() {
+        check_hasher::<Sha256Hasher>();
+    }
+
+    #[test]
+    fn blake3_hasher() {
+        check_hasher::<Blake3Hasher>();
+    }
+
+    #[test]
+    fn sha256_and_blake3_differ() {
+        let key = [1u8; 32];
+        assert_ne!(
+            Sha256Hasher::hash_leaf(&key, b"test"),
+            Blake3Hasher::hash_leaf(&key, b"test"),
+        );
+    }
+
+    #[test]
+    fn free_functions_match_sha256() {
+        let key = [1u8; 32];
+        assert_eq!(hash_leaf(&key, b"v"), Sha256Hasher::hash_leaf(&key, b"v"));
+        assert_eq!(
+            hash_node(&[1u8; 32], &[2u8; 32], 7),
+            Sha256Hasher::hash_node(&[1u8; 32], &[2u8; 32], 7),
+        );
     }
 }

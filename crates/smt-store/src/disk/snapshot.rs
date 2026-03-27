@@ -5,7 +5,8 @@ use std::sync::Arc;
 use rocksdb::DB;
 use rsmt::path::SmtKey;
 use rsmt::tree::SmtError;
-use rsmt::consistency::batch_insert;
+use rsmt::SmtHasher;
+use rsmt::consistency::{batch_insert, batch_insert_with};
 
 use super::store::DiskSmt;
 use super::overlay::Overlay;
@@ -98,6 +99,32 @@ impl DiskSmtSnapshot {
         persist_modified(&smt, &mut self.own_overlay);
 
         self.cached_root = Some(root);
+
+        Ok(())
+    }
+
+    fn flush_pending_with<H: SmtHasher>(&mut self) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+
+        let parent = self.parent_overlay.as_deref();
+
+        let mut smt = materialize_for_batch(
+            &self.db,
+            &self.own_overlay,
+            parent,
+            &pending,
+        )?;
+
+        batch_insert_with::<H>(&mut smt, &pending)?;
+
+        let root = smt.root_hash();
+        persist_modified(&smt, &mut self.own_overlay);
+
+        self.cached_root = Some(root);
+
         Ok(())
     }
 }
@@ -124,5 +151,22 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
 
     fn discard(self) {
         self.discard_inner()
+    }
+
+    fn insert_batch_with<H: SmtHasher>(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+        _with_proof: bool,
+    ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        let mut flags = vec![false; batch.len()];
+        for (i, (key, value)) in batch.iter().enumerate() {
+            match self.add_leaf_inner(*key, value.clone()) {
+                Ok(()) => flags[i] = true,
+                Err(rsmt::tree::SmtError::DuplicateLeaf) => {}
+                Err(e) => return Err(anyhow::anyhow!("add_leaf failed: {e}")),
+            }
+        }
+        self.flush_pending_with::<H>()?;
+        Ok((flags, None))
     }
 }

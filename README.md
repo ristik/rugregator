@@ -266,25 +266,25 @@ Criterion benchmarks are defined in `crates/rsmt/benches/smt.rs` and `crates/smt
 cargo bench --workspace
 
 # Run only rsmt benchmarks (batch_insert, verify_consistency, inclusion_proof)
-cargo bench -p rsmt
+cargo bench -p rsmt --bench smt
 
 # Run only smt-store benchmarks (mem_full_commit, mem_leaves_commit, disk_commit)
-cargo bench -p smt-store
+cargo bench -p smt-store --bench store
 
 # Run a single group by name filter
-cargo bench -p rsmt -- batch_insert
-cargo bench -p smt-store -- disk_commit
+cargo bench -p rsmt --bench smt -- batch_insert
+cargo bench -p smt-store --bench store -- disk_commit
 
 # Save a named baseline, then compare after a code change
-cargo bench -p rsmt -- --save-baseline before
+cargo bench -p rsmt --bench smt -- --save-baseline before
 # ... make changes ...
-cargo bench -p rsmt -- --baseline before
+cargo bench -p rsmt --bench smt -- --baseline before
 
 # Cross-branch comparison (baseline on main, compare on current branch)
 git worktree add ../rugregator-main main
 CARGO_TARGET_DIR=/absolute/path/to/rugregator/target \
-  cargo bench -p rsmt --manifest-path ../rugregator-main/Cargo.toml -- --save-baseline main
-cargo bench -p rsmt -- --baseline main
+  cargo bench -p rsmt --manifest-path ../rugregator-main/Cargo.toml --bench smt -- --save-baseline main
+cargo bench -p rsmt --bench smt -- --baseline main
 git worktree remove ../rugregator-main
 ```
 
@@ -406,6 +406,46 @@ The stream is **post-order** (left subtree, right subtree, then node), matching 
 
 The opcode stream is CBOR-encoded and attached to the CR as the `zk_proof` field. BFT Core validators run `verify_consistency` before including the round in the certified ledger.
 
+### Configurable hash function
+
+The SMT hashing algorithm is a zero-cost type parameter — no virtual dispatch, no runtime overhead.
+
+**Default:** all unparameterised public functions use SHA-256 (`Sha256Hasher`). No caller changes needed for the default path.
+
+**To use Blake3**:
+
+```rust
+use rsmt::{Blake3Hasher, batch_insert_with, batch_insert_with_proof_with, verify_consistency_with};
+use rsmt::tree::SparseMerkleTree;
+
+let mut tree = SparseMerkleTree::new();
+
+// Single-leaf insertion
+tree.add_leaf_with::<Blake3Hasher>(key, value);
+
+// Batch insertion (no proof)
+batch_insert_with::<Blake3Hasher>(&mut tree, &batch)?;
+
+// Batch insertion with consistency proof
+let (proof, roots) = batch_insert_with_proof_with::<Blake3Hasher>(&mut tree, &batch)?;
+
+// Proof verification
+verify_consistency_with::<Blake3Hasher>(&proof, old_root, new_root, &batch)?;
+```
+
+The `SmtHasher` trait is:
+
+```rust
+pub trait SmtHasher: Copy + 'static {
+    fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32];
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32];
+}
+```
+
+Custom implementations (e.g. SHA-3/keccak, Poseidon) can be plugged in by implementing `SmtHasher`.
+
+> **Important:** SHA-256 and Blake3 produce different root hashes. All participants in a deployment (inserters and verifiers) must use the same hasher. Mixing hashers produces invalid proofs. Partition state at BFT Core must be reset after hash function change.
+
 ### Scaling beyond RAM (`--smt-backend disk`)
 
 The in-memory SMT holds the entire tree in a heap-allocated Patricia trie. At ~200 bytes per node this exhausts a 16 GB machine at roughly 80 million leaves.
@@ -446,7 +486,7 @@ rugregator/
     │   └── src/
     │       ├── tree.rs           # Core insertion, hash caching
     │       ├── path.rs           # 272-bit sentinel-encoded paths
-    │       ├── hash.rs           # Go-compatible SHA-256 / CBOR hashing
+    │       ├── hash.rs           # SmtHasher trait, Sha256Hasher, Blake3Hasher
     │       ├── snapshot.rs       # O(1) copy-on-write snapshots (fork/commit/discard)
     │       ├── consistency.rs    # batch_insert_with_proof, ProofOp, CBOR encoding
     │       ├── proof.rs          # get_path, MerkleTreePath, CBOR wire format

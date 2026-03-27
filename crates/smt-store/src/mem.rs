@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rocksdb::{DB, WriteBatch};
 use rsmt::{
     Branch, SmtError, SmtKey, InclusionProof, SparseMerkleTree, SmtSnapshot,
-    consistency_proof_to_cbor, branch_hash,
+    consistency_proof_to_bytes, branch_hash,
 };
 use rsmt::consistency::batch_insert;
 use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node, serialize_leaf, serialize_node};
@@ -232,7 +232,7 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
                     self.pending.extend(inserted_pairs);
-                    let proof_cbor = consistency_proof_to_cbor(&proof);
+                    let proof_cbor = consistency_proof_to_bytes(&proof);
                     Ok((flags, Some(proof_cbor)))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof failed: {e}")),
@@ -250,6 +250,43 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     Ok((flags, None))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert failed: {e}")),
+            }
+        }
+    }
+
+    fn insert_batch_with<H: rsmt::SmtHasher>(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+        with_proof: bool,
+    ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        if with_proof {
+            match self.inner.batch_insert_with_proof_with::<H>(batch) {
+                Ok((inserted_pairs, proof)) => {
+                    let inserted_set: std::collections::HashSet<SmtKey> =
+                        inserted_pairs.iter().map(|(k, _)| *k).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let flags: Vec<bool> = batch.iter()
+                        .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
+                        .collect();
+                    self.pending.extend(inserted_pairs);
+                    let proof_bytes = consistency_proof_to_bytes(&proof);
+                    Ok((flags, Some(proof_bytes)))
+                }
+                Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof_with failed: {e}")),
+            }
+        } else {
+            match self.inner.batch_insert_with::<H>(batch) {
+                Ok(inserted_pairs) => {
+                    let inserted_set: std::collections::HashSet<SmtKey> =
+                        inserted_pairs.iter().map(|(k, _)| *k).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let flags: Vec<bool> = batch.iter()
+                        .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
+                        .collect();
+                    self.pending.extend(inserted_pairs);
+                    Ok((flags, None))
+                }
+                Err(e) => Err(anyhow::anyhow!("batch_insert_with failed: {e}")),
             }
         }
     }

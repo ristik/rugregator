@@ -14,6 +14,7 @@
 //!
 //! Options:
 //!   --backend NAME        mem | mem-leaves | mem-leaves-x | mem-full | disk  (default: mem)
+//!   --hasher NAME         sha256 | blake3                       (default: sha256)
 //!   --rounds N            Rounds per batch-size run            (default: 6)
 //!   --seed S              PRNG seed                            (default: random)
 //!   --proof-sample N      Proofs sampled per round             (default: 200)
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use rsmt::{Blake3Hasher, Sha256Hasher, SmtHasher};
 use smt_store::{SmtStore, SmtStoreSnapshot};
 use uni_aggregator::smt::{SmtKey, state_id_to_smt_key};
 use uni_aggregator::validation::state_id::compute_cert_data_hash;
@@ -57,11 +59,12 @@ fn install_ctrl_c_handler() {
 
 struct Config {
     backend:        String,
+    hasher:         String,
     rounds:         usize,
     seed:           u64,
     proof_sample:   usize,
     batch_sizes:    Vec<usize>,
-    cache_mb: usize,
+    cache_mb:       usize,
     db_path:        String,
     csv:            bool,
 }
@@ -70,11 +73,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             backend:        "mem".into(),
+            hasher:         "sha256".into(),
             rounds:         6,
             seed:           0, // resolved in parse_args
             proof_sample:   200,
             batch_sizes:    vec![1_000, 5_000, 10_000],
-            cache_mb: 0,
+            cache_mb:       0,
             db_path:        String::new(),
             csv:            false,
         }
@@ -88,6 +92,7 @@ fn parse_args() -> Config {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--backend"         => { if let Some(v) = args.next() { cfg.backend         = v; } }
+            "--hasher"          => { if let Some(v) = args.next() { cfg.hasher          = v; } }
             "--rounds"          => { if let Some(v) = args.next() { cfg.rounds          = v.parse().unwrap_or(cfg.rounds); } }
             "--seed"            => { if let Some(v) = args.next() { seed_override       = v.parse().ok(); } }
             "--proof-sample"    => { if let Some(v) = args.next() { cfg.proof_sample    = v.parse().unwrap_or(cfg.proof_sample); } }
@@ -165,7 +170,7 @@ struct Row {
 
 // ─── Generic measurement ──────────────────────────────────────────────────────
 
-fn measure_round<S: SmtStore>(
+fn measure_round<S: SmtStore, H: SmtHasher>(
     store:        &mut S,
     pre_fill:     usize,
     batch:        &[(SmtKey, Vec<u8>)],
@@ -175,7 +180,7 @@ fn measure_round<S: SmtStore>(
     let batch_size = batch.len();
     let mut snap   = store.create_snapshot();
     let t_ins = Instant::now();
-    let (flags, _proof) = snap.insert_batch(batch, false)?;
+    let (flags, _proof) = snap.insert_batch_with::<H>(batch, false)?;
     let inserted = flags.iter().filter(|&&f| f).count();
     let _ = snap.root_hash()?;
     let insert_dur = t_ins.elapsed();
@@ -266,7 +271,7 @@ fn do_shutdown_persist<S: SmtStore>(store: &mut S) {
 /// first round (non-zero when loading from a pre-existing DB).  Pre-fill
 /// accumulates globally across all batch-size sweeps so the output accurately
 /// reflects the growing tree.
-fn run_sweeps<S: SmtStore>(store: &mut S, cfg: &Config, label: &str, initial_prefill: usize) {
+fn run_sweeps<S: SmtStore, H: SmtHasher>(store: &mut S, cfg: &Config, label: &str, initial_prefill: usize) {
     if cfg.csv {
         println!("batch_size,pre_fill,inserted,insert_ms,throughput_leaves_per_s,commit_ms,proof_p50_us,proof_p95_us");
     }
@@ -284,7 +289,7 @@ fn run_sweeps<S: SmtStore>(store: &mut S, cfg: &Config, label: &str, initial_pre
             let mut proof_rng = StdRng::seed_from_u64(
                 cfg.seed.wrapping_add(round as u64 * 999_983)
             );
-            let row = measure_round(store, pre_fill, &batch, cfg.proof_sample, &mut proof_rng)
+            let row = measure_round::<S, H>(store, pre_fill, &batch, cfg.proof_sample, &mut proof_rng)
                 .expect("measure_round failed");
             print_row(&row, cfg.csv);
             pre_fill += row.inserted;
@@ -314,7 +319,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = parse_args();
     let cache_bytes = cfg.cache_mb * 1024 * 1024;
 
-    println!("SMT Performance Benchmark  [{}]", cfg.backend);
+    println!("SMT Performance Benchmark  [{}]  hasher={}", cfg.backend, cfg.hasher);
     println!("  rounds={}, seed={}, proof_sample={}", cfg.rounds, cfg.seed, cfg.proof_sample);
     println!("  batch_sizes={:?}", cfg.batch_sizes);
     if cfg.backend != "mem" {
@@ -325,12 +330,20 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
+    match cfg.hasher.as_str() {
+        "blake3" => run_backend::<Blake3Hasher>(&cfg, cache_bytes),
+        "sha256" | "" => run_backend::<Sha256Hasher>(&cfg, cache_bytes),
+        other => anyhow::bail!("unknown hasher '{other}' — supported: sha256, blake3"),
+    }
+}
+
+fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result<()> {
     match cfg.backend.as_str() {
 
         // ── Pure in-memory: no DB at all ──────────────────────────────────────
         "mem" => {
             let mut store = smt_store::MemSmt::new();
-            run_sweeps(&mut store, &cfg, "mem", 0);
+            run_sweeps::<_, H>(&mut store, cfg, "mem", 0);
         }
 
         // ── Persistent in-memory backends ─────────────────────────────────────
@@ -359,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                         if interrupted() { break; }
                         let batch = gen_leaves(batch_size, &mut rng);
                         let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
-                        let row = measure_round(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
+                        let row = measure_round::<_, H>(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
                         print_row(&row, cfg.csv);
                         pre_fill += row.inserted;
                     }
@@ -384,7 +397,7 @@ fn main() -> anyhow::Result<()> {
                 println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
                 println!();
 
-                run_sweeps(&mut store, &cfg, label, existing);
+                run_sweeps::<_, H>(&mut store, cfg, label, existing);
                 do_shutdown_persist(&mut store);
             }
         }
@@ -407,7 +420,7 @@ fn main() -> anyhow::Result<()> {
                         if interrupted() { break; }
                         let batch = gen_leaves(batch_size, &mut rng);
                         let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
-                        let row = measure_round(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
+                        let row = measure_round::<_, H>(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
                         print_row(&row, cfg.csv);
                         pre_fill += row.inserted;
                     }
@@ -429,7 +442,8 @@ fn main() -> anyhow::Result<()> {
                 println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
                 println!();
 
-                run_sweeps(&mut store, &cfg, "disk", existing);
+
+                run_sweeps::<_, H>(&mut store, cfg, "disk", existing);
             }
         }
 

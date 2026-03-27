@@ -1,7 +1,7 @@
 //! SMT branch types: `LeafBranch`, `NodeBranch`, and the `Branch` enum.
 
 use std::sync::Arc;
-use crate::hash::{hash_leaf, hash_node};
+use crate::hash::{SmtHasher, Sha256Hasher};
 use crate::path::{SmtKey, CompressedPath};
 
 // ─── Branch enum ─────────────────────────────────────────────────────────────
@@ -25,15 +25,15 @@ pub struct LeafBranch {
     pub key: SmtKey,
     /// The leaf value (e.g. CertDataHash, 32 bytes).
     pub value: Vec<u8>,
-    /// SHA-256 hash, always computed at construction.
+    /// Hash, always computed at construction.
     pub hash: [u8; 32],
 }
 
 impl LeafBranch {
-    /// Create a new leaf with eagerly computed hash.
+    /// Create a new leaf with eagerly computed SHA-256 hash (convenience constructor).
     #[inline]
     pub fn new(key: SmtKey, value: Vec<u8>) -> Self {
-        let hash = hash_leaf(&key, &value);
+        let hash = Sha256Hasher::hash_leaf(&key, &value);
         Self { key, value, hash }
     }
 }
@@ -74,14 +74,15 @@ pub fn branch_hash(b: &Branch) -> [u8; 32] {
     }
 }
 
-/// Create a new leaf wrapped in `Arc<Branch>`.
+/// Create a new leaf wrapped in `Arc<Branch>` using the given hasher.
 #[inline]
-pub fn make_leaf(key: SmtKey, value: Vec<u8>) -> Arc<Branch> {
-    Arc::new(Branch::Leaf(LeafBranch::new(key, value)))
+pub fn make_leaf<H: SmtHasher>(key: SmtKey, value: Vec<u8>) -> Arc<Branch> {
+    let hash = H::hash_leaf(&key, &value);
+    Arc::new(Branch::Leaf(LeafBranch { key, value, hash }))
 }
 
 /// Create a new internal node wrapped in `Arc<Branch>` with eagerly computed hash.
-pub fn make_node(
+pub fn make_node<H: SmtHasher>(
     path: CompressedPath,
     left: Arc<Branch>,
     right: Arc<Branch>,
@@ -89,7 +90,7 @@ pub fn make_node(
 ) -> Arc<Branch> {
     let lh = branch_hash(&left);
     let rh = branch_hash(&right);
-    let hash = hash_node(&lh, &rh, depth);
+    let hash = H::hash_node(&lh, &rh, depth);
     Arc::new(Branch::Node(NodeBranch {
         path,
         left,
@@ -97,4 +98,17 @@ pub fn make_node(
         depth,
         hash: Some(hash),
     }))
+}
+
+/// SHA-256 convenience wrappers (preserve call sites that don't need to be generic).
+pub fn make_leaf_sha256(key: SmtKey, value: Vec<u8>) -> Arc<Branch> {
+    make_leaf::<Sha256Hasher>(key, value)
+}
+pub fn make_node_sha256(
+    path: CompressedPath,
+    left: Arc<Branch>,
+    right: Arc<Branch>,
+    depth: u8,
+) -> Arc<Branch> {
+    make_node::<Sha256Hasher>(path, left, right, depth)
 }

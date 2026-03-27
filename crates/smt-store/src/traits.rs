@@ -1,5 +1,5 @@
 //! Common trait for SMT store implementations.
-use rsmt::{SmtError, SmtKey, InclusionProof};
+use rsmt::{SmtError, SmtHasher, SmtKey, InclusionProof};
 
 /// A Sparse Merkle Tree store supporting snapshot-based speculative execution.
 pub trait SmtStore: Send + 'static {
@@ -64,5 +64,17 @@ pub trait SmtStoreSnapshot: Send + 'static {
             }
         }
         Ok((flags, None))
+    }
+
+    /// Like [`insert_batch`] but with a configurable hasher.
+    ///
+    /// The default delegates to [`insert_batch`] (SHA-256). Implementations
+    /// that support configurable hashing override this to propagate `H`.
+    fn insert_batch_with<H: SmtHasher>(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+        with_proof: bool,
+    ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        self.insert_batch(batch, with_proof)
     }
 }
