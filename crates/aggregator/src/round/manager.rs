@@ -28,6 +28,7 @@ use crate::validation::state_id::compute_cert_data_hash;
 use crate::validation::ValidatedRequest;
 use async_trait::async_trait;
 
+use rayon::prelude::*;
 use smt_store::{SmtStore, SmtStoreSnapshot};
 
 // ─── BftCommitter trait ───────────────────────────────────────────────────────
@@ -449,7 +450,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         // Build (key, leaf_value) pairs.
         let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = batch
-            .iter()
+            .par_iter()
             .map(|req| {
                 (
                     state_id_to_smt_key(&req.state_id),

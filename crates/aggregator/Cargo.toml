@@ -72,6 +72,9 @@ rocksdb.workspace = true
 # LRU cache for disk-backed SMT nodes
 lru.workspace = true
 
+# Parallel iterators
+rayon.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

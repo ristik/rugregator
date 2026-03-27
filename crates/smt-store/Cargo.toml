@@ -11,6 +11,7 @@ anyhow.workspace     = true
 tracing.workspace    = true
 hex.workspace        = true
 thiserror.workspace  = true
+rayon.workspace      = true
 
 [[bench]]
 name    = "store"

@@ -3004,6 +3004,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "rayon",
  "sha2",
  "thiserror 1.0.69",
 ]
@@ -3342,6 +3343,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "hex",
+ "rayon",
  "rocksdb",
  "rsmt",
  "tempfile",
@@ -3800,6 +3802,7 @@ dependencies = [
  "libp2p",
  "lru",
  "rand 0.8.5",
+ "rayon",
  "rocksdb",
  "rsmt",
  "secp256k1",

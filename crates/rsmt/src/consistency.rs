@@ -42,9 +42,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::hash::{SmtHasher, Sha256Hasher};
+use rayon;
 use crate::path::{get_sort_key, key_bit_at, CompressedPath, SmtKey, KEY_BITS};
 use crate::tree::{SmtError, SparseMerkleTree};
 use crate::types::{branch_hash, make_leaf, make_node, Branch, NodeBranch};
+
+/// Minimum batch slice size to spawn a rayon parallel task.
+/// Below this threshold sequential execution is faster (rayon overhead ~1 µs).
+const PAR_THRESHOLD: usize = 64;
 
 // ─── Proof opcodes ────────────────────────────────────────────────────────────
 
@@ -343,8 +348,18 @@ fn insert_proof<H: SmtHasher>(
 
             match proof_out {
                 None => {
-                    let new_left  = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, None);
-                    let new_right = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, None);
+                    let (new_left, new_right) = if end - start >= PAR_THRESHOLD {
+                        let left_arc  = node.left.clone();
+                        let right_arc = node.right.clone();
+                        rayon::join(
+                            || insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, None),
+                            || insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, None),
+                        )
+                    } else {
+                        let l = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, None);
+                        let r = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, None);
+                        (l, r)
+                    };
                     Some(make_node::<H>(
                         node.path,
                         new_left.expect("left child"),
@@ -353,10 +368,29 @@ fn insert_proof<H: SmtHasher>(
                     ))
                 }
                 Some(p) => {
-                    let mut lp = Vec::new();
-                    let mut rp = Vec::new();
-                    let new_left  = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, Some(&mut lp));
-                    let new_right = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, Some(&mut rp));
+                    let (new_left, new_right, lp, rp) = if end - start >= PAR_THRESHOLD {
+                        let left_arc  = node.left.clone();
+                        let right_arc = node.right.clone();
+                        let ((nl, lp), (nr, rp)) = rayon::join(
+                            || {
+                                let mut lp = Vec::new();
+                                let nl = insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, Some(&mut lp));
+                                (nl, lp)
+                            },
+                            || {
+                                let mut rp = Vec::new();
+                                let nr = insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, Some(&mut rp));
+                                (nr, rp)
+                            },
+                        );
+                        (nl, nr, lp, rp)
+                    } else {
+                        let mut lp = Vec::new();
+                        let mut rp = Vec::new();
+                        let nl = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, Some(&mut lp));
+                        let nr = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, Some(&mut rp));
+                        (nl, nr, lp, rp)
+                    };
                     p.extend(lp);
                     p.extend(rp);
                     p.push(ProofOp::N(split as u8));
@@ -412,15 +446,40 @@ fn build_subtree<H: SmtHasher>(
 
     match proof_out {
         None => {
-            let ln = build_subtree::<H>(batch, start, mid, split + 1, None, frozen);
-            let rn = build_subtree::<H>(batch, mid,   end, split + 1, None, frozen);
+            let (ln, rn) = if end - start >= PAR_THRESHOLD {
+                rayon::join(
+                    || build_subtree::<H>(batch, start, mid, split + 1, None, frozen),
+                    || build_subtree::<H>(batch, mid,   end, split + 1, None, frozen),
+                )
+            } else {
+                let l = build_subtree::<H>(batch, start, mid, split + 1, None, frozen);
+                let r = build_subtree::<H>(batch, mid,   end, split + 1, None, frozen);
+                (l, r)
+            };
             make_node::<H>(cp, ln, rn, split as u8)
         }
         Some(p) => {
-            let mut lp = Vec::new();
-            let mut rp = Vec::new();
-            let ln = build_subtree::<H>(batch, start, mid, split + 1, Some(&mut lp), frozen);
-            let rn = build_subtree::<H>(batch, mid,   end, split + 1, Some(&mut rp), frozen);
+            let (ln, rn, lp, rp) = if end - start >= PAR_THRESHOLD {
+                let ((ln, lp), (rn, rp)) = rayon::join(
+                    || {
+                        let mut lp = Vec::new();
+                        let l = build_subtree::<H>(batch, start, mid, split + 1, Some(&mut lp), frozen);
+                        (l, lp)
+                    },
+                    || {
+                        let mut rp = Vec::new();
+                        let r = build_subtree::<H>(batch, mid,   end, split + 1, Some(&mut rp), frozen);
+                        (r, rp)
+                    },
+                );
+                (ln, rn, lp, rp)
+            } else {
+                let mut lp = Vec::new();
+                let mut rp = Vec::new();
+                let ln = build_subtree::<H>(batch, start, mid, split + 1, Some(&mut lp), frozen);
+                let rn = build_subtree::<H>(batch, mid,   end, split + 1, Some(&mut rp), frozen);
+                (ln, rn, lp, rp)
+            };
             p.extend(lp);
             p.extend(rp);
             p.push(ProofOp::N(split as u8));
@@ -458,7 +517,21 @@ fn node_split_proof<H: SmtHasher>(
 
     match proof_out {
         None => {
-            let (new_left, new_right) = if old_dir == 0 {
+            let (new_left, new_right) = if end - start >= PAR_THRESHOLD {
+                if old_dir == 0 {
+                    let old_node_r = old_node;
+                    rayon::join(
+                        || insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, None),
+                        || insert_proof::<H>(None,       batch, mid,   end, new_split + 1, None),
+                    )
+                } else {
+                    let old_node_r = old_node;
+                    rayon::join(
+                        || insert_proof::<H>(None,       batch, start, mid, new_split + 1, None),
+                        || insert_proof::<H>(old_node_r, batch, mid,   end, new_split + 1, None),
+                    )
+                }
+            } else if old_dir == 0 {
                 let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, None);
                 let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, None);
                 (nl, nr)
@@ -475,16 +548,50 @@ fn node_split_proof<H: SmtHasher>(
             )
         }
         Some(p) => {
-            let mut lp = Vec::new();
-            let mut rp = Vec::new();
-            let (new_left, new_right) = if old_dir == 0 {
-                let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, Some(&mut lp));
-                let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, Some(&mut rp));
-                (nl, nr)
+            let (new_left, new_right, lp, rp) = if end - start >= PAR_THRESHOLD {
+                let ((nl, lp), (nr, rp)) = if old_dir == 0 {
+                    let old_node_r = old_node;
+                    rayon::join(
+                        || {
+                            let mut lp = Vec::new();
+                            let nl = insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, Some(&mut lp));
+                            (nl, lp)
+                        },
+                        || {
+                            let mut rp = Vec::new();
+                            let nr = insert_proof::<H>(None, batch, mid, end, new_split + 1, Some(&mut rp));
+                            (nr, rp)
+                        },
+                    )
+                } else {
+                    let old_node_r = old_node;
+                    rayon::join(
+                        || {
+                            let mut lp = Vec::new();
+                            let nl = insert_proof::<H>(None, batch, start, mid, new_split + 1, Some(&mut lp));
+                            (nl, lp)
+                        },
+                        || {
+                            let mut rp = Vec::new();
+                            let nr = insert_proof::<H>(old_node_r, batch, mid, end, new_split + 1, Some(&mut rp));
+                            (nr, rp)
+                        },
+                    )
+                };
+                (nl, nr, lp, rp)
             } else {
-                let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, Some(&mut lp));
-                let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, Some(&mut rp));
-                (nl, nr)
+                let mut lp = Vec::new();
+                let mut rp = Vec::new();
+                let (nl, nr) = if old_dir == 0 {
+                    let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, Some(&mut lp));
+                    let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, Some(&mut rp));
+                    (nl, nr)
+                } else {
+                    let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, Some(&mut lp));
+                    let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, Some(&mut rp));
+                    (nl, nr)
+                };
+                (nl, nr, lp, rp)
             };
             p.extend(lp);
             p.extend(rp);

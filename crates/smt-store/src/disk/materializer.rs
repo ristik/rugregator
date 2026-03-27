@@ -21,9 +21,7 @@ pub fn materialize_for_batch(
     batch:          &[(SmtKey, Vec<u8>)],
 ) -> anyhow::Result<SparseMerkleTree> {
     let keys: Vec<&SmtKey> = batch.iter().map(|(k, _)| k).collect();
-    let cf = db.cf_handle(CF_SMT_NODES)
-        .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    materialize_inner(db, &cf, own_overlay, parent_overlay, &keys)
+    materialize_inner(db, own_overlay, parent_overlay, &keys)
 }
 
 /// Materialize a partial SMT for a single-leaf proof generation.
@@ -34,9 +32,7 @@ pub fn materialize_for_proof(
     leaf_key:       &SmtKey,
 ) -> anyhow::Result<SparseMerkleTree> {
     let keys = [leaf_key];
-    let cf = db.cf_handle(CF_SMT_NODES)
-        .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    materialize_inner(db, &cf, own_overlay, parent_overlay, &keys)
+    materialize_inner(db, own_overlay, parent_overlay, &keys)
 }
 
 /// Materialize a partial SMT covering multiple keys — for batch proof generation.
@@ -47,9 +43,7 @@ pub fn materialize_for_keys(
     keys:           &[SmtKey],
 ) -> anyhow::Result<SparseMerkleTree> {
     let key_refs: Vec<&SmtKey> = keys.iter().collect();
-    let cf = db.cf_handle(CF_SMT_NODES)
-        .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    materialize_inner(db, &cf, own_overlay, parent_overlay, &key_refs)
+    materialize_inner(db, own_overlay, parent_overlay, &key_refs)
 }
 
 /// Load node bytes, checking overlays → RocksDB.
@@ -59,23 +53,20 @@ pub fn load_bytes(
     parent_overlay: Option<&Overlay>,
     nk:             &NodeKey,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let cf = db.cf_handle(CF_SMT_NODES)
-        .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    load_node(db, &cf, own_overlay, parent_overlay, nk)
+    load_node(db, own_overlay, parent_overlay, nk)
 }
 
 // ─── Core implementation ─────────────────────────────────────────────────────
 
 fn materialize_inner(
     db:             &DB,
-    cf:             &impl rocksdb::AsColumnFamilyRef,
     own_overlay:    &Overlay,
     parent_overlay: Option<&Overlay>,
     keys:           &[&SmtKey],
 ) -> anyhow::Result<SparseMerkleTree> {
     let root_nk = NodeKey::root();
 
-    let root_bytes = match load_node(db, cf, own_overlay, parent_overlay, &root_nk)? {
+    let root_bytes = match load_node(db, own_overlay, parent_overlay, &root_nk)? {
         None => return Ok(SparseMerkleTree::new()),
         Some(b) => b,
     };
@@ -93,8 +84,21 @@ fn materialize_inner(
     let mut base_acc: PrefixBits = [0u8; 32];
     prefix_copy_path(&mut base_acc, 0, &root_node.path);
 
-    root_node.left = route_child(db, cf, own_overlay, parent_overlay, split, false, keys, &base_acc)?;
-    root_node.right = route_child(db, cf, own_overlay, parent_overlay, split, true, keys, &base_acc)?;
+    // Parallelize left/right subtree loads when both sides have keys to visit.
+    // Each side accesses disjoint node key prefixes and only reads overlays/DB.
+    let has_left  = keys.iter().any(|k| key_bit_at(k, split) == 0);
+    let has_right = keys.iter().any(|k| key_bit_at(k, split) == 1);
+    if has_left && has_right {
+        let (left_res, right_res) = rayon::join(
+            || route_child(db, own_overlay, parent_overlay, split, false, keys, &base_acc),
+            || route_child(db, own_overlay, parent_overlay, split, true,  keys, &base_acc),
+        );
+        root_node.left  = left_res?;
+        root_node.right = right_res?;
+    } else {
+        root_node.left  = route_child(db, own_overlay, parent_overlay, split, false, keys, &base_acc)?;
+        root_node.right = route_child(db, own_overlay, parent_overlay, split, true,  keys, &base_acc)?;
+    }
 
     // Recompute hash if missing.
     if root_node.hash.is_none() {
@@ -111,7 +115,6 @@ fn materialize_inner(
 /// Filter keys by routing bit, then materialize or load as stub.
 fn route_child(
     db:             &DB,
-    cf:             &impl rocksdb::AsColumnFamilyRef,
     own_overlay:    &Overlay,
     parent_overlay: Option<&Overlay>,
     split:          usize,
@@ -131,15 +134,14 @@ fn route_child(
     let child_nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
 
     if child_keys.is_empty() {
-        return load_stub(db, cf, own_overlay, parent_overlay, child_nk);
+        return load_stub(db, own_overlay, parent_overlay, child_nk);
     }
 
-    materialize_subtree(db, cf, own_overlay, parent_overlay, child_nk, &child_keys, split, &child_acc)
+    materialize_subtree(db, own_overlay, parent_overlay, child_nk, &child_keys, split, &child_acc)
 }
 
 fn materialize_subtree(
     db:             &DB,
-    cf:             &impl rocksdb::AsColumnFamilyRef,
     own_overlay:    &Overlay,
     parent_overlay: Option<&Overlay>,
     nk:             NodeKey,
@@ -147,7 +149,7 @@ fn materialize_subtree(
     start_bit:      usize,
     acc:            &PrefixBits,
 ) -> anyhow::Result<Arc<Branch>> {
-    let bytes = match load_node(db, cf, own_overlay, parent_overlay, &nk)? {
+    let bytes = match load_node(db, own_overlay, parent_overlay, &nk)? {
         None => return Ok(Arc::new(Branch::Stub([0u8; 32]))),
         Some(b) => b,
     };
@@ -165,8 +167,19 @@ fn materialize_subtree(
     prefix_copy_path(&mut base_acc, start_bit + 1, &node.path);
     let split = start_bit + 1 + n_path;
 
-    node.left = route_child(db, cf, own_overlay, parent_overlay, split, false, keys, &base_acc)?;
-    node.right = route_child(db, cf, own_overlay, parent_overlay, split, true, keys, &base_acc)?;
+    let has_left  = keys.iter().any(|k| key_bit_at(k, split) == 0);
+    let has_right = keys.iter().any(|k| key_bit_at(k, split) == 1);
+    if has_left && has_right {
+        let (left_res, right_res) = rayon::join(
+            || route_child(db, own_overlay, parent_overlay, split, false, keys, &base_acc),
+            || route_child(db, own_overlay, parent_overlay, split, true,  keys, &base_acc),
+        );
+        node.left  = left_res?;
+        node.right = right_res?;
+    } else {
+        node.left  = route_child(db, own_overlay, parent_overlay, split, false, keys, &base_acc)?;
+        node.right = route_child(db, own_overlay, parent_overlay, split, true,  keys, &base_acc)?;
+    }
 
     if node.hash.is_none() {
         let lh = branch_hash(&node.left);
@@ -178,12 +191,11 @@ fn materialize_subtree(
 
 fn load_stub(
     db:             &DB,
-    cf:             &impl rocksdb::AsColumnFamilyRef,
     own_overlay:    &Overlay,
     parent_overlay: Option<&Overlay>,
     nk:             NodeKey,
 ) -> anyhow::Result<Arc<Branch>> {
-    let bytes = match load_node(db, cf, own_overlay, parent_overlay, &nk)? {
+    let bytes = match load_node(db, own_overlay, parent_overlay, &nk)? {
         None => return Ok(Arc::new(Branch::Stub([0u8; 32]))),
         Some(b) => b,
     };
@@ -195,7 +207,6 @@ fn load_stub(
 
 fn load_node(
     db:             &DB,
-    cf:             &impl rocksdb::AsColumnFamilyRef,
     own_overlay:    &Overlay,
     parent_overlay: Option<&Overlay>,
     nk:             &NodeKey,
@@ -208,7 +219,9 @@ fn load_node(
             return Ok(opt.map(|b| b.to_vec()));
         }
     }
-    match db.get_cf(cf, nk.as_bytes())? {
+    let cf = db.cf_handle(CF_SMT_NODES)
+        .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
+    match db.get_cf(&cf, nk.as_bytes())? {
         None => Ok(None),
         Some(v) => Ok(Some(v.to_vec())),
     }

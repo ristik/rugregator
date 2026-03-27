@@ -16,7 +16,7 @@ use crate::path::SmtKey;
 ///
 /// Implementors must be `Copy` so they can be used as type parameters
 /// without any runtime state.
-pub trait SmtHasher: Copy + 'static {
+pub trait SmtHasher: Copy + Send + Sync + 'static {
     /// Hash a leaf: `H(0x00 || key || value)`.
     fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32];
     /// Hash an internal node: `H(0x01 || depth || left_hash || right_hash)`.

@@ -8,6 +8,7 @@ authors.workspace = true
 sha2.workspace       = true
 blake3.workspace     = true
 thiserror.workspace  = true
+rayon.workspace      = true
 
 [[bench]]
 name    = "smt"
