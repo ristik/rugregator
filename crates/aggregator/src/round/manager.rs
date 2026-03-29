@@ -303,6 +303,8 @@ struct InFlightRound<S: SmtStore> {
     inserted: Vec<ProcessedRecord>,
     spec_batch: Vec<ValidatedRequest>,
     spec_inserted: Vec<ProcessedRecord>,
+    dropped: usize,
+    spec_dropped: usize,
 }
 
 // ─── RoundManager ─────────────────────────────────────────────────────────────
@@ -503,6 +505,7 @@ impl<S: SmtStore> RoundManager<S> {
             }
         };
         let prev_root = self.current_root;
+        let dropped = batch.len() - inserted.len();
 
         // Fork for speculative next-round work.
         let spec_snap = proposed_snap.fork();
@@ -551,6 +554,8 @@ impl<S: SmtStore> RoundManager<S> {
             inserted,
             spec_batch: Vec::new(),
             spec_inserted: Vec::new(),
+            dropped,
+            spec_dropped: 0,
         });
     }
 
@@ -561,6 +566,7 @@ impl<S: SmtStore> RoundManager<S> {
         mut spec_snap: S::Snapshot,
         spec_batch: Vec<ValidatedRequest>,
         spec_inserted: Vec<ProcessedRecord>,
+        spec_dropped: usize,
     ) {
         let new_root = match spec_snap.root_hash() {
             Ok(r) => r,
@@ -573,6 +579,7 @@ impl<S: SmtStore> RoundManager<S> {
         };
         let prev_root = self.current_root;
         let count = spec_batch.len();
+        let dropped = spec_dropped;
 
         let new_spec_snap = spec_snap.fork();
 
@@ -619,6 +626,8 @@ impl<S: SmtStore> RoundManager<S> {
             inserted: spec_inserted,
             spec_batch: Vec::new(),
             spec_inserted: Vec::new(),
+            dropped,
+            spec_dropped: 0,
         });
 
         // Drain any pending requests into the new speculative layer.
@@ -662,6 +671,7 @@ impl<S: SmtStore> RoundManager<S> {
             }
             Err(rsmt::SmtError::DuplicateLeaf) => {
                 debug!(state_id = %hex::encode(&req.state_id), "skipping duplicate in spec");
+                inf.spec_dropped += 1;
             }
             Err(e) => {
                 warn!(state_id = %hex::encode(&req.state_id), err = %e, "spec leaf insert failed");
@@ -695,9 +705,10 @@ impl<S: SmtStore> RoundManager<S> {
                 // Generate proofs from committed store.
                 let finalized = self.generate_proofs(inf.inserted, inf.block_number);
 
-                let certified_count = finalized.len();
-                let submitted_count = inf.submitted_batch.len();
+                let unique_count = finalized.len();
+                let dropped_count = inf.dropped;
                 let spec_count = inf.spec_batch.len();
+                let spec_dropped = inf.spec_dropped;
 
                 let root_hex = inf.new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
                 self.state
@@ -712,11 +723,12 @@ impl<S: SmtStore> RoundManager<S> {
                     .await;
 
                 info!(
-                    block       = inf.block_number,
-                    root        = %root_hex,
-                    certified   = certified_count,
-                    submitted   = submitted_count,
-                    spec_queued = spec_count,
+                    block        = inf.block_number,
+                    root         = %root_hex,
+                    unique       = unique_count,
+                    dropped      = dropped_count,
+                    spec_queued  = spec_count,
+                    spec_dropped = spec_dropped,
                     "round finalized"
                 );
 
@@ -727,6 +739,7 @@ impl<S: SmtStore> RoundManager<S> {
                         inf.spec_snap,
                         inf.spec_batch,
                         inf.spec_inserted,
+                        inf.spec_dropped,
                     )
                     .await;
                 } else {

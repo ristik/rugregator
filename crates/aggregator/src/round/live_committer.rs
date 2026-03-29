@@ -89,7 +89,7 @@ mod opt_bytes {
     }
 }
 
-// ─── BFT round state ──────────────────────────────────────────────────────────
+// ─── Round state ──────────────────────────────────────────────────────────
 
 /// Authoritative reference from the last valid UC.
 /// Updated from EVERY valid UC (sync, cert response, repeat).
@@ -118,7 +118,7 @@ struct Shared {
 struct UcEvent {
     /// IR.round_number — 0 for sync (proactive) UCs.
     uc_round: u64,
-    /// TechnicalRecord.round — the BFT round the aggregator should use next.
+    /// TechnicalRecord.round — the round number for the next cert request.
     next_round: u64,
     epoch: u64,
     prev_hash: Option<Vec<u8>>,
@@ -137,8 +137,8 @@ struct PendingCert {
     block_size: u64,
     state_size: u64,
     uc_tx: oneshot::Sender<Vec<u8>>,
-    /// BFT round used when this cert request was (last) sent.
-    bft_round_used: u64,
+    /// Round used when this cert request was (last) sent.
+    round_used: u64,
 }
 
 // ─── libp2p plumbing ─────────────────────────────────────────────────────────
@@ -563,7 +563,7 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
 /// `timestamp` = UnicitySeal.Timestamp from the latest UC (must be echoed verbatim).
 fn make_cert_cbor(
     pending: &PendingCert,
-    bft_round: u64,
+    round: u64,
     epoch: u64,
     prev_hash_ir: Option<Vec<u8>>,
     timestamp: u64,
@@ -592,7 +592,7 @@ fn make_cert_cbor(
     };
     let ir = InputRecord {
         version: 1,
-        round_number: bft_round,
+        round_number: round,
         epoch,
         previous_hash: prev_hash_ir,
         hash: Some(pending.new_hash.clone()),
@@ -708,28 +708,28 @@ async fn network_loop(
 
                         // Handle pending cert request.
                         if let Some(ref mut p) = pending {
-                            if ev.uc_round > 0 && ev.uc_round == p.bft_round_used {
+                            if ev.uc_round > 0 && ev.uc_round == p.round_used {
                                 // Our cert request was certified.
-                                info!(bft_round = ev.uc_round, "UC matched — cert request certified");
+                                info!(round = ev.uc_round, "UC matched — cert request certified");
                                 let p = pending.take().unwrap();
                                 let _ = p.uc_tx.send(ev.uc_cbor);
-                            } else if ev.uc_round > 0 && ev.uc_round > p.bft_round_used {
+                            } else if ev.uc_round > 0 && ev.uc_round > p.round_used {
                                 // A higher partition round was certified — our request
                                 // was superseded (should not happen in single-aggregator setup).
                                 warn!(
-                                    our_round = p.bft_round_used,
+                                    our_round = p.round_used,
                                     uc_round = ev.uc_round,
                                     "pending cert superseded — dropping"
                                 );
                                 let p = pending.take().unwrap();
                                 drop(p);
-                            } else if ev.next_round > p.bft_round_used {
+                            } else if ev.next_round > p.round_used {
                                 // Repeat UC with an advanced partition round —
-                                // BFT Core timed out on our round and moved on.
+                                // BFT Core timed us out.
                                 // Re-send the same cert request with the new round number.
-                                let old_round = p.bft_round_used;
+                                let old_round = p.round_used;
                                 let new_round = ev.next_round;
-                                p.bft_round_used = new_round;
+                                p.round_used = new_round;
 
                                 let lu = last_uc.as_ref().unwrap();
                                 let prev_hash_ir = if fake_state_transitions {
@@ -756,7 +756,7 @@ async fn network_loop(
                             } else {
                                 // Repeat UC at same round — still waiting.
                                 debug!(
-                                    our_round = p.bft_round_used,
+                                    our_round = p.round_used,
                                     uc_round = ev.uc_round,
                                     next_round = ev.next_round,
                                     "repeat UC while cert pending — still waiting"
@@ -841,7 +841,7 @@ async fn network_loop(
                             }
                         };
 
-                        let bft_round = lu.next_round;
+                        let round = lu.next_round;
 
                         // Check whether our SMT root matches what BFT Core certified.
                         // An all-zeros SMT root (empty tree) is semantically nil —
@@ -886,13 +886,13 @@ async fn network_loop(
                             block_size: data.block_size,
                             state_size: data.state_size,
                             uc_tx: data.uc_tx,
-                            bft_round_used: bft_round,
+                            round_used: round,
                         };
 
-                        match make_cert_cbor(&p, bft_round, lu.epoch, prev_hash_ir,
+                        match make_cert_cbor(&p, round, lu.epoch, prev_hash_ir,
                                              lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
                             Ok(cbor) => {
-                                info!(bft_round, "sending cert request to BFT Core");
+                                info!(round, "sending cert request to BFT Core");
                                 pending = Some(p);
                                 swarm.behaviour_mut().cert.send_request(&bft_peer, cbor);
                             }

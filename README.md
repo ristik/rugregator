@@ -8,7 +8,6 @@ Focus areas:
 - Scaling beyond available system memory (fully disk-backed SMT)
 - Speculative execution of the next round while waiting for BFT certification
 - Configurable persistence — trade off restart speed vs. memory footprint vs. performance
-- NOT low level optimizations, all single-threaded for measurability
 
 
 ---
