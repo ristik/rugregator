@@ -44,7 +44,7 @@ async function runWorker(cfg: WorkerData): Promise<void> {
   const { CborSerializer } = await import('@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js');
   const { StateTransitionClient } = await import('@unicitylabs/state-transition-sdk/lib/StateTransitionClient.js');
   const { MintTransaction } = await import('@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js');
-  const { PayToScriptHash } = await import('@unicitylabs/state-transition-sdk/lib/transaction/PayToScriptHash.js');
+  const { Address } = await import('@unicitylabs/state-transition-sdk/lib/transaction/Address.js');
   const { TokenId } = await import('@unicitylabs/state-transition-sdk/lib/transaction/TokenId.js');
   const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js');
 
@@ -56,9 +56,9 @@ async function runWorker(cfg: WorkerData): Promise<void> {
 
   async function makeCertData(): Promise<CertificationData> {
     const s = new SigningService(SigningService.generatePrivateKey());
-    const p = PayToPublicKeyPredicate.create(s);
+    const p = PayToPublicKeyPredicate.fromSigningService(s);
     const tx = await MintTransaction.create(
-      await PayToScriptHash.create(p),
+      await Address.fromPredicate(p),
       new TokenId(crypto.getRandomValues(new Uint8Array(32))),
       new TokenType(crypto.getRandomValues(new Uint8Array(32))),
       CborSerializer.encodeArray(),

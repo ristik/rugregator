@@ -37,6 +37,7 @@ impl RocksDbStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        opts.set_max_open_files(1024);
 
         let mut node_opts = Options::default();
         node_opts.set_compression_type(DBCompressionType::Lz4);

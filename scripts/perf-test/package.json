@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "perf-test": "tsx perf-test.ts"
+    "perf-test": "tsx perf-test-mt.ts"
   },
   "dependencies": {
-    "@unicitylabs/state-transition-sdk": "2.0.0-rc.92d5a21"
+    "@unicitylabs/state-transition-sdk": "github:unicitynetwork/state-transition-sdk-js#inclusion_proof.v2"
   },
   "devDependencies": {
-    "tsx": "^4.19.2",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2"
   }
 }

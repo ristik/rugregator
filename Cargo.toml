@@ -44,4 +44,5 @@ rsmt         = { path = "crates/rsmt" }
 rocksdb      = { version = "0.22", features = ["multi-threaded-cf"] }
 lru          = "0.12"
 rayon        = "1"
+libc         = "0.2"
 smt-store    = { path = "crates/smt-store" }

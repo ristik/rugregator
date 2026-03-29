@@ -1,20 +1,23 @@
 //! Aggregator entry point.
 
-use std::sync::Arc;
 use clap::Parser;
+#[cfg(unix)]
+use libc;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use smt_store::SmtStore as _;
 use uni_aggregator::{
     api::build_router,
     config::{Config, RoundConfig},
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::AggregatorState,
 };
-use smt_store::SmtStore as _;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    raise_fd_limit();
     let cfg = Config::parse();
 
     tracing_subscriber::fmt()
@@ -23,11 +26,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve effective SMT backend early so we can log it.
     let smt_backend = if cfg.smt_backend.is_empty() {
-        if cfg.db_path.is_empty() { "mem" } else { "disk" }
+        if cfg.db_path.is_empty() {
+            "mem"
+        } else {
+            "disk"
+        }
     } else {
         cfg.smt_backend.as_str()
     };
-    let db_display = if cfg.db_path.is_empty() { "none" } else { &cfg.db_path };
+    let db_display = if cfg.db_path.is_empty() {
+        "none"
+    } else {
+        &cfg.db_path
+    };
 
     info!("Unicity Aggregator starting (Rust)");
     info!(listen = %cfg.listen, round_ms = cfg.round_duration_ms, batch = cfg.batch_limit,
@@ -45,11 +56,17 @@ async fn main() -> anyhow::Result<()> {
             if cfg.fake_state_transitions {
                 warn!("fake-state-transitions enabled — PreviousHash from UC, not SMT root");
             }
-            let peer_id: libp2p::PeerId = cfg.bft_peer_id.parse()
+            let peer_id: libp2p::PeerId = cfg
+                .bft_peer_id
+                .parse()
                 .map_err(|e| anyhow::anyhow!("invalid bft_peer_id '{}': {e}", cfg.bft_peer_id))?;
-            let bft_addr: libp2p::Multiaddr = cfg.bft_addr.parse()
+            let bft_addr: libp2p::Multiaddr = cfg
+                .bft_addr
+                .parse()
                 .map_err(|e| anyhow::anyhow!("invalid bft_addr '{}': {e}", cfg.bft_addr))?;
-            let p2p_addr: libp2p::Multiaddr = cfg.p2p_addr.parse()
+            let p2p_addr: libp2p::Multiaddr = cfg
+                .p2p_addr
+                .parse()
                 .map_err(|e| anyhow::anyhow!("invalid p2p_addr '{}': {e}", cfg.p2p_addr))?;
             let auth_key = hex::decode(&cfg.auth_key_hex)
                 .map_err(|e| anyhow::anyhow!("invalid auth_key_hex: {e}"))?;
@@ -74,7 +91,11 @@ async fn main() -> anyhow::Result<()> {
     let round_cfg = RoundConfig::from(&cfg);
 
     // Backends that require a DB path.
-    if matches!(smt_backend, "disk" | "mem-leaves" | "mem-leaves-x" | "mem-full") && cfg.db_path.is_empty() {
+    if matches!(
+        smt_backend,
+        "disk" | "mem-leaves" | "mem-leaves-x" | "mem-full"
+    ) && cfg.db_path.is_empty()
+    {
         anyhow::bail!("smt-backend '{}' requires --db-path to be set", smt_backend);
     }
 
@@ -82,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
     macro_rules! spawn_rm {
         ($rm:expr, $state:expr) => {{
             let notify = $rm.shutdown_notify();
-            tokio::spawn(async move { $rm.run().await; });
+            tokio::spawn(async move {
+                $rm.run().await;
+            });
             ($state, notify)
         }};
     }
@@ -93,9 +116,9 @@ async fn main() -> anyhow::Result<()> {
         let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
         spawn_rm!(rm, state)
     } else {
-        use uni_aggregator::storage_rocksdb::RocksDbStore;
-        use smt_store::{DiskSmt, MemSmt};
         use smt_store::mem::PersistMode;
+        use smt_store::{DiskSmt, MemSmt};
+        use uni_aggregator::storage_rocksdb::RocksDbStore;
 
         let recover_t0 = std::time::Instant::now();
         info!(path = %cfg.db_path, "opening RocksDB");
@@ -103,10 +126,17 @@ async fn main() -> anyhow::Result<()> {
         let store = Arc::new(store);
 
         let recovered = store.recover()?;
-        info!(records = recovered.records.len(), blocks = recovered.blocks.len(),
-              block_number = recovered.block_number, "recovered from RocksDB");
+        info!(
+            records = recovered.records.len(),
+            blocks = recovered.blocks.len(),
+            block_number = recovered.block_number,
+            "recovered from RocksDB"
+        );
 
-        let state = AggregatorState::new(req_tx, Some(store as Arc<dyn uni_aggregator::storage::Store>));
+        let state = AggregatorState::new(
+            req_tx,
+            Some(store as Arc<dyn uni_aggregator::storage::Store>),
+        );
         state.apply_recovered(recovered).await;
 
         match smt_backend {
@@ -169,4 +199,21 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
+}
+
+/// Raise the process's soft file-descriptor limit to the hard limit so that
+/// high-concurrency (or badly written) perf tests don't hit
+/// EMFILE (os error 24).
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    }
 }

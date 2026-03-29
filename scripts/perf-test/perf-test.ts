@@ -27,7 +27,7 @@ import { PayToPublicKeyPredicate } from '@unicitylabs/state-transition-sdk/lib/p
 import { CborSerializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 import { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
-import { PayToScriptHash } from '@unicitylabs/state-transition-sdk/lib/transaction/PayToScriptHash.js';
+import { Address } from '@unicitylabs/state-transition-sdk/lib/transaction/Address.js';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenId.js';
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
 
@@ -98,9 +98,9 @@ class TokenBucket {
 
 async function makeCertData(): Promise<{ certData: CertificationData; stateId: StateId }> {
   const signingService = new SigningService(SigningService.generatePrivateKey());
-  const predicate = PayToPublicKeyPredicate.create(signingService);
+  const predicate = PayToPublicKeyPredicate.fromSigningService(signingService);
   const mintTx = await MintTransaction.create(
-    await PayToScriptHash.create(predicate),
+    await Address.fromPredicate(predicate),
     new TokenId(crypto.getRandomValues(new Uint8Array(32))),
     new TokenType(crypto.getRandomValues(new Uint8Array(32))),
     CborSerializer.encodeArray(),
