@@ -14,8 +14,9 @@
  *   --workers <n>        Parallel workers in workers mode (default: 10)
  *   --rps <n>            Target requests/sec; overrides --workers
  *   --duration <s>       Test duration in seconds (default: 30)
- *   --proofs             Fetch inclusion proofs after certification
- *   --proof-delay <ms>   Delay before fetching each proof (default: 5000)
+ *   --proofs                  Fetch inclusion proofs after certification
+ *   --proof-delay <ms>        Delay before fetching each proof (default: 5000)
+ *   --proof-retry-delay <ms>  If proof not yet available, retry after this delay (up to 10 retries)
  */
 
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
@@ -40,6 +41,7 @@ interface Config {
   duration: number;
   proofs: boolean;
   proofDelay: number;
+  proofRetryDelay: number | null;
 }
 
 function parseArgs(): Config {
@@ -58,8 +60,10 @@ function parseArgs(): Config {
   const duration = parseInt(get('--duration') ?? '30', 10);
   const proofs = args.includes('--proofs');
   const proofDelay = parseInt(get('--proof-delay') ?? '5000', 10);
+  const proofRetryDelayStr = get('--proof-retry-delay');
+  const proofRetryDelay = proofRetryDelayStr ? parseInt(proofRetryDelayStr, 10) : null;
 
-  return { url, workers, rps, duration, proofs, proofDelay };
+  return { url, workers, rps, duration, proofs, proofDelay, proofRetryDelay };
 }
 
 // ── Token bucket rate limiter ─────────────────────────────────────────────────
@@ -155,7 +159,10 @@ async function main(): Promise<void> {
     `  url=${cfg.url}  ` +
       `mode=${cfg.rps ? `rps=${cfg.rps} (${cfg.workers} workers)` : `workers=${cfg.workers}`}  ` +
       `duration=${cfg.duration}s  proofs=${cfg.proofs}` +
-      (cfg.proofs ? `  proof-delay=${cfg.proofDelay}ms` : ''),
+      (cfg.proofs
+        ? `  proof-delay=${cfg.proofDelay}ms` +
+          (cfg.proofRetryDelay !== null ? `  proof-retry-delay=${cfg.proofRetryDelay}ms` : '')
+        : ''),
   );
   console.log('');
 
@@ -197,22 +204,28 @@ async function main(): Promise<void> {
         if (cfg.proofs && response.status === CertificationStatus.SUCCESS) {
           const capturedStateId = stateId;
           const capturedSentAt = sentAt;
-          const p = new Promise<void>((resolve) => {
-            setTimeout(async () => {
+          const p = (async () => {
+            const delay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+            await delay(cfg.proofDelay);
+            const maxRetries = cfg.proofRetryDelay !== null ? 10 : 0;
+            let lastErr: unknown;
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+              if (attempt > 0) await delay(cfg.proofRetryDelay!);
               try {
                 await client.getInclusionProof(capturedStateId);
                 proofResults.push({ sentAt: capturedSentAt, fetchedAt: Date.now(), success: true });
+                return;
               } catch (err) {
-                proofResults.push({
-                  sentAt: capturedSentAt,
-                  fetchedAt: Date.now(),
-                  success: false,
-                  error: String(err),
-                });
+                lastErr = err;
               }
-              resolve();
-            }, cfg.proofDelay);
-          });
+            }
+            proofResults.push({
+              sentAt: capturedSentAt,
+              fetchedAt: Date.now(),
+              success: false,
+              error: String(lastErr),
+            });
+          })();
           pendingProofs.push(p);
         }
       } catch (err) {
