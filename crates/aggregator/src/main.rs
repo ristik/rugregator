@@ -12,7 +12,7 @@ use uni_aggregator::{
     api::build_router,
     config::{Config, RoundConfig},
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
-    storage::AggregatorState,
+    storage::{AggregatorState, WalStore},
 };
 
 #[tokio::main]
@@ -125,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         let (store, arc_db) = RocksDbStore::open(&cfg.db_path, cfg.cache_mb * 1024 * 1024)?;
         let store = Arc::new(store);
 
+        // Retain a WAL handle before converting the store to a trait object.
+        let wal: Arc<dyn WalStore> = Arc::clone(&store) as Arc<dyn WalStore>;
+
         let recovered = store.recover()?;
         info!(
             records = recovered.records.len(),
@@ -144,35 +147,40 @@ async fn main() -> anyhow::Result<()> {
                 let disk_smt = DiskSmt::open(arc_db, cfg.cache_mb * 1024 * 1024)?;
                 info!(root = %disk_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "disk-backed SMT ready");
-                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt);
+                let rm = RoundManager::new_with_disk_smt(round_cfg, req_rx, Arc::clone(&state), bft, disk_smt)
+                    .with_wal(wal);
                 spawn_rm!(rm, state)
             }
             "mem-leaves" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesOnly)?;
                 info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves-only) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt)
+                    .with_wal(wal);
                 spawn_rm!(rm, state)
             }
             "mem-leaves-x" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::LeavesWithShutdownSnapshot)?;
                 info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (leaves + shutdown snapshot) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt)
+                    .with_wal(wal);
                 spawn_rm!(rm, state)
             }
             "mem-full" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::Full)?;
                 info!(root = %mem_smt.root_hash().map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()),
                       recovered_ms = recover_t0.elapsed().as_millis() as u64, "in-memory SMT (full-nodes) ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt)
+                    .with_wal(wal);
                 spawn_rm!(rm, state)
             }
             "mem" => {
                 let mem_smt = MemSmt::open(arc_db, PersistMode::None)?;
                 info!(recovered_ms = recover_t0.elapsed().as_millis() as u64,
                       "in-memory SMT (no persistence) with DB ready");
-                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt);
+                let rm = RoundManager::with_smt(round_cfg, req_rx, Arc::clone(&state), bft, mem_smt)
+                    .with_wal(wal);
                 spawn_rm!(rm, state)
             }
             other => anyhow::bail!("unknown smt-backend: '{other}' (supported: disk, mem, mem-leaves, mem-leaves-x, mem-full)"),
@@ -180,8 +188,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let router = build_router(Arc::clone(&state));
-    let listener = bind_listener(&cfg.listen, 4096)?;
     // let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    let listener = bind_listener(&cfg.listen, 4096)?;
     info!(listen = %cfg.listen, "HTTP server ready");
 
     // Run HTTP server until SIGINT (ctrl+c).

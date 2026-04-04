@@ -27,6 +27,46 @@ pub trait Store: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+// ─── WAL types ────────────────────────────────────────────────────────────────
+
+/// One record within a pending-round WAL entry.
+pub struct WalRecord {
+    pub state_id: Vec<u8>,
+    pub predicate_cbor: Vec<u8>,
+    pub source_state_hash: Vec<u8>,
+    pub transaction_hash: Vec<u8>,
+    pub witness: Vec<u8>,
+}
+
+/// WAL entry written to disk before a block is submitted to BFT Core.
+///
+/// Guarantees that after a crash the aggregator can reconstruct the batch
+/// that was certified and apply it to the SMT on recovery.
+pub struct PendingRound {
+    pub block_number: u64,
+    pub prev_root: Option<[u8; 32]>,
+    pub new_root: Option<[u8; 32]>,
+    /// Consistency proof bytes sent to BFT Core (stored so recovery can re-submit
+    /// the exact same proof rather than re-computing it from a potentially
+    /// already-committed SMT state).
+    pub zk_proof: Option<Vec<u8>>,
+    pub new_leaves: u64,
+    pub state_size: u64,
+    /// Records that were actually inserted (not duplicates/dropped).
+    pub inserted: Vec<WalRecord>,
+}
+
+/// Write-ahead log interface for in-flight rounds.
+///
+/// `write_pending_round` must be called (and succeed) before every BFT
+/// submission.  The entry is cleared atomically inside `persist_round` — so
+/// it exists if-and-only-if the round has not yet been durably committed.
+pub trait WalStore: Send + Sync {
+    fn write_pending_round(&self, round: &PendingRound) -> anyhow::Result<()>;
+    fn load_pending_round(&self) -> anyhow::Result<Option<PendingRound>>;
+    fn clear_pending_round(&self) -> anyhow::Result<()>;
+}
+
 // ─── RecoveredState ───────────────────────────────────────────────────────────
 
 pub struct RecoveredState {

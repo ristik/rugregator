@@ -23,7 +23,7 @@ use super::state::ProcessedRecord;
 use crate::api::cbor::CertDataFields;
 use crate::config::RoundConfig;
 use crate::smt::state_id_to_smt_key;
-use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord};
+use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord, PendingRound, WalRecord, WalStore};
 use crate::validation::state_id::compute_cert_data_hash;
 use crate::validation::ValidatedRequest;
 use async_trait::async_trait;
@@ -323,6 +323,9 @@ pub struct RoundManager<S: SmtStore> {
     uc_tx: mpsc::Sender<anyhow::Result<Vec<u8>>>,
     uc_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
     shutdown_notify: Arc<Notify>,
+    /// Write-ahead log: written before every BFT submission, cleared atomically
+    /// with `persist_round`.  `None` for in-memory (non-persistent) backends.
+    wal: Option<Arc<dyn WalStore>>,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -374,7 +377,15 @@ impl<S: SmtStore> RoundManager<S> {
             uc_tx,
             uc_rx,
             shutdown_notify: Arc::new(Notify::new()),
+            wal: None,
         }
+    }
+
+    /// Attach a write-ahead log store.  Call this for disk-backed backends
+    /// to enable pre-BFT crash safety.
+    pub fn with_wal(mut self, wal: Arc<dyn WalStore>) -> Self {
+        self.wal = Some(wal);
+        self
     }
 
     /// Get a handle that can be used to signal graceful shutdown.
@@ -388,6 +399,9 @@ impl<S: SmtStore> RoundManager<S> {
 
     /// Run the round manager event loop.
     pub async fn run(mut self) {
+        // On startup, replay any round that was in-flight when the process last crashed.
+        self.recover_pending_round().await;
+
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
@@ -426,6 +440,141 @@ impl<S: SmtStore> RoundManager<S> {
             Ok(()) => info!("SMT shutdown persist completed"),
             Err(e) => error!(err = %e, "SMT shutdown persist failed"),
         }
+    }
+
+    // ── WAL recovery ──────────────────────────────────────────────────────────
+
+    /// If a WAL entry exists from a previous crashed run, replay the round.
+    ///
+    /// Recovery strategy:
+    /// - Re-insert the same batch into the SMT (idempotent if already committed).
+    /// - Re-submit to BFT Core using the stored block number, roots, and proof.
+    /// - The normal `on_uc_result` path then commits and clears the WAL.
+    async fn recover_pending_round(&mut self) {
+        let wal = match &self.wal {
+            Some(w) => Arc::clone(w),
+            None    => return,
+        };
+
+        let pending = match wal.load_pending_round() {
+            Ok(Some(p)) => p,
+            Ok(None)    => return,
+            Err(e) => {
+                error!(err = %e, "WAL: failed to load pending round on startup");
+                return;
+            }
+        };
+
+        let current_block = self.state.current_block_number().await;
+        if pending.block_number < current_block {
+            // Round was already committed (block number advanced past it).
+            warn!(block = pending.block_number, "WAL: stale entry for already-committed block, clearing");
+            if let Err(e) = wal.clear_pending_round() {
+                error!(err = %e, "WAL: failed to clear stale entry");
+            }
+            return;
+        }
+
+        warn!(
+            block = pending.block_number,
+            count = pending.inserted.len(),
+            "WAL: recovering in-flight round from previous run"
+        );
+
+        // Reconstruct SMT pairs.  If the SMT was already committed before the crash
+        // these insertions will all be no-ops (DuplicateLeaf), leaving the root intact.
+        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = pending.inserted.iter().map(|r| {
+            (
+                state_id_to_smt_key(&r.state_id),
+                compute_cert_data_hash(
+                    &r.predicate_cbor,
+                    &r.source_state_hash,
+                    &r.transaction_hash,
+                    &r.witness,
+                ).to_vec(),
+            )
+        }).collect();
+
+        let mut proposed_snap = self.smt.create_snapshot();
+        // We don't need a new consistency proof here; use the one stored in the WAL.
+        if let Err(e) = proposed_snap.insert_batch(&pairs, false) {
+            error!(block = pending.block_number, err = %e, "WAL recovery: insert_batch failed");
+            proposed_snap.discard();
+            return;
+        }
+
+        let recovered_root = match proposed_snap.root_hash() {
+            Ok(r) => r,
+            Err(e) => {
+                error!(block = pending.block_number, err = %e, "WAL recovery: root_hash failed");
+                proposed_snap.discard();
+                return;
+            }
+        };
+
+        if recovered_root != pending.new_root {
+            warn!(
+                block    = pending.block_number,
+                expected = ?pending.new_root.map(hex::encode),
+                got      = ?recovered_root.map(hex::encode),
+                "WAL recovery: root hash mismatch after re-insertion"
+            );
+        }
+
+        // Reconstruct ProcessedRecord list from the WAL records.
+        let inserted: Vec<ProcessedRecord> = pending.inserted.iter().map(|r| ProcessedRecord {
+            state_id_hex: hex::encode(&r.state_id),
+            cert_data: CertDataFields {
+                predicate_cbor:    r.predicate_cbor.clone(),
+                source_state_hash: r.source_state_hash.clone(),
+                transaction_hash:  r.transaction_hash.clone(),
+                witness:           r.witness.clone(),
+            },
+        }).collect();
+
+        let spec_snap = proposed_snap.fork();
+
+        // WAL entry already exists from the previous run — no need to re-write.
+        if let Err(e) = self.bft.commit_block(
+            pending.block_number,
+            pending.new_root,   // use the stored root, not the recomputed one
+            pending.prev_root,
+            pending.zk_proof.clone(),
+            pending.new_leaves,
+            pending.state_size,
+        ).await {
+            error!(block = pending.block_number, err = %e, "WAL recovery: commit_block failed");
+            proposed_snap.discard();
+            spec_snap.discard();
+            // Clear the WAL so we don't loop on every startup.
+            if let Err(ce) = wal.clear_pending_round() {
+                error!(err = %ce, "WAL recovery: failed to clear WAL after commit_block failure");
+            }
+            return;
+        }
+
+        let bft = Arc::clone(&self.bft);
+        let uc_tx = self.uc_tx.clone();
+        let block_number = pending.block_number;
+        tokio::spawn(async move {
+            let result = bft.wait_for_uc(block_number).await;
+            let _ = uc_tx.send(result).await;
+        });
+
+        info!(block = pending.block_number, "WAL recovery: re-submitted to BFT Core, waiting for UC");
+
+        self.inflight = Some(InFlightRound {
+            block_number:  pending.block_number,
+            new_root:      pending.new_root,
+            proposed_snap,
+            spec_snap,
+            submitted_batch: Vec::new(),  // original requests not re-available after crash
+            inserted,
+            spec_batch:      Vec::new(),
+            spec_inserted:   Vec::new(),
+            dropped:         0,
+            spec_dropped:    0,
+        });
     }
 
     async fn handle_new_request(&mut self, req: ValidatedRequest) {
@@ -512,6 +661,34 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
+
+        // Write WAL before BFT submission so the batch is durable on disk.
+        // If this fails, abort the round rather than submit without crash protection.
+        if let Some(wal) = &self.wal {
+            let wal_entry = PendingRound {
+                block_number,
+                prev_root,
+                new_root,
+                zk_proof: zk_proof.clone(),
+                new_leaves,
+                state_size,
+                inserted: inserted.iter().map(|r| WalRecord {
+                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
+                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
+                    source_state_hash: r.cert_data.source_state_hash.clone(),
+                    transaction_hash:  r.cert_data.transaction_hash.clone(),
+                    witness:           r.cert_data.witness.clone(),
+                }).collect(),
+            };
+            if let Err(e) = wal.write_pending_round(&wal_entry) {
+                error!(block = block_number, err = %e, "WAL write failed — aborting round");
+                proposed_snap.discard();
+                spec_snap.discard();
+                self.pending.extend(batch);
+                return;
+            }
+        }
+
         if let Err(e) = self
             .bft
             .commit_block(
@@ -585,6 +762,33 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_leaves = spec_inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
+
+        // Write WAL before BFT submission (spec round promotion path).
+        if let Some(wal) = &self.wal {
+            let wal_entry = PendingRound {
+                block_number,
+                prev_root,
+                new_root,
+                zk_proof: None,
+                new_leaves,
+                state_size,
+                inserted: spec_inserted.iter().map(|r| WalRecord {
+                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
+                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
+                    source_state_hash: r.cert_data.source_state_hash.clone(),
+                    transaction_hash:  r.cert_data.transaction_hash.clone(),
+                    witness:           r.cert_data.witness.clone(),
+                }).collect(),
+            };
+            if let Err(e) = wal.write_pending_round(&wal_entry) {
+                error!(block = block_number, err = %e, "WAL write failed (spec) — aborting round");
+                spec_snap.discard();
+                new_spec_snap.discard();
+                self.pending.extend(spec_batch);
+                return;
+            }
+        }
+
         if let Err(e) = self
             .bft
             .commit_block(
