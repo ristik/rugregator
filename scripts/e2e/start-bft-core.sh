@@ -31,4 +31,5 @@ exec "$UBFT" root-node run \
   --address "/ip4/0.0.0.0/tcp/26652" \
   --rpc-server-address "127.0.0.1:26660" \
   --log-format console \
-  --log-level DEBUG
+  --block-rate=1000
+  --log-level WARN

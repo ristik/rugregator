@@ -78,6 +78,9 @@ rayon.workspace = true
 # Raise OS file-descriptor limit at startup
 libc.workspace = true
 
+# TCP listener with explicit backlog
+socket2.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

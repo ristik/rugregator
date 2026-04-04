@@ -180,7 +180,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let router = build_router(Arc::clone(&state));
-    let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    let listener = bind_listener(&cfg.listen, 4096)?;
+    // let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     info!(listen = %cfg.listen, "HTTP server ready");
 
     // Run HTTP server until SIGINT (ctrl+c).
@@ -199,6 +200,20 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
+}
+
+/// Bind a TCP listener with an explicit backlog (default tokio bind uses ~128).
+fn bind_listener(addr: &str, backlog: i32) -> anyhow::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr: std::net::SocketAddr = addr.parse()?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(socket.into())?)
 }
 
 /// Raise the process's soft file-descriptor limit to the hard limit so that
