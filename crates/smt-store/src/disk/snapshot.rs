@@ -2,7 +2,7 @@
 
 use rocksdb::DB;
 use rsmt::consistency::{
-    batch_insert, batch_insert_with, batch_insert_with_proof_with, consistency_proof_to_bytes,
+    batch_insert, batch_insert_with, batch_insert_with_proof_with, encode_aggregator_envelope_v1,
 };
 use rsmt::path::SmtKey;
 use rsmt::tree::SmtError;
@@ -167,6 +167,18 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
         self.discard_inner()
     }
 
+    fn insert_batch(
+        &mut self,
+        batch: &[(SmtKey, Vec<u8>)],
+        with_proof: bool,
+    ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        // Delegate to the hasher-generic path so the aggregator envelope is
+        // produced for the disk backend too. Without this override, the
+        // trait default would silently fall back to an add_leaf loop that
+        // returns None for the proof and breaks BFT Core verification.
+        self.insert_batch_with::<rsmt::Sha256Hasher>(batch, with_proof)
+    }
+
     fn insert_batch_with<H: SmtHasher>(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
@@ -197,7 +209,10 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
 
         let (inserted_pairs, proof_opt) = if with_proof {
             let (pairs, p) = batch_insert_with_proof_with::<H>(&mut smt, &unique_pending)?;
-            (pairs, Some(consistency_proof_to_bytes(&p)))
+            // Bundle the sorted batch with the opcode stream into the
+            // aggregator_rsmt_v1 envelope expected by BFT Core.
+            let envelope = encode_aggregator_envelope_v1(&pairs, &p);
+            (pairs, Some(envelope))
         } else {
             let pairs = batch_insert_with::<H>(&mut smt, &unique_pending)?;
             (pairs, None)

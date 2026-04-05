@@ -233,7 +233,7 @@ impl CompressedPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Blake3Hasher, Sha256Hasher};
+    use crate::hash::{Blake2bHasher, Blake2sHasher, Sha256Hasher};
 
     fn make_key(byte: u8) -> SmtKey {
         let mut k = [0u8; 32];
@@ -300,7 +300,12 @@ mod tests {
     fn sha256_tree() { run_tests::<Sha256Hasher>(); }
 
     #[test]
-    fn blake3_tree() { run_tests::<Blake3Hasher>(); }
+    fn blake2s_tree() { run_tests::<Blake2sHasher>(); }
+
+    #[test]
+    fn blake2b_tree() { run_tests::<Blake2bHasher>(); }
+
+
 
     #[test]
     fn default_add_leaf_uses_sha256() {
@@ -313,12 +318,5 @@ mod tests {
         assert_eq!(t1.root_hash(), t2.root_hash());
     }
 
-    #[test]
-    fn sha256_and_blake3_roots_differ() {
-        let mut t1 = SparseMerkleTree::new();
-        let mut t2 = SparseMerkleTree::new();
-        t1.add_leaf(make_key(1), vec![1u8; 32]).unwrap();
-        t2.add_leaf_with::<Blake3Hasher>(make_key(1), vec![1u8; 32]).unwrap();
-        assert_ne!(t1.root_hash(), t2.root_hash());
-    }
+
 }

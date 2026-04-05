@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::state::ProcessedRecord;
 use crate::api::cbor::CertDataFields;
@@ -293,18 +293,50 @@ fn stub_generate_uc(
 
 // ─── InFlightRound ────────────────────────────────────────────────────────────
 
+/// Speculative next-round state, living alongside the inflight round.
+///
+/// - `Collecting`: `spec_snap` is a fresh fork off the inflight round's
+///   `proposed_snap`; requests arriving during the UC wait accumulate in
+///   `buffer` without touching the tree. When the round timer ticks or
+///   `buffer.len() >= batch_limit`, [`RoundManager::prepare_spec`] runs a
+///   single `insert_batch_with_proof` pass on `spec_snap` and transitions
+///   to [`SpecState::Prepared`].
+/// - `Prepared`: the speculative round's tree update **and** its
+///   consistency-proof envelope have been computed in one pass. It is
+///   waiting for the inflight round's UC so it can be submitted to BFT.
+enum SpecState<S: SmtStore> {
+    Collecting {
+        snap: S::Snapshot,
+        buffer: Vec<ValidatedRequest>,
+    },
+    Prepared {
+        snap: S::Snapshot,
+        new_root: Option<[u8; 32]>,
+        zk_proof: Option<Vec<u8>>,
+        batch: Vec<ValidatedRequest>,
+        inserted: Vec<ProcessedRecord>,
+        dropped: usize,
+    },
+}
+
+impl<S: SmtStore> SpecState<S> {
+    fn discard(self) {
+        match self {
+            SpecState::Collecting { snap, .. } => snap.discard(),
+            SpecState::Prepared { snap, .. } => snap.discard(),
+        }
+    }
+}
+
 /// State of a round that has been proposed to BFT Core and is awaiting its UC.
 struct InFlightRound<S: SmtStore> {
     block_number: u64,
     new_root: Option<[u8; 32]>,
     proposed_snap: S::Snapshot,
-    spec_snap: S::Snapshot,
+    spec: SpecState<S>,
     submitted_batch: Vec<ValidatedRequest>,
     inserted: Vec<ProcessedRecord>,
-    spec_batch: Vec<ValidatedRequest>,
-    spec_inserted: Vec<ProcessedRecord>,
     dropped: usize,
-    spec_dropped: usize,
 }
 
 // ─── RoundManager ─────────────────────────────────────────────────────────────
@@ -393,10 +425,6 @@ impl<S: SmtStore> RoundManager<S> {
         Arc::clone(&self.shutdown_notify)
     }
 
-    fn no_round_inflight(&self) -> bool {
-        self.inflight.is_none()
-    }
-
     /// Run the round manager event loop.
     pub async fn run(mut self) {
         // On startup, replay any round that was in-flight when the process last crashed.
@@ -408,9 +436,7 @@ impl<S: SmtStore> RoundManager<S> {
         loop {
             tokio::select! {
                 _ = timer.tick() => {
-                    if self.no_round_inflight() && !self.pending.is_empty() {
-                        self.start_round().await;
-                    }
+                    self.on_timer_tick().await;
                 }
                 Some(req) = self.request_rx.recv() => {
                     self.handle_new_request(req).await;
@@ -432,7 +458,7 @@ impl<S: SmtStore> RoundManager<S> {
                 "discarding in-flight round on shutdown"
             );
             inf.proposed_snap.discard();
-            inf.spec_snap.discard();
+            inf.spec.discard();
         }
 
         // Persist SMT state (meaningful for mem-leaves-x shutdown snapshot).
@@ -567,24 +593,60 @@ impl<S: SmtStore> RoundManager<S> {
             block_number:  pending.block_number,
             new_root:      pending.new_root,
             proposed_snap,
-            spec_snap,
+            spec: SpecState::Collecting {
+                snap: spec_snap,
+                buffer: Vec::new(),
+            },
             submitted_batch: Vec::new(),  // original requests not re-available after crash
             inserted,
-            spec_batch:      Vec::new(),
-            spec_inserted:   Vec::new(),
             dropped:         0,
-            spec_dropped:    0,
         });
     }
 
     async fn handle_new_request(&mut self, req: ValidatedRequest) {
-        if self.inflight.is_some() {
-            self.insert_speculative(req);
+        // Inflight round present: route to the speculative buffer (while it
+        // is still collecting) or to `self.pending` (after prep, to seed the
+        // round-after-next). Collection happens continuously.
+        if let Some(inf) = self.inflight.as_mut() {
+            match &mut inf.spec {
+                SpecState::Collecting { buffer, .. } => {
+                    buffer.push(req);
+                    if buffer.len() >= self.config.batch_limit {
+                        self.prepare_spec().await;
+                    }
+                }
+                SpecState::Prepared { .. } => {
+                    self.pending.push(req);
+                }
+            }
             return;
         }
+
+        // No inflight round: standard collecting path that feeds start_round.
         self.pending.push(req);
-        if self.no_round_inflight() && self.pending.len() >= self.config.batch_limit {
+        if self.pending.len() >= self.config.batch_limit {
             self.start_round().await;
+        }
+    }
+
+    /// Timer tick: either kick off a new round or prepare a speculative one.
+    async fn on_timer_tick(&mut self) {
+        match self.inflight.as_ref() {
+            None => {
+                if !self.pending.is_empty() {
+                    self.start_round().await;
+                }
+            }
+            Some(inf) => {
+                // Only Collecting specs need prep; Prepared specs are waiting
+                // on the inflight UC. Prep is skipped for an empty buffer —
+                // nothing to insert, nothing to prove.
+                if let SpecState::Collecting { buffer, .. } = &inf.spec {
+                    if !buffer.is_empty() {
+                        self.prepare_spec().await;
+                    }
+                }
+            }
         }
     }
 
@@ -726,65 +788,199 @@ impl<S: SmtStore> RoundManager<S> {
             block_number,
             new_root,
             proposed_snap,
-            spec_snap,
+            spec: SpecState::Collecting {
+                snap: spec_snap,
+                buffer: Vec::new(),
+            },
             submitted_batch: batch,
             inserted,
-            spec_batch: Vec::new(),
-            spec_inserted: Vec::new(),
             dropped,
-            spec_dropped: 0,
         });
+
+        // Seed the new inflight round's speculative buffer with any requests
+        // that accumulated in self.pending after a prior spec-prep finished
+        // but before this round was submitted.
+        self.drain_pending_into_spec_buffer();
     }
 
-    /// Immediately start the next round from a pre-built speculative snapshot.
-    async fn start_round_from_spec(
-        &mut self,
-        block_number: u64,
-        mut spec_snap: S::Snapshot,
-        spec_batch: Vec<ValidatedRequest>,
-        spec_inserted: Vec<ProcessedRecord>,
-        spec_dropped: usize,
-    ) {
-        let new_root = match spec_snap.root_hash() {
-            Ok(r) => r,
-            Err(e) => {
-                error!(block = block_number, err = %e, "spec root_hash failed");
-                spec_snap.discard();
-                self.pending.extend(spec_batch);
+    /// Move any pending requests into the current inflight's spec buffer
+    /// (if it's still collecting). No-op otherwise.
+    fn drain_pending_into_spec_buffer(&mut self) {
+        let inf = match self.inflight.as_mut() {
+            Some(i) => i,
+            None => return,
+        };
+        if let SpecState::Collecting { buffer, .. } = &mut inf.spec {
+            if !self.pending.is_empty() {
+                buffer.extend(std::mem::take(&mut self.pending));
+            }
+        }
+    }
+
+    // ── Speculative round preparation / submission ───────────────────────────
+
+    /// Transition the current inflight round's spec state from Collecting to
+    /// Prepared by running a single `insert_batch_with_proof` pass on
+    /// `spec_snap`. This produces both the tree update and the consistency
+    /// proof in one pass, while the inflight round is still waiting for its
+    /// UC. Called when the round timer ticks or the buffer fills up.
+    async fn prepare_spec(&mut self) {
+        // Take the inflight out by value so we can destructure its spec
+        // state without fighting the borrow checker.
+        let mut inf = match self.inflight.take() {
+            Some(i) => i,
+            None => return,
+        };
+
+        let (mut snap, buffer) = match inf.spec {
+            SpecState::Collecting { snap, buffer } => (snap, buffer),
+            prepared @ SpecState::Prepared { .. } => {
+                // Already prepared — nothing to do.
+                inf.spec = prepared;
+                self.inflight = Some(inf);
                 return;
             }
         };
+
+        if buffer.is_empty() {
+            inf.spec = SpecState::Collecting { snap, buffer };
+            self.inflight = Some(inf);
+            return;
+        }
+
+        let block_number = inf.block_number.saturating_add(1);
+        let count = buffer.len();
+
+        // Build (key, value) pairs in parallel, mirroring start_round.
+        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = buffer
+            .par_iter()
+            .map(|req| {
+                (
+                    state_id_to_smt_key(&req.state_id),
+                    compute_cert_data_hash(
+                        &req.predicate_cbor,
+                        &req.source_state_hash,
+                        &req.transaction_hash,
+                        &req.witness,
+                    )
+                    .to_vec(),
+                )
+            })
+            .collect();
+
+        let (flags, zk_proof) =
+            match snap.insert_batch(&pairs, self.config.consistency_proofs) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        block = block_number,
+                        err = %e,
+                        "spec prep insert_batch failed — requeuing buffer"
+                    );
+                    snap.discard();
+                    self.pending.extend(buffer);
+                    // Replace spec with a fresh empty Collecting fork so the
+                    // next wave of requests can still accumulate.
+                    inf.spec = SpecState::Collecting {
+                        snap: inf.proposed_snap.fork(),
+                        buffer: Vec::new(),
+                    };
+                    self.inflight = Some(inf);
+                    return;
+                }
+            };
+
+        let inserted: Vec<ProcessedRecord> = buffer
+            .iter()
+            .zip(flags.iter())
+            .filter(|(_, &ok)| ok)
+            .map(|(req, _)| ProcessedRecord {
+                state_id_hex: hex::encode(&req.state_id),
+                cert_data: CertDataFields {
+                    predicate_cbor: req.predicate_cbor.clone(),
+                    source_state_hash: req.source_state_hash.clone(),
+                    transaction_hash: req.transaction_hash.clone(),
+                    witness: req.witness.clone(),
+                },
+            })
+            .collect();
+
+        let new_root = match snap.root_hash() {
+            Ok(r) => r,
+            Err(e) => {
+                error!(block = block_number, err = %e, "spec prep root_hash failed");
+                snap.discard();
+                self.pending.extend(buffer);
+                inf.spec = SpecState::Collecting {
+                    snap: inf.proposed_snap.fork(),
+                    buffer: Vec::new(),
+                };
+                self.inflight = Some(inf);
+                return;
+            }
+        };
+        let dropped = buffer.len() - inserted.len();
+
+        info!(
+            count,
+            dropped,
+            root = %new_root.map(hex::encode).unwrap_or_else(|| "empty".into()),
+            "spec round prepared (awaiting UC of previous round)"
+        );
+
+        inf.spec = SpecState::Prepared {
+            snap,
+            new_root,
+            zk_proof,
+            batch: buffer,
+            inserted,
+            dropped,
+        };
+        self.inflight = Some(inf);
+    }
+
+    /// Submit an already-Prepared speculative round to BFT Core and turn it
+    /// into the new inflight round. Called right after the previous round's
+    /// UC has been committed.
+    async fn submit_prepared_spec(
+        &mut self,
+        block_number: u64,
+        mut snap: S::Snapshot,
+        new_root: Option<[u8; 32]>,
+        zk_proof: Option<Vec<u8>>,
+        batch: Vec<ValidatedRequest>,
+        inserted: Vec<ProcessedRecord>,
+        dropped: usize,
+    ) {
         let prev_root = self.current_root;
-        let count = spec_batch.len();
-        let dropped = spec_dropped;
-
-        let new_spec_snap = spec_snap.fork();
-
-        let new_leaves = spec_inserted.len() as u64;
+        let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
+        let new_spec_snap = snap.fork();
 
-        // Write WAL before BFT submission (spec round promotion path).
         if let Some(wal) = &self.wal {
             let wal_entry = PendingRound {
                 block_number,
                 prev_root,
                 new_root,
-                zk_proof: None,
+                zk_proof: zk_proof.clone(),
                 new_leaves,
                 state_size,
-                inserted: spec_inserted.iter().map(|r| WalRecord {
-                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
-                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
-                    source_state_hash: r.cert_data.source_state_hash.clone(),
-                    transaction_hash:  r.cert_data.transaction_hash.clone(),
-                    witness:           r.cert_data.witness.clone(),
-                }).collect(),
+                inserted: inserted
+                    .iter()
+                    .map(|r| WalRecord {
+                        state_id: hex::decode(&r.state_id_hex).unwrap_or_default(),
+                        predicate_cbor: r.cert_data.predicate_cbor.clone(),
+                        source_state_hash: r.cert_data.source_state_hash.clone(),
+                        transaction_hash: r.cert_data.transaction_hash.clone(),
+                        witness: r.cert_data.witness.clone(),
+                    })
+                    .collect(),
             };
             if let Err(e) = wal.write_pending_round(&wal_entry) {
-                error!(block = block_number, err = %e, "WAL write failed (spec) — aborting round");
-                spec_snap.discard();
+                error!(block = block_number, err = %e, "WAL write failed (spec submit) — aborting round");
+                snap.discard();
                 new_spec_snap.discard();
-                self.pending.extend(spec_batch);
+                self.pending.extend(batch);
                 return;
             }
         }
@@ -795,16 +991,16 @@ impl<S: SmtStore> RoundManager<S> {
                 block_number,
                 new_root,
                 prev_root,
-                None,
+                zk_proof,
                 new_leaves,
                 state_size,
             )
             .await
         {
-            error!(block = block_number, err = %e, "commit_block (spec promotion) failed — rolling back");
-            spec_snap.discard();
+            error!(block = block_number, err = %e, "commit_block (spec submit) failed — rolling back");
+            snap.discard();
             new_spec_snap.discard();
-            self.pending.extend(spec_batch);
+            self.pending.extend(batch);
             return;
         }
 
@@ -817,70 +1013,28 @@ impl<S: SmtStore> RoundManager<S> {
 
         let root_hex = new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
         info!(
-            block = block_number, count, root = %root_hex,
-            "spec round promoted immediately, waiting for UC"
+            block = block_number,
+            count = batch.len(),
+            root = %root_hex,
+            "prepared spec round submitted, waiting for UC"
         );
 
         self.inflight = Some(InFlightRound {
             block_number,
             new_root,
-            proposed_snap: spec_snap,
-            spec_snap: new_spec_snap,
-            submitted_batch: spec_batch,
-            inserted: spec_inserted,
-            spec_batch: Vec::new(),
-            spec_inserted: Vec::new(),
+            proposed_snap: snap,
+            spec: SpecState::Collecting {
+                snap: new_spec_snap,
+                buffer: Vec::new(),
+            },
+            submitted_batch: batch,
+            inserted,
             dropped,
-            spec_dropped: 0,
         });
 
-        // Drain any pending requests into the new speculative layer.
-        let pending = std::mem::take(&mut self.pending);
-        for req in pending {
-            self.insert_speculative(req);
-        }
-    }
-
-    // ── Speculative insertion ─────────────────────────────────────────────────
-
-    fn insert_speculative(&mut self, req: ValidatedRequest) {
-        let inf = match self.inflight.as_mut() {
-            Some(i) => i,
-            None => {
-                self.pending.push(req);
-                return;
-            }
-        };
-
-        let key = state_id_to_smt_key(&req.state_id);
-        let value = compute_cert_data_hash(
-            &req.predicate_cbor,
-            &req.source_state_hash,
-            &req.transaction_hash,
-            &req.witness,
-        );
-
-        match inf.spec_snap.add_leaf(key, value.to_vec()) {
-            Ok(()) => {
-                inf.spec_inserted.push(ProcessedRecord {
-                    state_id_hex: hex::encode(&req.state_id),
-                    cert_data: CertDataFields {
-                        predicate_cbor: req.predicate_cbor.clone(),
-                        source_state_hash: req.source_state_hash.clone(),
-                        transaction_hash: req.transaction_hash.clone(),
-                        witness: req.witness.clone(),
-                    },
-                });
-                inf.spec_batch.push(req);
-            }
-            Err(rsmt::SmtError::DuplicateLeaf) => {
-                debug!(state_id = %hex::encode(&req.state_id), "skipping duplicate in spec");
-                inf.spec_dropped += 1;
-            }
-            Err(e) => {
-                warn!(state_id = %hex::encode(&req.state_id), err = %e, "spec leaf insert failed");
-            }
-        }
+        // Requests that accumulated in self.pending after spec prep seed the
+        // new inflight round's speculative buffer.
+        self.drain_pending_into_spec_buffer();
     }
 
     // ── UC arrival ────────────────────────────────────────────────────────────
@@ -900,7 +1054,16 @@ impl<S: SmtStore> RoundManager<S> {
                 if let Err(e) = inf.proposed_snap.commit(&mut self.smt) {
                     error!(block = inf.block_number, err = %e, "snapshot commit failed — requeuing");
                     self.pending.extend(inf.submitted_batch);
-                    self.pending.extend(inf.spec_batch);
+                    match inf.spec {
+                        SpecState::Collecting { snap, buffer } => {
+                            snap.discard();
+                            self.pending.extend(buffer);
+                        }
+                        SpecState::Prepared { snap, batch, .. } => {
+                            snap.discard();
+                            self.pending.extend(batch);
+                        }
+                    }
                     return;
                 }
                 self.current_root = inf.new_root;
@@ -911,8 +1074,6 @@ impl<S: SmtStore> RoundManager<S> {
 
                 let unique_count = finalized.len();
                 let dropped_count = inf.dropped;
-                let spec_count = inf.spec_batch.len();
-                let spec_dropped = inf.spec_dropped;
 
                 let root_hex = inf.new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
                 self.state
@@ -927,41 +1088,59 @@ impl<S: SmtStore> RoundManager<S> {
                     .await;
 
                 info!(
-                    block        = inf.block_number,
-                    root         = %root_hex,
-                    unique       = unique_count,
-                    dropped      = dropped_count,
-                    spec_queued  = spec_count,
-                    spec_dropped = spec_dropped,
+                    block   = inf.block_number,
+                    root    = %root_hex,
+                    unique  = unique_count,
+                    dropped = dropped_count,
                     "round finalized"
                 );
 
-                if !inf.spec_batch.is_empty() {
-                    let next_block = self.state.current_block_number().await;
-                    self.start_round_from_spec(
-                        next_block,
-                        inf.spec_snap,
-                        inf.spec_batch,
-                        inf.spec_inserted,
-                        inf.spec_dropped,
-                    )
-                    .await;
-                } else {
-                    inf.spec_snap.discard();
-                    // Start a new round if there are pending requests.
-                    let pending = std::mem::take(&mut self.pending);
-                    if !pending.is_empty() {
-                        self.pending = pending;
-                        self.start_round().await;
+                // Continue with the speculative round, if any.
+                match inf.spec {
+                    SpecState::Prepared {
+                        snap,
+                        new_root,
+                        zk_proof,
+                        batch,
+                        inserted,
+                        dropped,
+                    } => {
+                        let next_block = self.state.current_block_number().await;
+                        self.submit_prepared_spec(
+                            next_block, snap, new_root, zk_proof, batch, inserted, dropped,
+                        )
+                        .await;
+                    }
+                    SpecState::Collecting { snap, buffer } => {
+                        // Spec was still accumulating (timer hadn't ticked and
+                        // batch_limit wasn't reached). Drop the old fork and
+                        // requeue its buffer; the next start_round() will pick
+                        // them up into a fresh speculative snapshot over the
+                        // newly committed state.
+                        snap.discard();
+                        let mut merged = buffer;
+                        merged.extend(std::mem::take(&mut self.pending));
+                        self.pending = merged;
+                        if !self.pending.is_empty() {
+                            self.start_round().await;
+                        }
                     }
                 }
             }
             Err(e) => {
                 error!(block = inf.block_number, err = %e, "UC failed — rolling back");
                 inf.proposed_snap.discard();
-                inf.spec_snap.discard();
                 self.pending.extend(inf.submitted_batch);
-                self.pending.extend(inf.spec_batch);
+                match inf.spec {
+                    SpecState::Collecting { snap, buffer } => {
+                        snap.discard();
+                        self.pending.extend(buffer);
+                    }
+                    SpecState::Prepared { snap, batch, .. } => {
+                        snap.discard();
+                        self.pending.extend(batch);
+                    }
+                }
             }
         }
     }

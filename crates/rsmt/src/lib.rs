@@ -11,11 +11,11 @@ pub mod types;
 
 pub use consistency::{
     batch_insert, batch_insert_with, batch_insert_with_proof, batch_insert_with_proof_with,
-    consistency_proof_to_bytes, consistency_proof_to_cbor,
+    consistency_proof_to_bytes, consistency_proof_to_cbor, encode_aggregator_envelope_v1,
     verify_consistency, verify_consistency_with,
     ConsistencyProof, ProofOp,
 };
-pub use hash::{hash_leaf, hash_node, Blake3Hasher, Sha256Hasher, SmtHasher};
+pub use hash::{hash_leaf, hash_node, Blake2bHasher, Blake2sHasher, Sha256Hasher, SmtHasher};
 pub use path::{get_sort_key, key_bit_at, CompressedPath, SmtKey, KEY_BITS};
 pub use proof::{verify_inclusion, InclusionProof};
 pub use snapshot::SmtSnapshot;

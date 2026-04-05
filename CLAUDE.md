@@ -40,8 +40,6 @@ This is a Rust reimplementation of `aggregator-go/`, a blockchain nullifier aggr
 
 ### SMT (rsmt crate)
 
-The tree uses sentinel-bit path encoding identical to the Go implementation: `path(k, bits) = (1 << k) | bits`. Key length is 272 bits.
-
 `SmtSnapshot` provides copy-on-write snapshots: `SmtSnapshot::create(tree)` starts a speculative round; `snap.commit(tree)` atomically applies it on BFT success; dropping the snapshot discards it on failure.
 
 Two batch-insert modes share one internal algorithm:

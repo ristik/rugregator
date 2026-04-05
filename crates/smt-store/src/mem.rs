@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rocksdb::{DB, WriteBatch};
 use rsmt::{
     Branch, SmtError, SmtKey, InclusionProof, SparseMerkleTree, SmtSnapshot,
-    consistency_proof_to_bytes, branch_hash,
+    encode_aggregator_envelope_v1, branch_hash,
 };
 use rsmt::consistency::batch_insert;
 use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node, serialize_leaf, serialize_node};
@@ -231,9 +231,12 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let flags: Vec<bool> = batch.iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
+                    // Build the aggregator_rsmt_v1 envelope while we still
+                    // hold the sorted inserted pairs; this is the wire form
+                    // the BFT Core verifier expects.
+                    let envelope = encode_aggregator_envelope_v1(&inserted_pairs, &proof);
                     self.pending.extend(inserted_pairs);
-                    let proof_cbor = consistency_proof_to_bytes(&proof);
-                    Ok((flags, Some(proof_cbor)))
+                    Ok((flags, Some(envelope)))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof failed: {e}")),
             }
@@ -268,9 +271,9 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let flags: Vec<bool> = batch.iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
+                    let envelope = encode_aggregator_envelope_v1(&inserted_pairs, &proof);
                     self.pending.extend(inserted_pairs);
-                    let proof_bytes = consistency_proof_to_bytes(&proof);
-                    Ok((flags, Some(proof_bytes)))
+                    Ok((flags, Some(envelope)))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof_with failed: {e}")),
             }

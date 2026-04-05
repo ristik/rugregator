@@ -40,7 +40,7 @@ clients  ──POST /──>  JSON-RPC server  ──mpsc──>  RoundManager<S
 
 | Crate | Description |
 |-------|-------------|
-| `crates/rsmt` | Standalone Sparse Merkle Tree library — path-compressed 272-bit Patricia trie, Go-compatible hashing, consistency proofs, serialisation. No async, no I/O. |
+| `crates/rsmt` | Standalone Sparse Merkle Tree library — path-compressed Merkle Patricia trie, consistency proofs, serialisation. No async, no I/O. |
 | `crates/smt-store` | SMT storage backends behind a common `SmtStore` / `SmtStoreSnapshot` trait. Contains `MemSmt` (fully in-memory, optional DB persistence) and `DiskSmt` (lazy disk-backed via RocksDB). |
 | `crates/aggregator` | The aggregator service — HTTP API, generic `RoundManager<S: SmtStore>`, BFT Core connectivity, application-level RocksDB persistence. |
 
@@ -411,25 +411,37 @@ The SMT hashing algorithm is a zero-cost type parameter — no virtual dispatch,
 
 **Default:** all unparameterised public functions use SHA-256 (`Sha256Hasher`). No caller changes needed for the default path.
 
-**To use Blake3**:
+**To use Blake2s or Blake2b**:
 
 ```rust
-use rsmt::{Blake3Hasher, batch_insert_with, batch_insert_with_proof_with, verify_consistency_with};
+use rsmt::{Blake2sHasher, Blake2bHasher, batch_insert_with, batch_insert_with_proof_with, verify_consistency_with};
 use rsmt::tree::SparseMerkleTree;
 
 let mut tree = SparseMerkleTree::new();
 
-// Single-leaf insertion
-tree.add_leaf_with::<Blake3Hasher>(key, value);
+// Single-leaf insertion with Blake2s
+tree.add_leaf_with::<Blake2sHasher>(key, value);
 
-// Batch insertion (no proof)
-batch_insert_with::<Blake3Hasher>(&mut tree, &batch)?;
+// Single-leaf insertion with Blake2b
+tree.add_leaf_with::<Blake2bHasher>(key, value);
 
-// Batch insertion with consistency proof
-let (proof, roots) = batch_insert_with_proof_with::<Blake3Hasher>(&mut tree, &batch)?;
+// Batch insertion with Blake2s (no proof)
+batch_insert_with::<Blake2sHasher>(&mut tree, &batch)?;
 
-// Proof verification
-verify_consistency_with::<Blake3Hasher>(&proof, old_root, new_root, &batch)?;
+// Batch insertion with Blake2b (no proof)
+batch_insert_with::<Blake2bHasher>(&mut tree, &batch)?;
+
+// Batch insertion with consistency proof using Blake2s
+let (proof, roots) = batch_insert_with_proof_with::<Blake2sHasher>(&mut tree, &batch)?;
+
+// Batch insertion with consistency proof using Blake2b
+let (proof, roots) = batch_insert_with_proof_with::<Blake2bHasher>(&mut tree, &batch)?;
+
+// Proof verification with Blake2s
+verify_consistency_with::<Blake2sHasher>(&proof, old_root, new_root, &batch)?;
+
+// Proof verification with Blake2b
+verify_consistency_with::<Blake2bHasher>(&proof, old_root, new_root, &batch)?;
 ```
 
 The `SmtHasher` trait is:
@@ -443,7 +455,7 @@ pub trait SmtHasher: Copy + 'static {
 
 Custom implementations (e.g. SHA-3/keccak, Poseidon) can be plugged in by implementing `SmtHasher`.
 
-> **Important:** SHA-256 and Blake3 produce different root hashes. All participants in a deployment (inserters and verifiers) must use the same hasher. Mixing hashers produces invalid proofs. Partition state at BFT Core must be reset after hash function change.
+> **Important:** We're just experimenting. To use a different hash function for aggregation we need to create a tree partitioning scheme and assign tokens to partitions at the mint time and extend partition configs etc.
 
 ### Scaling beyond RAM (`--smt-backend disk`)
 
@@ -484,8 +496,8 @@ rugregator/
     ├── rsmt/                     # Standalone SMT library
     │   └── src/
     │       ├── tree.rs           # Core insertion, hash caching
-    │       ├── path.rs           # 272-bit sentinel-encoded paths
-    │       ├── hash.rs           # SmtHasher trait, Sha256Hasher, Blake3Hasher
+    │       ├── path.rs           # Path helpers
+    │       ├── hash.rs           # SmtHasher trait, Sha256Hasher, Blake2sHasher, Blake2bHasher
     │       ├── snapshot.rs       # O(1) copy-on-write snapshots (fork/commit/discard)
     │       ├── consistency.rs    # batch_insert_with_proof, ProofOp, CBOR encoding
     │       ├── proof.rs          # get_path, MerkleTreePath, CBOR wire format

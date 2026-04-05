@@ -1,5 +1,6 @@
 # Test setup
 e2e-data/
+scripts/perf-test/requests.json
 
 # e2e test deps (separate git repository)
 aggregator-go/

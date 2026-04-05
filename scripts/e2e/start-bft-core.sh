@@ -18,18 +18,31 @@ if [ -z "$SHARD_CONF" ]; then
   exit 1
 fi
 
+RPC_ADDR="127.0.0.1:26660"
+
 echo "==> Starting BFT Core root node"
 echo "    Home:       $ROOT_HOME"
-echo "    Shard-conf: $SHARD_CONF"
+echo "    Shard-conf: $SHARD_CONF (uploaded via RPC after launch)"
 echo "    Address:    /ip4/127.0.0.1/tcp/26652"
 echo ""
 
-exec "$UBFT" root-node run \
+"$UBFT" root-node run \
   --home "$ROOT_HOME" \
   --trust-base "$ROOT_HOME/trust-base.json" \
-  --shard-conf "$SHARD_CONF" \
   --address "/ip4/0.0.0.0/tcp/26652" \
-  --rpc-server-address "127.0.0.1:26660" \
+  --rpc-server-address "$RPC_ADDR" \
   --log-format console \
-  --block-rate=1000
-  --log-level WARN
+  --block-rate 1000 \
+  --log-level DEBUG &
+NODE_PID=$!
+trap 'kill $NODE_PID 2>/dev/null' INT TERM EXIT
+
+# Give the RPC server a moment to come up, then upload the shard conf.
+sleep 2
+echo "==> Uploading shard conf to http://$RPC_ADDR/api/v1/configurations"
+curl -sS -w "\n    HTTP %{http_code}\n" -X PUT \
+  -H "Content-Type: application/json" \
+  --data-binary "@$SHARD_CONF" \
+  "http://$RPC_ADDR/api/v1/configurations" || echo "    shard-conf upload failed"
+
+wait $NODE_PID

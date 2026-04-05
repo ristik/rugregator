@@ -14,7 +14,7 @@
 //!
 //! Options:
 //!   --backend NAME        mem | mem-leaves | mem-leaves-x | mem-full | disk  (default: mem)
-//!   --hasher NAME         sha256 | blake3                       (default: sha256)
+//!   --hasher NAME         sha256 | blake2s | blake2b            (default: sha256)
 //!   --rounds N            Rounds per batch-size run            (default: 6)
 //!   --seed S              PRNG seed                            (default: random)
 //!   --proof-sample N      Proofs sampled per round             (default: 200)
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use rsmt::{Blake3Hasher, Sha256Hasher, SmtHasher};
+use rsmt::{Blake2bHasher, Blake2sHasher, Sha256Hasher, SmtHasher};
 use smt_store::{SmtStore, SmtStoreSnapshot};
 use uni_aggregator::smt::{SmtKey, state_id_to_smt_key};
 use uni_aggregator::validation::state_id::compute_cert_data_hash;
@@ -331,9 +331,10 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     match cfg.hasher.as_str() {
-        "blake3" => run_backend::<Blake3Hasher>(&cfg, cache_bytes),
         "sha256" | "" => run_backend::<Sha256Hasher>(&cfg, cache_bytes),
-        other => anyhow::bail!("unknown hasher '{other}' — supported: sha256, blake3"),
+        "blake2s" => run_backend::<Blake2sHasher>(&cfg, cache_bytes),
+        "blake2b" => run_backend::<Blake2bHasher>(&cfg, cache_bytes),
+        other => anyhow::bail!("unknown hasher '{other}' — supported: sha256, blake2s, blake2b"),
     }
 }
 

@@ -70,6 +70,7 @@ echo "==> Generating shard config (partition $PARTITION_ID, epoch=$SHARD_EPOCH, 
   --epoch-start 1 \
   --t2-timeout 50000 \
   --node-info "$AGG_HOME/node-info.json" \
+  --partition-params "proof_type=aggregator_rsmt_v1" \
   --home "$ROOT_HOME"
 
 # ── Aggregator config ─────────────────────────────────────────────────────────
@@ -87,15 +88,13 @@ AGGREGATOR_SIG_KEY=$(jq -r '.sigKey.privateKey' "$AGG_HOME/keys.json" | sed 's/0
 AGGREGATOR_DB_PATH=$AGG_HOME/db
 AGGREGATOR_SMT_BACKEND=disk
 AGGREGATOR_ROUND_DURATION_MS=1000
-AGGREGATOR_BATCH_LIMIT=50000
-AGGREGATOR_UC_TIMEOUT_MS=15000
+AGGREGATOR_FAKE_STATE_TRANSITIONS=false
+AGGREGATOR_UC_TIMEOUT_MS=60000
+AGGREGATOR_BATCH_LIMIT=100000
+AGGREGATOR_CONSISTENCY_PROOFS=true
 RUST_LOG=info
 EOF
 echo "    Aggregator env: $E2E_DATA/aggregator.env"
-
-# ── Copy trust-base.json to SDK test directory ────────────────────────────────
-cp "$ROOT_HOME/trust-base.json" "$SDK_E2E/trust-base.json"
-echo "    trust-base.json copied to $SDK_E2E/"
 
 echo ""
 echo "✓ E2E setup complete!"
@@ -104,6 +103,6 @@ echo "  Aggregator:   $AGG_HOME   (PeerId: $AGG_NODE_ID)"
 echo "  BFT addr:     /ip4/127.0.0.1/tcp/26652"
 echo ""
 echo "Next:"
-echo "  scripts/e2e/start-bft-core.sh   (keep running in terminal 1)"
-echo "  scripts/e2e/start-aggregator.sh  (keep running in terminal 2)"
-echo "  scripts/e2e/run-e2e-test.sh      (from terminal 3)"
+echo "  scripts/e2e/start-bft-core.sh      (keep running in terminal 1)"
+echo "  scripts/e2e/start-aggregator.sh    (keep running in terminal 2)"
+echo "  tsx scripts/perf-test/perf-test.ts --workers 1 --duration 1  (from terminal 3)"

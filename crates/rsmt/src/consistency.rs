@@ -206,6 +206,73 @@ pub fn consistency_proof_to_bytes(proof: &ConsistencyProof) -> Vec<u8> {
     out
 }
 
+/// Encode an `aggregator_rsmt_v1` envelope: the batch of newly-inserted
+/// leaves followed by the flat opcode stream.
+///
+/// Wire format (big-endian integers, no version/tag byte):
+///
+/// ```text
+/// offset  size  field
+/// 0       4     leaf_count                         (u32)
+/// 4       ...   leaves:   leaf_count ×
+///                         { key[32] || value_len (u16) || value[value_len] }
+/// ...     ...   opcode stream (as from `consistency_proof_to_bytes`)
+/// ```
+///
+/// `leaves` **must** already be sorted by [`get_sort_key`] (this is the same
+/// order [`batch_insert_with_proof`] emits its `L` opcodes in) and each
+/// value's length must fit in `u16`. Both invariants are `debug_assert!`ed;
+/// the encoder does not reorder or truncate.
+///
+/// The Go verifier (`bft-core/rootchain/consensus/zkverifier/rsmt`) decodes
+/// this format directly and recomputes both roots from the envelope.
+pub fn encode_aggregator_envelope_v1(
+    leaves_sorted: &[(SmtKey, Vec<u8>)],
+    proof: &ConsistencyProof,
+) -> Vec<u8> {
+    debug_assert!(
+        leaves_sorted.windows(2).all(|w| get_sort_key(&w[0].0) < get_sort_key(&w[1].0)),
+        "encode_aggregator_envelope_v1: leaves not sorted by get_sort_key"
+    );
+    debug_assert!(
+        leaves_sorted.len() <= u32::MAX as usize,
+        "encode_aggregator_envelope_v1: too many leaves"
+    );
+    let proof_bytes_len: usize = proof
+        .iter()
+        .map(|op| match op {
+            ProofOp::S(_) => 33,
+            ProofOp::L => 1,
+            ProofOp::N(_) => 2,
+        })
+        .sum();
+    let leaves_bytes_len: usize = leaves_sorted
+        .iter()
+        .map(|(_, v)| 32 + 2 + v.len())
+        .sum();
+    let mut out = Vec::with_capacity(4 + leaves_bytes_len + proof_bytes_len);
+
+    out.extend_from_slice(&(leaves_sorted.len() as u32).to_be_bytes());
+    for (k, v) in leaves_sorted {
+        debug_assert!(
+            v.len() <= u16::MAX as usize,
+            "encode_aggregator_envelope_v1: value length {} exceeds u16::MAX",
+            v.len()
+        );
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        out.extend_from_slice(v);
+    }
+    for op in proof {
+        match op {
+            ProofOp::S(h) => { out.push(0x00); out.extend_from_slice(h); }
+            ProofOp::L    => { out.push(0x01); }
+            ProofOp::N(d) => { out.push(0x02); out.push(*d); }
+        }
+    }
+    out
+}
+
 /// Legacy CBOR encoding — kept for callers that have not yet migrated.
 ///
 /// Prefer [`consistency_proof_to_bytes`] for new deployments.
@@ -655,7 +722,7 @@ fn first_divergence_in_prefix(path: &CompressedPath, key: &SmtKey, start_bit: us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Blake3Hasher, Sha256Hasher};
+    use crate::hash::{Blake2bHasher, Blake2sHasher, Sha256Hasher};
 
     fn make_key(byte: u8) -> SmtKey {
         let mut k = [0u8; 32]; k[0] = byte; k
@@ -750,21 +817,102 @@ mod tests {
         assert!(verify_consistency_with::<H>(&proof, old, new, &items));
     }
 
+    /// Parse an `aggregator_rsmt_v1` envelope back into (leaves, proof) and
+    /// run it through `verify_consistency`. This is the Rust-side mirror of
+    /// the Go `rsmt.Verify` path and locks the wire format in place.
+    fn decode_envelope_v1(
+        bytes: &[u8],
+    ) -> (Vec<(SmtKey, Vec<u8>)>, ConsistencyProof) {
+        assert!(bytes.len() >= 4, "envelope too short");
+        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut pos = 4;
+        let mut leaves = Vec::with_capacity(count);
+        for _ in 0..count {
+            assert!(pos + 32 + 2 <= bytes.len());
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let vlen = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            pos += 2;
+            assert!(pos + vlen <= bytes.len());
+            let v = bytes[pos..pos + vlen].to_vec();
+            pos += vlen;
+            leaves.push((k, v));
+        }
+        let mut proof = Vec::new();
+        while pos < bytes.len() {
+            match bytes[pos] {
+                0x00 => {
+                    assert!(pos + 33 <= bytes.len());
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&bytes[pos + 1..pos + 33]);
+                    proof.push(ProofOp::S(h));
+                    pos += 33;
+                }
+                0x01 => { proof.push(ProofOp::L); pos += 1; }
+                0x02 => {
+                    assert!(pos + 2 <= bytes.len());
+                    proof.push(ProofOp::N(bytes[pos + 1]));
+                    pos += 2;
+                }
+                op => panic!("bad opcode 0x{op:02x}"),
+            }
+        }
+        (leaves, proof)
+    }
+
+    #[test]
+    fn envelope_v1_roundtrip() {
+        let mut tree = SparseMerkleTree::new();
+        tree.add_leaf_with::<Sha256Hasher>(make_key(1), vec![1; 32]).unwrap();
+        let old = tree.root_hash();
+        let batch: Vec<_> = (2u8..=10).map(|i| (make_key(i), vec![i; 16])).collect();
+        let (items, proof) = batch_insert_with_proof_with::<Sha256Hasher>(&mut tree, &batch).unwrap();
+        let new = tree.root_hash();
+
+        let envelope = encode_aggregator_envelope_v1(&items, &proof);
+        let (re_leaves, re_proof) = decode_envelope_v1(&envelope);
+        assert_eq!(re_leaves.len(), items.len());
+        for (a, b) in re_leaves.iter().zip(items.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1, b.1);
+        }
+        assert!(
+            verify_consistency_with::<Sha256Hasher>(&re_proof, old, new, &re_leaves),
+            "envelope round-trip failed verification"
+        );
+    }
+
+    #[test]
+    fn envelope_v1_empty_batch() {
+        // No leaves, no proof → 4 bytes of zeros.
+        let env = encode_aggregator_envelope_v1(&[], &vec![]);
+        assert_eq!(env, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn envelope_v1_leaves_pre_sorted() {
+        // Encoder accepts sorted leaves from batch_insert_with_proof.
+        let mut tree = SparseMerkleTree::new();
+        let batch: Vec<_> = (1u8..=8).map(|i| (make_key(i ^ 0xA5), vec![i])).collect();
+        let (items, proof) = batch_insert_with_proof_with::<Sha256Hasher>(&mut tree, &batch).unwrap();
+        // items is guaranteed sorted by consistency.rs:275; encoder's
+        // debug_assert! verifies this — if it trips, we have a regression.
+        let _ = encode_aggregator_envelope_v1(&items, &proof);
+    }
+
     #[test]
     fn sha256_suite() { run_suite::<Sha256Hasher>(); }
 
     #[test]
-    fn blake3_suite() { run_suite::<Blake3Hasher>(); }
+    fn blake2s_suite() { run_suite::<Blake2sHasher>(); }
 
     #[test]
-    fn sha256_and_blake3_roots_differ() {
-        let mut t1 = SparseMerkleTree::new();
-        let mut t2 = SparseMerkleTree::new();
-        let pairs: Vec<_> = (1u8..=4).map(|i| (make_key(i), vec![i;32])).collect();
-        batch_insert_with::<Sha256Hasher>(&mut t1, &pairs).unwrap();
-        batch_insert_with::<Blake3Hasher>(&mut t2, &pairs).unwrap();
-        assert_ne!(t1.root_hash(), t2.root_hash());
-    }
+    fn blake2b_suite() { run_suite::<Blake2bHasher>(); }
+
+
+
+
 
     fn lcg_key(seed: &mut u64) -> SmtKey {
         let mut key = [0u8; 32];
