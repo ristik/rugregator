@@ -31,6 +31,57 @@ use async_trait::async_trait;
 use rayon::prelude::*;
 use smt_store::{SmtStore, SmtStoreSnapshot};
 
+// ─── Rejection classes mirroring bft-core's certification.CertStatus* ─────────
+
+/// BFT Core rejection classes (must mirror the `CertStatus*` constants in
+/// `bft-core/network/protocol/certification/certification_response.go`).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertStatus {
+    Ok = 0,
+    Transient = 1,
+    RequestInvalid = 2,
+    ProofInvalid = 3,
+    Fatal = 255,
+}
+
+impl CertStatus {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => CertStatus::Ok,
+            1 => CertStatus::Transient,
+            2 => CertStatus::RequestInvalid,
+            3 => CertStatus::ProofInvalid,
+            255 => CertStatus::Fatal,
+            // Unknown code → treat as Fatal so operators notice instead of
+            // silently dropping batches.
+            _ => CertStatus::Fatal,
+        }
+    }
+}
+
+/// Typed rejection signalled by BFT Core in a CertificationResponse with
+/// `Status != CertStatusOK`. Sent across the `wait_for_uc` future as an
+/// `anyhow::Error` so the round manager can downcast and branch.
+#[derive(Debug, Clone)]
+pub struct CertRejection {
+    pub status: CertStatus,
+    pub raw_status: u32,
+    pub message: String,
+}
+
+impl std::fmt::Display for CertRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BFT Core rejected certification (status={:?}/{}): {}",
+            self.status, self.raw_status, self.message
+        )
+    }
+}
+
+impl std::error::Error for CertRejection {}
+
 // ─── BftCommitter trait ───────────────────────────────────────────────────────
 
 /// BFT Core interface.
@@ -1128,17 +1179,69 @@ impl<S: SmtStore> RoundManager<S> {
                 }
             }
             Err(e) => {
-                error!(block = inf.block_number, err = %e, "UC failed — rolling back");
-                inf.proposed_snap.discard();
-                self.pending.extend(inf.submitted_batch);
-                match inf.spec {
-                    SpecState::Collecting { snap, buffer } => {
-                        snap.discard();
-                        self.pending.extend(buffer);
+                // Classify the failure: typed BFT Core rejection (CertRejection)
+                // vs generic transport error (connection dropped, sender closed).
+                // Treat generic transport errors like Transient — retry the batch.
+                let rejection = e.downcast_ref::<CertRejection>().cloned();
+                let status = rejection.as_ref().map(|r| r.status).unwrap_or(CertStatus::Transient);
+
+                match status {
+                    CertStatus::ProofInvalid => {
+                        error!(
+                            block = inf.block_number,
+                            err = %e,
+                            "BFT Core rejected batch as proof-invalid — dropping submitted batch"
+                        );
+                        inf.proposed_snap.discard();
+                        // DROP submitted_batch — its proof is inconsistent with
+                        // the batch itself; replaying would fail the same way.
+                        let dropped = inf.submitted_batch.len();
+                        drop(inf.submitted_batch);
+                        warn!(dropped_requests = dropped, "discarded proof-invalid batch");
+                        // Speculative work built on top of the discarded batch is
+                        // also invalid against the (unchanged) committed state —
+                        // but the *requests* themselves may still be fine, so
+                        // requeue them to be re-processed in a fresh round.
+                        match inf.spec {
+                            SpecState::Collecting { snap, buffer } => {
+                                snap.discard();
+                                self.pending.extend(buffer);
+                            }
+                            SpecState::Prepared { snap, batch, .. } => {
+                                snap.discard();
+                                self.pending.extend(batch);
+                            }
+                        }
                     }
-                    SpecState::Prepared { snap, batch, .. } => {
-                        snap.discard();
-                        self.pending.extend(batch);
+                    CertStatus::Fatal => {
+                        error!(
+                            block = inf.block_number,
+                            err = %e,
+                            "FATAL rejection from BFT Core — shutting down round manager"
+                        );
+                        inf.proposed_snap.discard();
+                        match inf.spec {
+                            SpecState::Collecting { snap, .. } => snap.discard(),
+                            SpecState::Prepared { snap, .. } => snap.discard(),
+                        }
+                        self.shutdown_notify.notify_waiters();
+                    }
+                    // Transient, RequestInvalid, Ok (unreachable via Err), or
+                    // generic transport error: roll back and requeue.
+                    _ => {
+                        error!(block = inf.block_number, err = %e, "UC failed — rolling back and requeuing");
+                        inf.proposed_snap.discard();
+                        self.pending.extend(inf.submitted_batch);
+                        match inf.spec {
+                            SpecState::Collecting { snap, buffer } => {
+                                snap.discard();
+                                self.pending.extend(buffer);
+                            }
+                            SpecState::Prepared { snap, batch, .. } => {
+                                snap.discard();
+                                self.pending.extend(batch);
+                            }
+                        }
                     }
                 }
             }

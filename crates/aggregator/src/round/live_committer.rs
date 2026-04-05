@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
-use super::BftCommitter;
+use super::{BftCommitter, CertRejection, CertStatus};
 
 // ─── Wire types ───────────────────────────────────────────────────────────────
 
@@ -106,10 +106,15 @@ struct LastUc {
 
 // ─── Shared state between the committer and the network task ──────────────────
 
+/// Result delivered to the round manager via the per-block oneshot channel.
+/// `Ok(uc_cbor)` = accepted. `Err(rejection)` = BFT Core refused with a typed
+/// status; the round manager branches on `rejection.status`.
+type UcOutcome = Result<Vec<u8>, CertRejection>;
+
 struct Shared {
     initialized: AtomicBool,
     /// block_number → oneshot receiver (set in commit_block, awaited in wait_for_uc)
-    blk_receivers: Mutex<HashMap<u64, oneshot::Receiver<Vec<u8>>>>,
+    blk_receivers: Mutex<HashMap<u64, oneshot::Receiver<UcOutcome>>>,
     init_notify: Notify,
 }
 
@@ -125,6 +130,11 @@ struct UcEvent {
     /// UnicitySeal.Timestamp — must be echoed verbatim in our cert request.
     timestamp: u64,
     uc_cbor: Vec<u8>,
+    /// Outer transport status (0 = accepted). Non-zero → the request that
+    /// triggered this response was rejected; `message` explains why and the
+    /// wrapped UC is the last-good certificate.
+    status: u32,
+    message: String,
 }
 
 // ─── Pending cert request (held by network loop during certification) ─────────
@@ -136,7 +146,7 @@ struct PendingCert {
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
-    uc_tx: oneshot::Sender<Vec<u8>>,
+    uc_tx: oneshot::Sender<UcOutcome>,
     /// Round used when this cert request was (last) sent.
     round_used: u64,
 }
@@ -156,8 +166,8 @@ struct CertReqData {
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
-    /// Deliver the raw UC CBOR bytes to this sender once the UC arrives.
-    uc_tx: oneshot::Sender<Vec<u8>>,
+    /// Deliver the UC outcome (accepted CBOR or typed rejection) once it arrives.
+    uc_tx: oneshot::Sender<UcOutcome>,
 }
 
 enum NetCmd {
@@ -376,7 +386,7 @@ impl BftCommitter for LiveBftCommitter {
 
         // Register the block → UC receiver BEFORE queuing the Submit command so
         // the network task can fill the sender side at transmission time.
-        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let (tx, rx) = oneshot::channel::<UcOutcome>();
         self.shared
             .blk_receivers
             .lock()
@@ -421,9 +431,14 @@ impl BftCommitter for LiveBftCommitter {
                 return Ok(vec![]);
             }
         };
-        let uc = rx.await.map_err(|_| anyhow::anyhow!("UC sender dropped"))?;
-        info!(block = block_number, "UC received ({}B)", uc.len());
-        Ok(uc)
+        let outcome = rx.await.map_err(|_| anyhow::anyhow!("UC sender dropped"))?;
+        match outcome {
+            Ok(uc) => {
+                info!(block = block_number, "UC received ({}B)", uc.len());
+                Ok(uc)
+            }
+            Err(rejection) => Err(anyhow::Error::new(rejection)),
+        }
     }
 }
 
@@ -545,6 +560,14 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
     let mut uc_cbor = Vec::new();
     let _ = ciborium::into_writer(&arr[3], &mut uc_cbor);
 
+    // CertificationResponse (toarray): [Partition, Shard, Technical, UC, Status, Message]
+    // Status/Message are transport-level fields, absent in older (4-elem) payloads.
+    let status = arr.get(4).and_then(cbor_u64).map(|v| v as u32).unwrap_or(0);
+    let message = match arr.get(5) {
+        Some(ciborium::value::Value::Text(s)) => s.clone(),
+        _ => String::new(),
+    };
+
     Some(UcEvent {
         uc_round,
         next_round,
@@ -552,6 +575,8 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
         prev_hash: uc_hash,
         timestamp,
         uc_cbor,
+        status,
+        message,
     })
 }
 
@@ -691,7 +716,7 @@ async fn network_loop(
 
                         last_uc_time = std::time::Instant::now();
                         let ev = match parse_uc(&request) { Some(e) => e, None => continue };
-                        info!(uc_round = ev.uc_round, next_round = ev.next_round, epoch = ev.epoch, "UC received from BFT Core");
+                        info!(uc_round = ev.uc_round, next_round = ev.next_round, epoch = ev.epoch, status = ev.status, "UC received from BFT Core");
 
                         // Always update last_uc from every valid UC.
                         last_uc = Some(LastUc {
@@ -706,13 +731,36 @@ async fn network_loop(
                             shared.init_notify.notify_waiters();
                         }
 
+                        // Typed rejection from BFT Core: the wrapped UC is the last-good
+                        // certificate, and `status`/`message` tell us why our request was
+                        // refused. Deliver a typed error to the round manager so it can
+                        // branch on the class (retry / drop batch / fatal).
+                        if ev.status != 0 {
+                            warn!(
+                                status = ev.status,
+                                message = %ev.message,
+                                our_round = pending.as_ref().map(|p| p.round_used),
+                                uc_round = ev.uc_round,
+                                "BFT Core rejected certification request"
+                            );
+                            if let Some(p) = pending.take() {
+                                let rejection = CertRejection {
+                                    status: CertStatus::from_u32(ev.status),
+                                    raw_status: ev.status,
+                                    message: ev.message.clone(),
+                                };
+                                let _ = p.uc_tx.send(Err(rejection));
+                            }
+                            continue;
+                        }
+
                         // Handle pending cert request.
                         if let Some(ref mut p) = pending {
                             if ev.uc_round > 0 && ev.uc_round == p.round_used {
                                 // Our cert request was certified.
                                 info!(round = ev.uc_round, "UC matched — cert request certified");
                                 let p = pending.take().unwrap();
-                                let _ = p.uc_tx.send(ev.uc_cbor);
+                                let _ = p.uc_tx.send(Ok(ev.uc_cbor));
                             } else if ev.uc_round > 0 && ev.uc_round > p.round_used {
                                 // A higher partition round was certified — our request
                                 // was superseded (should not happen in single-aggregator setup).
