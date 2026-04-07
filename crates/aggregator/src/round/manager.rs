@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use super::state::ProcessedRecord;
 use crate::api::cbor::CertDataFields;
-use crate::config::RoundConfig;
+use crate::config::{ConsistencyProofMode, RoundConfig};
 use crate::smt::state_id_to_smt_key;
 use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord, PendingRound, WalRecord, WalStore};
 use crate::validation::state_id::compute_cert_data_hash;
@@ -342,6 +342,24 @@ fn stub_generate_uc(
     cbor_tag(1007, &uc_inner)
 }
 
+// ─── ProvingRoundData ─────────────────────────────────────────────────────────
+
+/// Data held while a ZK proof is being generated in a background thread.
+/// When the proof arrives we use this to write the WAL and call `commit_block`.
+struct ProvingRoundData<S: SmtStore> {
+    block_number:      u64,
+    new_root:          Option<[u8; 32]>,
+    prev_root:         Option<[u8; 32]>,
+    new_leaves:        u64,
+    state_size:        u64,
+    proposed_snap:     S::Snapshot,
+    spec_snap:         S::Snapshot,
+    batch:             Vec<ValidatedRequest>,
+    inserted:          Vec<ProcessedRecord>,
+    dropped:           usize,
+    proof_started_at:  std::time::Instant,
+}
+
 // ─── InFlightRound ────────────────────────────────────────────────────────────
 
 /// Speculative next-round state, living alongside the inflight round.
@@ -409,6 +427,14 @@ pub struct RoundManager<S: SmtStore> {
     /// Write-ahead log: written before every BFT submission, cleared atomically
     /// with `persist_round`.  `None` for in-memory (non-persistent) backends.
     wal: Option<Arc<dyn WalStore>>,
+    /// SP1 prover — `Some` only when `proof_mode == Zk` and the binary was
+    /// compiled with `--features zk`.
+    prover: Option<Arc<zk_host::Prover>>,
+    /// Channel for the background proving thread to return its result.
+    proof_tx: mpsc::Sender<anyhow::Result<Vec<u8>>>,
+    proof_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
+    /// Data held while a ZK proof is generating.  `None` when not proving.
+    proving_data: Option<ProvingRoundData<S>>,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -447,6 +473,7 @@ impl<S: SmtStore> RoundManager<S> {
     ) -> Self {
         let current_root = smt.root_hash();
         let (uc_tx, uc_rx) = mpsc::channel(4);
+        let (proof_tx, proof_rx) = mpsc::channel(1);
         Self {
             config,
             request_rx,
@@ -461,6 +488,10 @@ impl<S: SmtStore> RoundManager<S> {
             uc_rx,
             shutdown_notify: Arc::new(Notify::new()),
             wal: None,
+            prover: None,
+            proof_tx,
+            proof_rx,
+            proving_data: None,
         }
     }
 
@@ -468,6 +499,12 @@ impl<S: SmtStore> RoundManager<S> {
     /// to enable pre-BFT crash safety.
     pub fn with_wal(mut self, wal: Arc<dyn WalStore>) -> Self {
         self.wal = Some(wal);
+        self
+    }
+
+    /// Attach a ZK prover.  Required when `proof_mode == Zk`.
+    pub fn with_prover(mut self, prover: Arc<zk_host::Prover>) -> Self {
+        self.prover = Some(prover);
         self
     }
 
@@ -495,6 +532,9 @@ impl<S: SmtStore> RoundManager<S> {
                 Some(uc_result) = self.uc_rx.recv() => {
                     self.on_uc_result(uc_result).await;
                 }
+                Some(proof_result) = self.proof_rx.recv() => {
+                    self.on_proving_complete(proof_result).await;
+                }
                 _ = self.shutdown_notify.notified() => {
                     info!("shutdown signal received, stopping round manager");
                     break;
@@ -510,6 +550,16 @@ impl<S: SmtStore> RoundManager<S> {
             );
             inf.proposed_snap.discard();
             inf.spec.discard();
+        }
+
+        // Discard any round waiting for a ZK proof.
+        if let Some(data) = self.proving_data.take() {
+            warn!(
+                block = data.block_number,
+                "discarding ZK proving round on shutdown"
+            );
+            data.proposed_snap.discard();
+            data.spec_snap.discard();
         }
 
         // Persist SMT state (meaningful for mem-leaves-x shutdown snapshot).
@@ -704,6 +754,11 @@ impl<S: SmtStore> RoundManager<S> {
     // ── Round startup ─────────────────────────────────────────────────────────
 
     async fn start_round(&mut self) {
+        // Don't start a new primary round while a ZK proof is in-flight.
+        if self.proving_data.is_some() {
+            return;
+        }
+
         let batch = std::mem::take(&mut self.pending);
         if batch.is_empty() {
             return;
@@ -731,8 +786,10 @@ impl<S: SmtStore> RoundManager<S> {
 
         let mut proposed_snap = self.smt.create_snapshot();
 
-        let (flags, zk_proof) =
-            match proposed_snap.insert_batch(&pairs, self.config.consistency_proofs) {
+        // Request the consistency-proof envelope for Rsmt and Zk modes.
+        let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
+        let (flags, envelope) =
+            match proposed_snap.insert_batch(&pairs, with_proof) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
@@ -774,6 +831,71 @@ impl<S: SmtStore> RoundManager<S> {
 
         let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
+
+        // Determine the proof to attach, or start background ZK proving.
+        match self.config.proof_mode {
+            ConsistencyProofMode::Zk => {
+                // For Zk mode: spawn a background thread to generate the proof.
+                // WAL and commit_block happen only after the proof arrives.
+                let prover = match self.prover.as_ref() {
+                    Some(p) => Arc::clone(p),
+                    None => {
+                        error!(block = block_number, "ZK mode but prover not initialized");
+                        proposed_snap.discard();
+                        spec_snap.discard();
+                        self.pending.extend(batch);
+                        return;
+                    }
+                };
+                let envelope = match envelope {
+                    Some(e) => e,
+                    None => {
+                        error!(block = block_number, "ZK mode but insert_batch returned no envelope");
+                        proposed_snap.discard();
+                        spec_snap.discard();
+                        self.pending.extend(batch);
+                        return;
+                    }
+                };
+                let kind_str = self.config.zk_proof_kind.clone();
+                let proof_tx = self.proof_tx.clone();
+                let prev = prev_root.unwrap_or([0u8; 32]);
+                let new  = new_root.unwrap_or([0u8; 32]);
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<Vec<u8>> {
+                        let kind = kind_str.parse::<zk_host::ZkProofKind>()
+                            .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
+                        prover.prove_with_kind(&envelope, prev, new, kind)
+                    })();
+                    let _ = proof_tx.blocking_send(result);
+                });
+                let proof_started_at = std::time::Instant::now();
+                info!(block = block_number, "ZK proof started in background thread");
+                self.proving_data = Some(ProvingRoundData {
+                    block_number,
+                    new_root,
+                    prev_root,
+                    new_leaves,
+                    state_size,
+                    proposed_snap,
+                    spec_snap,
+                    batch,
+                    inserted,
+                    dropped,
+                    proof_started_at,
+                });
+                // Return: WAL + commit_block + inflight set in on_proving_complete.
+                return;
+            }
+            _ => {}
+        }
+
+        // Off / Rsmt: synchronous path — proof is ready now.
+        let zk_proof = match self.config.proof_mode {
+            ConsistencyProofMode::Off  => None,
+            ConsistencyProofMode::Rsmt => envelope,
+            ConsistencyProofMode::Zk   => unreachable!(),
+        };
 
         // Write WAL before BFT submission so the batch is durable on disk.
         // If this fails, abort the round rather than submit without crash protection.
@@ -919,8 +1041,9 @@ impl<S: SmtStore> RoundManager<S> {
             })
             .collect();
 
+        let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
         let (flags, zk_proof) =
-            match snap.insert_batch(&pairs, self.config.consistency_proofs) {
+            match snap.insert_batch(&pairs, with_proof) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
@@ -993,10 +1116,14 @@ impl<S: SmtStore> RoundManager<S> {
     /// Submit an already-Prepared speculative round to BFT Core and turn it
     /// into the new inflight round. Called right after the previous round's
     /// UC has been committed.
+    ///
+    /// In Zk mode, `zk_proof` contains the consistency-proof envelope (not yet
+    /// an SP1 proof). A background proving thread is spawned and WAL/commit
+    /// happen only after the proof arrives via `on_proving_complete`.
     async fn submit_prepared_spec(
         &mut self,
         block_number: u64,
-        mut snap: S::Snapshot,
+        snap: S::Snapshot,
         new_root: Option<[u8; 32]>,
         zk_proof: Option<Vec<u8>>,
         batch: Vec<ValidatedRequest>,
@@ -1006,6 +1133,61 @@ impl<S: SmtStore> RoundManager<S> {
         let prev_root = self.current_root;
         let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
+
+        // In Zk mode the envelope must be proved before submission.
+        if matches!(self.config.proof_mode, ConsistencyProofMode::Zk) {
+            let prover = match self.prover.as_ref() {
+                Some(p) => Arc::clone(p),
+                None => {
+                    error!(block = block_number, "ZK mode but prover not initialized (spec submit)");
+                    snap.discard();
+                    self.pending.extend(batch);
+                    return;
+                }
+            };
+            let envelope = match zk_proof {
+                Some(e) => e,
+                None => {
+                    error!(block = block_number, "ZK mode but spec round has no envelope");
+                    snap.discard();
+                    self.pending.extend(batch);
+                    return;
+                }
+            };
+            let mut snap = snap;
+            let spec_snap = snap.fork();
+            let kind_str = self.config.zk_proof_kind.clone();
+            let proof_tx = self.proof_tx.clone();
+            let prev = prev_root.unwrap_or([0u8; 32]);
+            let new  = new_root.unwrap_or([0u8; 32]);
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<Vec<u8>> {
+                    let kind = kind_str.parse::<zk_host::ZkProofKind>()
+                        .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
+                    prover.prove_with_kind(&envelope, prev, new, kind)
+                })();
+                let _ = proof_tx.blocking_send(result);
+            });
+            let proof_started_at = std::time::Instant::now();
+            info!(block = block_number, "ZK proof started in background thread (spec submit)");
+            self.proving_data = Some(ProvingRoundData {
+                block_number,
+                new_root,
+                prev_root,
+                new_leaves,
+                state_size,
+                proposed_snap: snap,
+                spec_snap,
+                batch,
+                inserted,
+                dropped,
+                proof_started_at,
+            });
+            return;
+        }
+
+        // Off / Rsmt: synchronous submit.
+        let mut snap = snap;
         let new_spec_snap = snap.fork();
 
         if let Some(wal) = &self.wal {
@@ -1085,6 +1267,114 @@ impl<S: SmtStore> RoundManager<S> {
 
         // Requests that accumulated in self.pending after spec prep seed the
         // new inflight round's speculative buffer.
+        self.drain_pending_into_spec_buffer();
+    }
+
+    // ── ZK proof arrival ──────────────────────────────────────────────────────
+
+    /// Called when the background proving thread sends its result.
+    /// Writes WAL, calls `commit_block`, and promotes `proving_data` to
+    /// an `InFlightRound`.  On error, discards the snapshot and requeues
+    /// the batch.
+    async fn on_proving_complete(&mut self, result: anyhow::Result<Vec<u8>>) {
+        let data = match self.proving_data.take() {
+            Some(d) => d,
+            None => {
+                warn!("ZK proof arrived but no proving_data — ignoring");
+                return;
+            }
+        };
+
+        let proof_bytes = match result {
+            Ok(bytes) => {
+                let elapsed = data.proof_started_at.elapsed();
+                info!(
+                    block      = data.block_number,
+                    leaves     = data.new_leaves,
+                    proof_kind = %self.config.zk_proof_kind,
+                    proof_size = bytes.len(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "ZK proof complete, submitting to BFT Core"
+                );
+                bytes
+            }
+            Err(e) => {
+                error!(block = data.block_number, err = %e, "ZK proof failed — requeuing batch");
+                data.proposed_snap.discard();
+                data.spec_snap.discard();
+                self.pending.extend(data.batch);
+                return;
+            }
+        };
+
+        // Write WAL now that we have the proof.
+        if let Some(wal) = &self.wal {
+            let wal_entry = PendingRound {
+                block_number: data.block_number,
+                prev_root:    data.prev_root,
+                new_root:     data.new_root,
+                zk_proof:     Some(proof_bytes.clone()),
+                new_leaves:   data.new_leaves,
+                state_size:   data.state_size,
+                inserted: data.inserted.iter().map(|r| WalRecord {
+                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
+                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
+                    source_state_hash: r.cert_data.source_state_hash.clone(),
+                    transaction_hash:  r.cert_data.transaction_hash.clone(),
+                    witness:           r.cert_data.witness.clone(),
+                }).collect(),
+            };
+            if let Err(e) = wal.write_pending_round(&wal_entry) {
+                error!(block = data.block_number, err = %e, "WAL write failed after ZK proof — aborting round");
+                data.proposed_snap.discard();
+                data.spec_snap.discard();
+                self.pending.extend(data.batch);
+                return;
+            }
+        }
+
+        if let Err(e) = self.bft.commit_block(
+            data.block_number,
+            data.new_root,
+            data.prev_root,
+            Some(proof_bytes),
+            data.new_leaves,
+            data.state_size,
+        ).await {
+            error!(block = data.block_number, err = %e, "commit_block after ZK proof failed — rolling back");
+            data.proposed_snap.discard();
+            data.spec_snap.discard();
+            self.pending.extend(data.batch);
+            return;
+        }
+
+        let bft = Arc::clone(&self.bft);
+        let uc_tx = self.uc_tx.clone();
+        let block_number = data.block_number;
+        tokio::spawn(async move {
+            let result = bft.wait_for_uc(block_number).await;
+            let _ = uc_tx.send(result).await;
+        });
+
+        let root_hex = data.new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
+        info!(
+            block = data.block_number, count = data.batch.len(), root = %root_hex,
+            "ZK round proposed, waiting for UC"
+        );
+
+        self.inflight = Some(InFlightRound {
+            block_number:   data.block_number,
+            new_root:       data.new_root,
+            proposed_snap:  data.proposed_snap,
+            spec: SpecState::Collecting {
+                snap:   data.spec_snap,
+                buffer: Vec::new(),
+            },
+            submitted_batch: data.batch,
+            inserted:        data.inserted,
+            dropped:         data.dropped,
+        });
+
         self.drain_pending_into_spec_buffer();
     }
 

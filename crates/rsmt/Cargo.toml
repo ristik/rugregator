@@ -5,10 +5,11 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-sha2.workspace       = true
-blake2.workspace     = true
-thiserror.workspace  = true
-rayon.workspace      = true
+rsmt-verify.workspace = true
+sha2.workspace        = true
+blake2.workspace      = true
+thiserror.workspace   = true
+rayon.workspace       = true
 
 [[bench]]
 name    = "smt"

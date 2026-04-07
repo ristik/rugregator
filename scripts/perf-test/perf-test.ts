@@ -207,7 +207,7 @@ async function main(): Promise<void> {
           const p = (async () => {
             const delay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
             await delay(cfg.proofDelay);
-            const maxRetries = cfg.proofRetryDelay !== null ? 10 : 0;
+            const maxRetries = cfg.proofRetryDelay !== null ? 50 : 0;
             let lastErr: unknown;
             for (let attempt = 0; attempt <= maxRetries; attempt++) {
               if (attempt > 0) await delay(cfg.proofRetryDelay!);

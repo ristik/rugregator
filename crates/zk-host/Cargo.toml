@@ -1,0 +1,45 @@
+[package]
+name        = "zk-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "SP1 prover host for aggregator ZK consistency proofs (feature-gated)"
+
+[features]
+default = []
+# Pull in the SP1 SDK and build infrastructure.
+# `native-gnark` compiles the gnark Go library into a static archive so that
+# Groth16/Plonk proving runs fully in-process without Docker.
+# Requires a Go toolchain (go + CGO) at build time.
+prove = ["dep:sp1-sdk", "dep:sp1-build", "dep:sp1-verifier", "dep:sp1-core-executor", "sp1-sdk/native-gnark"]
+
+[dependencies]
+rsmt-verify.workspace = true
+rsmt.workspace        = true
+anyhow.workspace      = true
+hex.workspace         = true
+bincode               = "1.3"
+clap.workspace        = true
+sp1-core-executor     = { version = "6.0.2", optional = true }
+
+# SP1 host SDK — only compiled when the `prove` feature is active.
+sp1-sdk      = { version = "6.0.2", features = ["blocking"], optional = true }
+# Lightweight algebraic verifier — no CpuProver needed for Groth16/Plonk.
+sp1-verifier = { version = "6.0.2", features = ["std"],      optional = true }
+
+[build-dependencies]
+# sp1-build compiles the guest ELF from ../zk-guest/program.
+# Only needed when actually building the guest (prove feature).
+sp1-build = { version = "6.0.2", optional = true }
+
+[[bin]]
+name               = "extract-vkey"
+path               = "src/bin/extract-vkey.rs"
+required-features  = ["prove"]
+
+[[bin]]
+name               = "check-syscalls"
+path               = "src/bin/check-syscalls.rs"
+required-features  = ["prove"]
+
+[dev-dependencies]

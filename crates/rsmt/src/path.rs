@@ -1,71 +1,12 @@
 //! SMT key and path operations.
 //!
-//! Keys are plain 256-bit (32-byte) arrays.  Bit addressing is LSB-first:
-//! byte 0, bit 0 is position 0; byte 0, bit 7 is position 7; byte 1, bit 0
-//! is position 8; and so on.
+//! Primitive types (`SmtKey`, `KEY_BITS`, `key_bit_at`, `get_sort_key`) are
+//! defined in `rsmt-verify` (no_std-compatible) and re-exported here.
 //!
-//! `CompressedPath` stores the common-prefix bits of an internal node using
-//! sentinel-bit encoding: `(1 << n) | bits` where `n` is the number of data
-//! bits.  This is used only for tree navigation, never in hashes.
+//! `CompressedPath` is defined here; it is used only for tree navigation and
+//! is not needed by the verifier.
 
-/// A 256-bit SMT key.
-pub type SmtKey = [u8; 32];
-
-/// Number of bits in an SMT key.
-pub const KEY_BITS: usize = 256;
-
-// Pre-computed table to reverse bits in a byte (for get_sort_key).
-const BIT_REVERSE_TABLE: [u8; 256] = {
-    let mut table = [0u8; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut reversed = 0u8;
-        let mut bit = 0;
-        while bit < 8 {
-            if (i >> bit) & 1 != 0 {
-                reversed |= 1 << (7 - bit);
-            }
-            bit += 1;
-        }
-        table[i] = reversed;
-        i += 1;
-    }
-    table
-};
-
-// ─── Bit access ──────────────────────────────────────────────────────────────
-
-/// Get the bit at `pos` from a 256-bit key (LSB-first).
-///
-/// `pos = 0` is bit 0 of byte 0.  `pos = 255` is bit 7 of byte 31.
-#[inline]
-pub fn key_bit_at(key: &SmtKey, pos: usize) -> u8 {
-    debug_assert!(pos < KEY_BITS);
-    (key[pos / 8] >> (pos % 8)) & 1
-}
-
-// ─── Sort key ────────────────────────────────────────────────────────────────
-
-/// Convert a key to LSB-first lexicographic sort order.
-///
-/// Bit-reverse each byte in place (no byte-order reversal).  This makes
-/// bit 0 the most-significant bit in sort_key[0], producing true LSB-first
-/// ordering: items differing at bit 0 are separated first, then bit 1, etc.
-///
-/// Matches Python's `get_sort_key`:
-///   `k.to_bytes(32,"big")[::-1].translate(BIT_REVERSE_TABLE)`
-/// where the `[::-1]` brings the LSB byte to index 0, and bit-reversal
-/// places raw bit 0 in the MSB of sort_key[0].
-#[inline]
-pub fn get_sort_key(key: &SmtKey) -> SmtKey {
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = BIT_REVERSE_TABLE[key[i] as usize];
-        i += 1;
-    }
-    out
-}
+pub use rsmt_verify::{get_sort_key, key_bit_at, SmtKey, KEY_BITS};
 
 // ─── CompressedPath ──────────────────────────────────────────────────────────
 

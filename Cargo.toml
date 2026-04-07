@@ -2,8 +2,11 @@
 members = [
     "crates/aggregator",
     "crates/rsmt",
+    "crates/rsmt-verify",
     "crates/smt-store",
+    "crates/zk-host",
 ]
+exclude = ["zk-guest"]
 resolver = "2"
 
 [workspace.package]
@@ -41,6 +44,8 @@ rand         = "0.8"
 criterion    = { version = "0.5", features = ["html_reports"] }
 tempfile     = "3"
 rsmt         = { path = "crates/rsmt" }
+rsmt-verify  = { path = "crates/rsmt-verify" }
+zk-host      = { path = "crates/zk-host" }
 rocksdb      = { version = "0.22", features = ["multi-threaded-cf"] }
 lru          = "0.12"
 rayon        = "1"

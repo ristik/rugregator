@@ -1,10 +1,24 @@
 //! Configuration for the aggregator (CLI + env + defaults).
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Consistency proof mode attached to each BFT Core certification request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ConsistencyProofMode {
+    /// No proof attached (default).
+    Off,
+    /// Hash-based `aggregator_rsmt_v1` envelope — O(j·d) size.
+    Rsmt,
+    /// SP1 ZK proof — constant size.  Requires `--features zk`.
+    Zk,
+}
 
 /// Unicity Aggregator (Rust implementation).
 #[derive(Debug, Parser, Clone)]
-#[command(name = "aggregator", about = "Unicity Aggregator — Rust implementation")]
+#[command(
+    name = "aggregator",
+    about = "Unicity Aggregator — Rust implementation"
+)]
 pub struct Config {
     /// Listen address (host:port).
     #[arg(long, env = "AGGREGATOR_LISTEN", default_value = "0.0.0.0:8080")]
@@ -23,7 +37,6 @@ pub struct Config {
     pub bft_mode: String,
 
     // ── Live BFT Core connectivity (used when bft_mode = "live") ─────────────
-
     /// BFT Core partition ID (u32).
     #[arg(long, env = "AGGREGATOR_PARTITION_ID", default_value_t = 1)]
     pub partition_id: u32,
@@ -33,11 +46,19 @@ pub struct Config {
     pub bft_peer_id: String,
 
     /// BFT Core root node multiaddr (e.g. "/ip4/127.0.0.1/tcp/26652").
-    #[arg(long, env = "AGGREGATOR_BFT_ADDR", default_value = "/ip4/127.0.0.1/tcp/26652")]
+    #[arg(
+        long,
+        env = "AGGREGATOR_BFT_ADDR",
+        default_value = "/ip4/127.0.0.1/tcp/26652"
+    )]
     pub bft_addr: String,
 
     /// Our libp2p listen address.
-    #[arg(long, env = "AGGREGATOR_P2P_ADDR", default_value = "/ip4/0.0.0.0/tcp/0")]
+    #[arg(
+        long,
+        env = "AGGREGATOR_P2P_ADDR",
+        default_value = "/ip4/0.0.0.0/tcp/0"
+    )]
     pub p2p_addr: String,
 
     /// Hex-encoded secp256k1 private key (32 bytes) for libp2p auth (PeerId).
@@ -57,13 +78,25 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_CACHE_MB", default_value_t = 0)]
     pub cache_mb: usize,
 
-    /// Send a consistency proof (zk_proof) to BFT Core with each round.
+    /// Consistency proof mode sent to BFT Core with each round.
     ///
-    /// When enabled the aggregator uses `batch_insert_with_proof` to compute an
-    /// append-only consistency proof and includes it in every Certification
-    /// Request.  Slightly slower per round; useful when BFT Core validates proofs.
-    #[arg(long, env = "AGGREGATOR_CONSISTENCY_PROOFS", default_value_t = false)]
-    pub consistency_proofs: bool,
+    /// - `off`  — no proof; `zk_proof` field is null (default).
+    /// - `rsmt` — hash-based envelope (aggregator_rsmt_v1); O(j·d) size.
+    /// - `zk`   — SP1 ZK proof; constant size.  Requires the binary to be
+    ///            compiled with `--features zk`.
+    #[arg(
+        long,
+        env = "AGGREGATOR_CONSISTENCY_PROOF_MODE",
+        default_value = "off",
+        value_enum
+    )]
+    pub consistency_proof_mode: ConsistencyProofMode,
+
+    /// SP1 proof kind (used when consistency-proof-mode = zk).
+    ///
+    /// Valid values: `core`, `compressed`, `groth16`, `plonk`.
+    #[arg(long, env = "AGGREGATOR_ZK_PROOF_KIND", default_value = "compressed")]
+    pub zk_proof_kind: String,
 
     /// SMT backend selection.
     ///
@@ -98,7 +131,11 @@ pub struct Config {
     /// PreviousHash, which MUST form a continuous chain with the hashes
     /// certified by BFT Core.  Enable this flag only for testing scenarios
     /// where we're too lazy to reset the BFT Core between stateless aggr. runs.
-    #[arg(long, env = "AGGREGATOR_FAKE_STATE_TRANSITIONS", default_value_t = false)]
+    #[arg(
+        long,
+        env = "AGGREGATOR_FAKE_STATE_TRANSITIONS",
+        default_value_t = false
+    )]
     pub fake_state_transitions: bool,
 
     /// Log level filter (e.g. "info", "debug", "warn").
@@ -111,8 +148,9 @@ pub struct Config {
 pub struct RoundConfig {
     pub round_duration_ms: u64,
     pub batch_limit: usize,
-    /// Generate and send a consistency proof with each Certification Request.
-    pub consistency_proofs: bool,
+    pub proof_mode: ConsistencyProofMode,
+    /// SP1 proof kind string ("core" | "compressed" | "groth16" | "plonk").
+    pub zk_proof_kind: String,
 }
 
 impl From<&Config> for RoundConfig {
@@ -120,7 +158,8 @@ impl From<&Config> for RoundConfig {
         Self {
             round_duration_ms: c.round_duration_ms,
             batch_limit: c.batch_limit,
-            consistency_proofs: c.consistency_proofs,
+            proof_mode: c.consistency_proof_mode,
+            zk_proof_kind: c.zk_proof_kind.clone(),
         }
     }
 }

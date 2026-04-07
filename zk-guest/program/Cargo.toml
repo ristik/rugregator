@@ -1,0 +1,12 @@
+[package]
+name    = "zk-guest-program"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zk-guest-program"
+path = "src/main.rs"
+
+[dependencies]
+sp1-zkvm    = "6.0.2"
+rsmt-verify = { path = "../../crates/rsmt-verify", default-features = false }

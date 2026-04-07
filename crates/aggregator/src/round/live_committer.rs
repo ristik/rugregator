@@ -733,9 +733,45 @@ async fn network_loop(
 
                         // Typed rejection from BFT Core: the wrapped UC is the last-good
                         // certificate, and `status`/`message` tell us why our request was
-                        // refused. Deliver a typed error to the round manager so it can
-                        // branch on the class (retry / drop batch / fatal).
+                        // refused.
+                        //
+                        // Special case: RequestInvalid (status=2) with an advanced next_round
+                        // means BFT Core moved to a new round before our cert request arrived.
+                        // Re-send with the correct round rather than forcing a rollback — this
+                        // avoids discarding an already-computed (and possibly expensive) ZK proof.
                         if ev.status != 0 {
+                            let is_stale_round = ev.status == 2
+                                && pending.as_ref().map_or(false, |p| ev.next_round > p.round_used);
+
+                            if is_stale_round {
+                                let p = pending.as_mut().unwrap();
+                                let old_round = p.round_used;
+                                let new_round = ev.next_round;
+                                p.round_used = new_round;
+                                let lu = last_uc.as_ref().unwrap();
+                                let prev_hash_ir = if fake_state_transitions {
+                                    lu.prev_hash.clone()
+                                } else if p.prev_hash.iter().all(|&b| b == 0) {
+                                    None
+                                } else {
+                                    Some(p.prev_hash.clone())
+                                };
+                                match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
+                                                     lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
+                                    Ok(cbor) => {
+                                        warn!(
+                                            old_round, new_round,
+                                            "round mismatch rejection — re-sending cert request with correct round"
+                                        );
+                                        swarm.behaviour_mut().cert.send_request(&bft_peer, cbor);
+                                    }
+                                    Err(e) => {
+                                        error!("failed to rebuild cert req after round mismatch: {e}");
+                                    }
+                                }
+                                continue;
+                            }
+
                             warn!(
                                 status = ev.status,
                                 message = %ev.message,

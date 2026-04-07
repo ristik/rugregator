@@ -41,34 +41,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::hash::{SmtHasher, Sha256Hasher};
+use rsmt_verify::{SmtHasher, Sha256Hasher, get_sort_key, SmtKey};
 use rayon;
-use crate::path::{get_sort_key, key_bit_at, CompressedPath, SmtKey, KEY_BITS};
+use crate::path::{key_bit_at, CompressedPath, KEY_BITS};
 use crate::tree::{SmtError, SparseMerkleTree};
 use crate::types::{branch_hash, make_leaf, make_node, Branch, NodeBranch};
+
+// Re-export the types now living in rsmt-verify so that `crate::consistency::*`
+// imports still resolve for the test module in this file.
+pub use rsmt_verify::{
+    ProofOp, ConsistencyProof,
+    verify_consistency, verify_consistency_with,
+    consistency_proof_to_bytes, encode_aggregator_envelope_v1,
+};
 
 /// Minimum batch slice size to spawn a rayon parallel task.
 /// Below this threshold sequential execution is faster (rayon overhead ~1 µs).
 const PAR_THRESHOLD: usize = 64;
-
-// ─── Proof opcodes ────────────────────────────────────────────────────────────
-
-/// One element of the flat post-order consistency-proof stream.
-#[derive(Debug, Clone)]
-pub enum ProofOp {
-    /// Unchanged subtree — carries its hash.
-    ///
-    /// `S(None)` (empty unchanged subtree) is provably unreachable for any
-    /// valid tree operation and is not part of the format.
-    S([u8; 32]),
-    /// New leaf (key/value consumed from sorted batch).
-    L,
-    /// Node at the given depth. Two children precede on the stack.
-    N(u8),
-}
-
-/// Ordered flat consistency proof.
-pub type ConsistencyProof = Vec<ProofOp>;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -103,174 +92,6 @@ pub fn batch_insert_with_proof_with<H: SmtHasher>(
     batch: &[(SmtKey, Vec<u8>)],
 ) -> Result<(Vec<(SmtKey, Vec<u8>)>, ConsistencyProof), SmtError> {
     run_batch::<H>(tree, batch, true)
-}
-
-/// Verify a consistency proof using SHA-256 (default).
-pub fn verify_consistency(
-    proof: &ConsistencyProof,
-    old_root: Option<[u8; 32]>,
-    new_root: Option<[u8; 32]>,
-    batch: &[(SmtKey, Vec<u8>)],
-) -> bool {
-    verify_consistency_with::<Sha256Hasher>(proof, old_root, new_root, batch)
-}
-
-/// Verify a consistency proof using the given hasher.
-pub fn verify_consistency_with<H: SmtHasher>(
-    proof: &ConsistencyProof,
-    old_root: Option<[u8; 32]>,
-    new_root: Option<[u8; 32]>,
-    batch: &[(SmtKey, Vec<u8>)],
-) -> bool {
-    if batch.is_empty() {
-        return old_root == new_root;
-    }
-
-    // Precompute sort keys exactly once; sort (sort_key, original_index) pairs.
-    let mut sort_idx: Vec<(SmtKey, usize)> = batch
-        .iter()
-        .enumerate()
-        .map(|(i, (k, _))| (get_sort_key(k), i))
-        .collect();
-    sort_idx.sort_unstable_by_key(|&(sk, _)| sk);
-
-    let mut stack: Vec<(Option<[u8; 32]>, Option<[u8; 32]>)> = Vec::new();
-    let mut pi = 0usize; // proof index
-    let mut bi = 0usize; // batch index (into sort_idx)
-
-    while pi < proof.len() {
-        match &proof[pi] {
-            ProofOp::S(h) => {
-                pi += 1;
-                stack.push((Some(*h), Some(*h)));
-            }
-            ProofOp::L => {
-                pi += 1;
-                if bi >= sort_idx.len() {
-                    return false;
-                }
-                let (k, v) = &batch[sort_idx[bi].1];
-                bi += 1;
-                stack.push((None, Some(H::hash_leaf(k, v))));
-            }
-            ProofOp::N(depth) => {
-                pi += 1;
-                let depth = *depth;
-                if stack.len() < 2 {
-                    return false;
-                }
-                let (rh0, rh1) = stack.pop().unwrap();
-                let (lh0, lh1) = stack.pop().unwrap();
-
-                let h0 = match (lh0, rh0) {
-                    (None, None) => None,
-                    (None, rh) => rh,
-                    (lh, None) => lh,
-                    (Some(l), Some(r)) => Some(H::hash_node(&l, &r, depth)),
-                };
-
-                let h1 = match (lh1, rh1) {
-                    (Some(l), Some(r)) => Some(H::hash_node(&l, &r, depth)),
-                    _ => return false,
-                };
-
-                stack.push((h0, h1));
-            }
-        }
-    }
-
-    pi == proof.len()
-        && bi == sort_idx.len()
-        && stack.len() == 1
-        && stack[0].0 == old_root
-        && stack[0].1 == new_root
-}
-
-// ─── Wire encoding ───────────────────────────────────────────────────────────
-
-/// Encode a `ConsistencyProof` as a flat binary byte slice.
-///
-/// Wire format per opcode:
-/// - `S(h)`: `[0x00, h[0..32]]` — 33 bytes
-/// - `L`:    `[0x01]`           —  1 byte
-/// - `N(d)`: `[0x02, d]`        —  2 bytes
-pub fn consistency_proof_to_bytes(proof: &ConsistencyProof) -> Vec<u8> {
-    let mut out = Vec::with_capacity(proof.len() * 4);
-    for op in proof {
-        match op {
-            ProofOp::S(h) => { out.push(0x00); out.extend_from_slice(h); }
-            ProofOp::L    => { out.push(0x01); }
-            ProofOp::N(d) => { out.push(0x02); out.push(*d); }
-        }
-    }
-    out
-}
-
-/// Encode an `aggregator_rsmt_v1` envelope: the batch of newly-inserted
-/// leaves followed by the flat opcode stream.
-///
-/// Wire format (big-endian integers, no version/tag byte):
-///
-/// ```text
-/// offset  size  field
-/// 0       4     leaf_count                         (u32)
-/// 4       ...   leaves:   leaf_count ×
-///                         { key[32] || value_len (u16) || value[value_len] }
-/// ...     ...   opcode stream (as from `consistency_proof_to_bytes`)
-/// ```
-///
-/// `leaves` **must** already be sorted by [`get_sort_key`] (this is the same
-/// order [`batch_insert_with_proof`] emits its `L` opcodes in) and each
-/// value's length must fit in `u16`. Both invariants are `debug_assert!`ed;
-/// the encoder does not reorder or truncate.
-///
-/// The Go verifier (`bft-core/rootchain/consensus/zkverifier/rsmt`) decodes
-/// this format directly and recomputes both roots from the envelope.
-pub fn encode_aggregator_envelope_v1(
-    leaves_sorted: &[(SmtKey, Vec<u8>)],
-    proof: &ConsistencyProof,
-) -> Vec<u8> {
-    debug_assert!(
-        leaves_sorted.windows(2).all(|w| get_sort_key(&w[0].0) < get_sort_key(&w[1].0)),
-        "encode_aggregator_envelope_v1: leaves not sorted by get_sort_key"
-    );
-    debug_assert!(
-        leaves_sorted.len() <= u32::MAX as usize,
-        "encode_aggregator_envelope_v1: too many leaves"
-    );
-    let proof_bytes_len: usize = proof
-        .iter()
-        .map(|op| match op {
-            ProofOp::S(_) => 33,
-            ProofOp::L => 1,
-            ProofOp::N(_) => 2,
-        })
-        .sum();
-    let leaves_bytes_len: usize = leaves_sorted
-        .iter()
-        .map(|(_, v)| 32 + 2 + v.len())
-        .sum();
-    let mut out = Vec::with_capacity(4 + leaves_bytes_len + proof_bytes_len);
-
-    out.extend_from_slice(&(leaves_sorted.len() as u32).to_be_bytes());
-    for (k, v) in leaves_sorted {
-        debug_assert!(
-            v.len() <= u16::MAX as usize,
-            "encode_aggregator_envelope_v1: value length {} exceeds u16::MAX",
-            v.len()
-        );
-        out.extend_from_slice(k);
-        out.extend_from_slice(&(v.len() as u16).to_be_bytes());
-        out.extend_from_slice(v);
-    }
-    for op in proof {
-        match op {
-            ProofOp::S(h) => { out.push(0x00); out.extend_from_slice(h); }
-            ProofOp::L    => { out.push(0x01); }
-            ProofOp::N(d) => { out.push(0x02); out.push(*d); }
-        }
-    }
-    out
 }
 
 /// Legacy CBOR encoding — kept for callers that have not yet migrated.

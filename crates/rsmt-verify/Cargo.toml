@@ -1,0 +1,15 @@
+[package]
+name        = "rsmt-verify"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "no_std-compatible verifier for the rugregator Sparse Merkle Tree consistency proof"
+
+[features]
+# Enable std::error::Error impl on EnvelopeError and std integration.
+default = ["std"]
+std     = []
+
+[dependencies]
+# sha2 is no_std-compatible with default-features = false.
+sha2 = { workspace = true, default-features = false }

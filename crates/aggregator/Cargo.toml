@@ -81,6 +81,15 @@ libc.workspace = true
 # TCP listener with explicit backlog
 socket2.workspace = true
 
+# ZK prover host (SP1).  All heavy deps are gated behind zk-host's own
+# `prove` feature which this crate's `zk` feature activates.
+zk-host.workspace = true
+
+[features]
+# Enable the real SP1 prover.  Without this the aggregator still compiles and
+# runs in `off` and `rsmt` modes; selecting `zk` mode at runtime will error.
+zk = ["zk-host/prove"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

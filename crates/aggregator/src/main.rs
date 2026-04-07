@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use smt_store::SmtStore as _;
+use smt_store::{mem, SmtStore as _};
 use uni_aggregator::{
     api::build_router,
-    config::{Config, RoundConfig},
+    config::{Config, ConsistencyProofMode, RoundConfig},
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::{AggregatorState, WalStore},
 };
@@ -90,6 +90,27 @@ async fn main() -> anyhow::Result<()> {
 
     let round_cfg = RoundConfig::from(&cfg);
 
+    // Fail fast if ZK mode is requested but the binary wasn't compiled with it.
+    if matches!(round_cfg.proof_mode, ConsistencyProofMode::Zk) && !cfg!(feature = "zk") {
+        anyhow::bail!(
+            "consistency-proof-mode=zk requires the binary to be compiled with \
+             `--features aggregator/zk` (SP1 prover not available in this build)"
+        );
+    }
+
+    // Initialize the ZK prover if needed (setup can take seconds).
+    let zk_prover: Option<std::sync::Arc<zk_host::Prover>> =
+        if matches!(round_cfg.proof_mode, ConsistencyProofMode::Zk) {
+            info!("initializing SP1 prover (this may take a moment)…");
+            let prover = tokio::task::spawn_blocking(|| zk_host::Prover::new())
+                .await
+                .map_err(|e| anyhow::anyhow!("prover init thread panicked: {e}"))??;
+            info!("SP1 prover ready");
+            Some(std::sync::Arc::new(prover))
+        } else {
+            None
+        };
+
     // Backends that require a DB path.
     if matches!(
         smt_backend,
@@ -99,12 +120,17 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("smt-backend '{}' requires --db-path to be set", smt_backend);
     }
 
-    // Helper: spawn a RoundManager and return (state, shutdown_notify).
+    // Helper: attach optional ZK prover and spawn a RoundManager.
     macro_rules! spawn_rm {
         ($rm:expr, $state:expr) => {{
-            let notify = $rm.shutdown_notify();
+            let rm = if let Some(ref p) = zk_prover {
+                $rm.with_prover(std::sync::Arc::clone(p))
+            } else {
+                $rm
+            };
+            let notify = rm.shutdown_notify();
             tokio::spawn(async move {
-                $rm.run().await;
+                rm.run().await;
             });
             ($state, notify)
         }};

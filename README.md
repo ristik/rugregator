@@ -144,7 +144,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --uc-timeout-ms 15000 \
   --db-path      /var/lib/aggregator/db \
   --smt-backend  disk \
-  --consistency-proofs
+  --consistency-proof-mode rsmt
 ```
 
 ### Configuration reference
@@ -157,7 +157,8 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--round-duration-ms` | `AGGREGATOR_ROUND_DURATION_MS` | `1000` | Round timer (ms) |
 | `--batch-limit` | `AGGREGATOR_BATCH_LIMIT` | `1000` | Max requests per round |
 | `--bft-mode` | `AGGREGATOR_BFT_MODE` | `stub` | `stub` or `live` |
-| `--consistency-proofs` | `AGGREGATOR_CONSISTENCY_PROOFS` | `false` | Attach consistency proof to each CR |
+| `--consistency-proof-mode` | `AGGREGATOR_CONSISTENCY_PROOF_MODE` | `off` | `off`, `rsmt` (hash-based), or `zk` (SP1 ZK proof) |
+| `--zk-proof-kind` | `AGGREGATOR_ZK_PROOF_KIND` | `compressed` | `core`, `compressed`, `groth16`, `plonk` — only used when `--consistency-proof-mode zk` |
 | `--db-path` | `AGGREGATOR_DB_PATH` | _(empty)_ | RocksDB directory; empty = in-memory only |
 | `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, or `disk` |
 | `--cache-mb` | `AGGREGATOR_CACHE_MB` | `0` | RocksDB block cache size in MB (0 = RocksDB default ~8 MB) |
@@ -377,9 +378,19 @@ All five SMT backends (`mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, `disk`) 
 
 ### Consistency proofs for trustless operation
 
-Every Certification Request sent to BFT Core can optionally carry a cryptographic **consistency proof** — a compact CBOR-encoded witness that the new SMT root was derived from the previous certified root by appending only the declared leaves, with no deletions or modifications.
+Every Certification Request sent to BFT Core can optionally carry a cryptographic **consistency proof** — a witness that the new SMT root was derived from the previous certified root by appending only the declared leaves, with no deletions or modifications.
 
-Enable with `--consistency-proofs`:
+Three modes are available via `--consistency-proof-mode`:
+
+| Mode | Value | Description |
+|------|-------|-------------|
+| Off | `off` | No proof attached (default) |
+| RSMT | `rsmt` | Hash-based consistency proof, O(batch) size |
+| ZK | `zk` | SP1 zkVM proof, constant size (~200 KB); requires `--features uni-aggregator/zk` build |
+
+See [README-ZK.md](README-ZK.md) for full build and configuration instructions for ZK mode.
+
+**RSMT mode** (`--consistency-proof-mode rsmt`):
 
 **What it proves:** Let `h₀` be the root certified in the last UC and `h₁` be the root in the current Certification Request. The proof witnesses the exact set of (key, value) leaves appended to the tree going from `h₀` to `h₁`. A verifier can replay the proof to independently compute both `h₀` and `h₁` and confirm they match the Input Record hashes in consecutive UCs.
 
