@@ -1,7 +1,7 @@
-//! SMT hash functions — domain-separated SHA-256.
+//! SMT hash functions — domain-separated SHA-256 (RSMT v6a).
 //!
 //! **Leaf:**  `H(0x00 || key_32B || value)`
-//! **Node:**  `H(0x01 || depth_1B || left_hash_32B || right_hash_32B)`
+//! **Node:**  `H(0x01 || depth_1B || region_32B || left_hash_32B || right_hash_32B)`
 //!
 //! ## SP1 zkVM acceleration
 //!
@@ -21,8 +21,8 @@ use crate::path::SmtKey;
 pub trait SmtHasher: Copy + Send + Sync + 'static {
     /// Hash a leaf: `H(0x00 || key || value)`.
     fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32];
-    /// Hash an internal node: `H(0x01 || depth || left_hash || right_hash)`.
-    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32];
+    /// Hash an internal node: `H(0x01 || depth || region || left_hash || right_hash)`.
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8, region: &[u8; 32]) -> [u8; 32];
 }
 
 // ─── SHA-256 (default) ────────────────────────────────────────────────────────
@@ -42,8 +42,13 @@ impl SmtHasher for Sha256Hasher {
     }
 
     #[inline]
-    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32] {
-        sha256_parts(&[&[0x01, depth], left.as_slice(), right.as_slice()])
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8, region: &[u8; 32]) -> [u8; 32] {
+        sha256_parts(&[
+            &[0x01, depth],
+            region.as_slice(),
+            left.as_slice(),
+            right.as_slice(),
+        ])
     }
 }
 
@@ -224,7 +229,7 @@ mod tests {
     #[test]
     fn domain_separation() {
         let lh = Sha256Hasher::hash_leaf(&[0u8; 32], &[0u8; 64]);
-        let nh = Sha256Hasher::hash_node(&[0u8; 32], &[0u8; 32], 0);
+        let nh = Sha256Hasher::hash_node(&[0u8; 32], &[0u8; 32], 0, &[0u8; 32]);
         assert_ne!(lh, nh);
     }
 
@@ -232,9 +237,23 @@ mod tests {
     fn depth_matters() {
         let l = [1u8; 32];
         let r = [2u8; 32];
+        let region = [0u8; 32];
         assert_ne!(
-            Sha256Hasher::hash_node(&l, &r, 0),
-            Sha256Hasher::hash_node(&l, &r, 1)
+            Sha256Hasher::hash_node(&l, &r, 0, &region),
+            Sha256Hasher::hash_node(&l, &r, 1, &region)
+        );
+    }
+
+    #[test]
+    fn region_matters() {
+        let l = [1u8; 32];
+        let r = [2u8; 32];
+        let region_a = [0u8; 32];
+        let mut region_b = [0u8; 32];
+        region_b[0] = 0x80;
+        assert_ne!(
+            Sha256Hasher::hash_node(&l, &r, 1, &region_a),
+            Sha256Hasher::hash_node(&l, &r, 1, &region_b)
         );
     }
 

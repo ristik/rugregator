@@ -13,7 +13,7 @@ use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node, s
 use crate::traits::{SmtStore, SmtStoreSnapshot};
 use crate::disk::materializer::CF_SMT_NODES;
 use crate::disk::node_key::{NodeKey, PrefixBits, prefix_set_bit, prefix_copy_path};
-use rsmt::path::{get_sort_key, key_bit_at};
+use rsmt::path::key_bit_at;
 
 const CF_SMT_META:       &str = "smt_meta";
 pub const CF_SMT_LEAVES: &str = "smt_leaves";
@@ -346,10 +346,11 @@ fn persist_full(
         batch.put_cf(&cf_leaves, key, value);
     }
 
-    // Sort pending keys by LSB-first traversal order so partition_point_keys
-    // can binary-search at each tree level.
+    // Sort pending keys by traversal order (RSMT v6a: plain key order, since
+    // rsmt_sort_key(k) = k) so partition_point_keys can binary-search at each
+    // tree level.
     let mut sorted_keys: Vec<SmtKey> = pending.iter().map(|(k, _)| *k).collect();
-    sorted_keys.sort_by(|a, b| get_sort_key(a).cmp(&get_sort_key(b)));
+    sorted_keys.sort();
 
     if let Some(root_arc) = &tree.root {
         persist_delta_node(
@@ -421,7 +422,7 @@ fn persist_delta_node(
 }
 
 /// Binary search: first index in `keys` where `key_bit_at(key, split) == 1`.
-/// Requires keys are sorted by `get_sort_key` (LSB-first order).
+/// Requires keys are sorted in plain key order (RSMT v6a traversal order).
 fn partition_point_keys(keys: &[SmtKey], split: usize) -> usize {
     let mut lo = 0;
     let mut hi = keys.len();
@@ -467,7 +468,7 @@ fn load_full_tree(db: &DB) -> anyhow::Result<SparseMerkleTree> {
     // Recompute hash.
     let lh = branch_hash(&root_node.left);
     let rh = branch_hash(&root_node.right);
-    root_node.hash = Some(rsmt::hash_node(&lh, &rh, root_node.depth));
+    root_node.hash = Some(rsmt::hash_node(&lh, &rh, root_node.depth, &root_node.region));
 
     let mut tree = SparseMerkleTree::new();
     tree.root = Some(Arc::new(Branch::Node(root_node)));
@@ -510,7 +511,7 @@ fn load_full_branch(
 
     let lh = branch_hash(&node.left);
     let rh = branch_hash(&node.right);
-    node.hash = Some(rsmt::hash_node(&lh, &rh, node.depth));
+    node.hash = Some(rsmt::hash_node(&lh, &rh, node.depth, &node.region));
 
     Ok(Arc::new(Branch::Node(node)))
 }

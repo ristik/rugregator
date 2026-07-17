@@ -5,10 +5,12 @@
 //! Format:
 //! - First byte: type tag (0 = internal node, 1 = leaf)
 //!
-//! **Internal node** (`[0x00, flags, depth_1B, path_len_1B, path_bits..., hash_32B?]`):
+//! **Internal node** (`[0x00, flags, depth_1B, region_32B, path_len_1B, path_bits..., hash_32B?]`):
 //! - flags (u8): bit 0 = has_hash
 //! - depth (u8)
-//! - path_len (u8): number of common-prefix bits
+//! - region (32 bytes): absolute key prefix `[0..depth)`, MSB-first packed with
+//!   bits `depth..256` cleared (RSMT v6a region commitment — hashed, unlike `path`)
+//! - path_len (u8): number of common-prefix bits (local navigation aid, not hashed)
 //! - path_bits: ceil(path_len / 8) bytes
 //! - hash (optional, 32 bytes): present if FLAG_HAS_HASH
 //!
@@ -37,7 +39,7 @@ pub fn serialize_node(n: &NodeBranch) -> Vec<u8> {
     let path_bytes = n.path.as_bytes();
     let path_len = n.path.path_len();
 
-    let mut out = Vec::with_capacity(1 + 1 + 1 + 1 + path_bytes.len() + 32);
+    let mut out = Vec::with_capacity(1 + 1 + 1 + 32 + 1 + path_bytes.len() + 32);
     out.push(TAG_NODE);
 
     let mut flags = 0u8;
@@ -46,6 +48,7 @@ pub fn serialize_node(n: &NodeBranch) -> Vec<u8> {
     }
     out.push(flags);
     out.push(n.depth);
+    out.extend_from_slice(&n.region);
     out.push(path_len as u8);
     out.extend_from_slice(path_bytes);
 
@@ -68,6 +71,10 @@ pub fn deserialize_node(data: &[u8]) -> NodeBranch {
     let depth = data[pos];
     pos += 1;
 
+    let mut region = [0u8; 32];
+    region.copy_from_slice(&data[pos..pos + 32]);
+    pos += 32;
+
     let path_len = data[pos];
     pos += 1;
 
@@ -89,6 +96,7 @@ pub fn deserialize_node(data: &[u8]) -> NodeBranch {
         left: std::sync::Arc::new(crate::types::Branch::Stub([0u8; 32])),
         right: std::sync::Arc::new(crate::types::Branch::Stub([0u8; 32])),
         depth,
+        region,
         hash,
     }
 }
@@ -201,12 +209,15 @@ mod tests {
 
     #[test]
     fn node_roundtrip_with_hash() {
-        let path = CompressedPath::from_key_range(&make_key(0b1010_0101), 0, 5);
+        let key = make_key(0b1010_0101);
+        let path = CompressedPath::from_key_range(&key, 0, 5);
+        let region = crate::path::prefix_region(&key, 5);
         let node = NodeBranch {
             path: path.clone(),
             left: Arc::new(crate::types::Branch::Stub([0x11; 32])),
             right: Arc::new(crate::types::Branch::Stub([0x22; 32])),
             depth: 42,
+            region,
             hash: Some([0xFF; 32]),
         };
         let bytes = serialize_node(&node);
@@ -214,23 +225,27 @@ mod tests {
         let decoded = deserialize_node(&bytes);
         assert_eq!(decoded.path, path);
         assert_eq!(decoded.depth, 42);
+        assert_eq!(decoded.region, region);
         assert_eq!(decoded.hash, Some([0xFF; 32]));
     }
 
     #[test]
     fn node_roundtrip_no_hash() {
         let path = CompressedPath::empty();
+        let region = [0u8; 32];
         let node = NodeBranch {
             path,
             left: Arc::new(crate::types::Branch::Stub([0; 32])),
             right: Arc::new(crate::types::Branch::Stub([0; 32])),
             depth: 0,
+            region,
             hash: None,
         };
         let bytes = serialize_node(&node);
         let decoded = deserialize_node(&bytes);
         assert_eq!(decoded.path, CompressedPath::empty());
         assert_eq!(decoded.depth, 0);
+        assert_eq!(decoded.region, region);
         assert_eq!(decoded.hash, None);
     }
 
@@ -241,17 +256,20 @@ mod tests {
         key[1] = 0xAA;
         key[2] = 0x55;
         let path = CompressedPath::from_key_range(&key, 0, 20);
+        let region = crate::path::prefix_region(&key, 200);
         let node = NodeBranch {
             path: path.clone(),
             left: Arc::new(crate::types::Branch::Stub([0; 32])),
             right: Arc::new(crate::types::Branch::Stub([0; 32])),
             depth: 200,
+            region,
             hash: Some([0x42; 32]),
         };
         let bytes = serialize_node(&node);
         let decoded = deserialize_node(&bytes);
         assert_eq!(decoded.path, path);
         assert_eq!(decoded.depth, 200);
+        assert_eq!(decoded.region, region);
         assert_eq!(decoded.hash, Some([0x42; 32]));
     }
 }

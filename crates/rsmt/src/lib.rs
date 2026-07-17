@@ -16,12 +16,11 @@ pub use rsmt_verify::{
     verify_consistency, verify_consistency_with,
     ConsistencyProof, EnvelopeError, ProofOp,
     Sha256Hasher, SmtHasher,
-    get_sort_key, key_bit_at, SmtKey, KEY_BITS,
+    key_bit_at, prefix_region, SmtKey, KEY_BITS,
 };
 
 pub use consistency::{
     batch_insert, batch_insert_with, batch_insert_with_proof, batch_insert_with_proof_with,
-    consistency_proof_to_cbor,
 };
 pub use hash::{hash_leaf, hash_node, Blake2bHasher, Blake2sHasher};
 pub use path::{CompressedPath};

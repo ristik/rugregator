@@ -4,7 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::hash::{SmtHasher, Sha256Hasher};
-use crate::path::{key_bit_at, CompressedPath, SmtKey, KEY_BITS};
+use crate::path::{key_bit_at, prefix_region, CompressedPath, SmtKey, KEY_BITS};
 use crate::types::{branch_hash, make_leaf, make_node, Branch, LeafBranch, NodeBranch};
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -122,12 +122,13 @@ fn insert<H: SmtHasher>(
         Branch::Leaf(existing) => {
             let div = first_diverging_bit(&existing.key, &key, start_bit);
             let cp = CompressedPath::from_key_range(&key, start_bit, div - start_bit);
+            let region = prefix_region(&key, div);
             let old_leaf = Arc::new(Branch::Leaf(existing));
             let new_leaf = make_leaf::<H>(key, value);
             if key_bit_at(&key, div) == 1 {
-                make_node::<H>(cp, old_leaf, new_leaf, div as u8)
+                make_node::<H>(cp, old_leaf, new_leaf, div as u8, region)
             } else {
-                make_node::<H>(cp, new_leaf, old_leaf, div as u8)
+                make_node::<H>(cp, new_leaf, old_leaf, div as u8, region)
             }
         }
         Branch::Node(mut n) => {
@@ -149,7 +150,7 @@ fn insert<H: SmtHasher>(
             }
             let lh = branch_hash(&n.left);
             let rh = branch_hash(&n.right);
-            n.hash = Some(H::hash_node(&lh, &rh, n.depth));
+            n.hash = Some(H::hash_node(&lh, &rh, n.depth, &n.region));
             Arc::new(Branch::Node(n))
         }
         Branch::Stub(_) => {
@@ -174,16 +175,20 @@ fn split_node<H: SmtHasher>(
     n.hash = None;
     let lh = branch_hash(&n.left);
     let rh = branch_hash(&n.right);
-    n.hash = Some(H::hash_node(&lh, &rh, n.depth));
+    // n.depth and n.region are absolute properties of the preserved node and
+    // are unchanged by the split — only the local navigation `path` above it
+    // shrinks.
+    n.hash = Some(H::hash_node(&lh, &rh, n.depth, &n.region));
     let old_node = Arc::new(Branch::Node(n));
 
     let new_leaf = make_leaf::<H>(key, value);
     let new_cp = CompressedPath::from_key_range(&key, start_bit, first_div);
+    let new_region = prefix_region(&key, new_split);
 
     if old_dir == 1 {
-        make_node::<H>(new_cp, new_leaf, old_node, new_split as u8)
+        make_node::<H>(new_cp, new_leaf, old_node, new_split as u8, new_region)
     } else {
-        make_node::<H>(new_cp, old_node, new_leaf, new_split as u8)
+        make_node::<H>(new_cp, old_node, new_leaf, new_split as u8, new_region)
     }
 }
 

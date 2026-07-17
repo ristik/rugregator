@@ -74,7 +74,8 @@ fn scenario_single_leaf() -> Fixture {
 
 fn scenario_two_leaves() -> Fixture {
     let mut tree = SparseMerkleTree::new();
-    // Two keys that diverge early: byte 0 = 0x00 vs 0x80 (differ in MSB, bit 7).
+    // Two keys that diverge immediately: byte 0 = 0x00 vs 0x80 (differ at
+    // bit 0, the MSB of byte 0, under RSMT v6a's big-endian bit order).
     let k0 = mk_key(0x00, 0x01);
     let k1 = mk_key(0x80, 0x02);
     let (pairs, proof) = batch_insert_with_proof(
@@ -116,6 +117,52 @@ fn scenario_insert_into_existing() -> Fixture {
     }
 }
 
+fn scenario_edge_split_ol() -> Fixture {
+    // A single pre-existing leaf, split by a second batch inserting a key
+    // that diverges from it partway through — the preserved leaf must be
+    // presented opened (O_L), never opaque (S), since it becomes the child
+    // of a junction created this round.
+    let mut tree = SparseMerkleTree::new();
+    let old = mk_key(0x00, 0x01);
+    batch_insert_with_proof(&mut tree, &[(old, b"old".to_vec())]).unwrap();
+    let prev = tree.root_hash();
+
+    let new_key = mk_key(0x03, 0x02); // diverges from `old` at bit 6
+    let (pairs, proof) = batch_insert_with_proof(&mut tree, &[(new_key, b"new".to_vec())]).unwrap();
+    let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
+    Fixture {
+        name: "edge_split_emits_ol",
+        prev_root: opt_hex(prev),
+        new_root: opt_hex(tree.root_hash()),
+        envelope: hex(&envelope),
+    }
+}
+
+fn scenario_deep_split_o() -> Fixture {
+    // Two pre-existing leaves sharing a 4-bit prefix form one internal
+    // NodeBranch. A second batch inserts a key diverging from that shared
+    // prefix before the node's own depth, forcing a new junction above it —
+    // the preserved NodeBranch must be presented opened (O), never opaque.
+    let mut tree = SparseMerkleTree::new();
+    let mut key_a = [0u8; 32];
+    key_a[0] = 0b0000_0000; // bits 0..3 = 0000, bit 4 = 0
+    let mut key_b = [0u8; 32];
+    key_b[0] = 0b0000_1000; // bits 0..3 = 0000, bit 4 = 1
+    batch_insert_with_proof(&mut tree, &[(key_a, b"a".to_vec()), (key_b, b"b".to_vec())]).unwrap();
+    let prev = tree.root_hash();
+
+    let mut key_c = [0u8; 32];
+    key_c[0] = 0b0010_0000; // bits 0..1 = 00, bit 2 = 1: diverges before depth 4
+    let (pairs, proof) = batch_insert_with_proof(&mut tree, &[(key_c, b"c".to_vec())]).unwrap();
+    let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
+    Fixture {
+        name: "deep_split_emits_o",
+        prev_root: opt_hex(prev),
+        new_root: opt_hex(tree.root_hash()),
+        envelope: hex(&envelope),
+    }
+}
+
 fn scenario_large_batch() -> Fixture {
     // Insert 50 leaves into an empty tree to exercise multi-level trees.
     let mut tree = SparseMerkleTree::new();
@@ -150,6 +197,8 @@ fn main() {
         scenario_single_leaf(),
         scenario_two_leaves(),
         scenario_insert_into_existing(),
+        scenario_edge_split_ol(),
+        scenario_deep_split_o(),
         scenario_large_batch(),
     ];
 

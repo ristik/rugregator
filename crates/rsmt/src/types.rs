@@ -53,8 +53,14 @@ pub struct NodeBranch {
     /// Right child (keys with bit `depth` = 1).
     pub right: Arc<Branch>,
     /// Absolute bit position where children diverge (0..255).
-    /// Used in `hash_node(left, right, depth)`.
+    /// Used in `hash_node(left, right, depth, region)`.
     pub depth: u8,
+    /// Absolute key prefix `[0..depth)` shared by every descendant key,
+    /// packed MSB-first into 32 bytes with bits `depth..256` cleared
+    /// (RSMT v6a region commitment). Absolute like `depth`: splitting an
+    /// edge above this node changes neither. Hashed — unlike `path`, which
+    /// is a local, parent-relative navigation aid.
+    pub region: [u8; 32],
     /// Cached hash.  None = needs recomputation.
     pub hash: Option<[u8; 32]>,
 }
@@ -87,15 +93,17 @@ pub fn make_node<H: SmtHasher>(
     left: Arc<Branch>,
     right: Arc<Branch>,
     depth: u8,
+    region: [u8; 32],
 ) -> Arc<Branch> {
     let lh = branch_hash(&left);
     let rh = branch_hash(&right);
-    let hash = H::hash_node(&lh, &rh, depth);
+    let hash = H::hash_node(&lh, &rh, depth, &region);
     Arc::new(Branch::Node(NodeBranch {
         path,
         left,
         right,
         depth,
+        region,
         hash: Some(hash),
     }))
 }
@@ -109,6 +117,7 @@ pub fn make_node_sha256(
     left: Arc<Branch>,
     right: Arc<Branch>,
     depth: u8,
+    region: [u8; 32],
 ) -> Arc<Branch> {
-    make_node::<Sha256Hasher>(path, left, right, depth)
+    make_node::<Sha256Hasher>(path, left, right, depth, region)
 }

@@ -35,18 +35,22 @@ This is a Rust reimplementation of `aggregator-go/`, a blockchain nullifier aggr
 
 ### Workspace crates
 
-- **`crates/rsmt`** — Standalone Sparse Merkle Tree library. Go-compatible path-compressed Patricia trie with 272-bit keys (sentinel-encoded `BigUint`). No async, no application logic.
+- **`crates/rsmt`** — Standalone Sparse Merkle Tree library implementing RSMT v6a (path-compressed Patricia trie, 256-bit keys, region-committing node hashes). No async, no application logic.
 - **`crates/aggregator`** — The aggregator service. Re-exports `rsmt` wholesale via `pub use rsmt::*` in `smt/mod.rs`.
 
-### SMT (rsmt crate)
+### SMT (rsmt crate) — RSMT v6a
+
+A path-compressed radix trie (Patricia trie) over 256-bit keys, following the Unicity Yellowpaper's "Radix Sparse Merkle Trees" (RSMT v6a) format. Keys and regions are read as big-endian (MSB-first) bit strings: bit 0 is the MSB of byte 0.
+
+**Hashing**: `hash_leaf(key, value) = H(0x00 ‖ key ‖ value)`; `hash_node(left, right, depth, region) = H(0x01 ‖ depth ‖ region ‖ left ‖ right)`. `region` is the absolute key prefix `[0..depth)` shared by every descendant key, packed into 32 bytes with bits `depth..256` cleared — an absolute property of the node, like `depth`, unaffected by edge splits above it. `NodeBranch.path` (`CompressedPath`) is a separate, purely local navigation aid — the common-prefix bits between a node and its parent — and is never hashed.
 
 `SmtSnapshot` provides copy-on-write snapshots: `SmtSnapshot::create(tree)` starts a speculative round; `snap.commit(tree)` atomically applies it on BFT success; dropping the snapshot discards it on failure.
 
 Two batch-insert modes share one internal algorithm:
 - `batch_insert(tree, batch)` — inserts only, no overhead
-- `batch_insert_with_proof(tree, batch)` — also returns a `ConsistencyProof` (flat pre-order opcode list for BFT's `zk_proof` field)
+- `batch_insert_with_proof(tree, batch)` — also returns a `ConsistencyProof` (flat post-order opcode list for BFT's `zk_proof` field)
 
-Consistency proof opcodes: `S` (unchanged subtree hash), `N` (new junction — pass-through in verifier), `Nx` (existing node traversed — always `hash_node`), `L` (new leaf), `Bl` (border leaf), `Bns` (border node shortened). The `N`/`Nx` distinction is critical: Go always calls `hash_node()` even on single-child nodes, so existing nodes never short-circuit.
+Consistency proof opcodes (5): `S(h)` opaque preserved subtree (valid only under a pre-existing parent junction), `L` new leaf (consumed from sorted batch), `N(depth)` junction over the two preceding stack entries, `O(depth, region, left, right)` a preserved junction opened one level, `O_L(key, value)` a preserved leaf opened. `O`/`O_L` are required whenever a preserved subtree becomes the child of a junction created this round (an edge split, including the leaf-merge case) — an opaque `S` may never attach to a new edge, since the verifier needs the opened preimage to check the new edge against the child's authenticated depth and region. See `crates/rsmt-verify/src/consistency.rs` for the full stack-machine verifier.
 
 ### Aggregator service
 
@@ -74,6 +78,6 @@ Leaf value stored in the SMT is `CertDataHash`: `SHA256(CborArray(4) || cbor(pre
 
 ### Go compatibility
 
-CBOR is hand-assembled (not via ciborium's value API) to exactly match Go's `fxamacker/cbor` output. Hash inputs are constructed as `SHA256(cbor_array_header || cbor_bytes(field1) || ...)` — concatenated raw bytes, not a serialized CBOR value. See `rsmt/hash.rs` for leaf/node hash implementations and `aggregator/api/cbor.rs` for wire types.
+CBOR is hand-assembled (not via ciborium's value API) to exactly match Go's `fxamacker/cbor` output for the validation-pipeline hashes above (StateID, CertDataHash, signature preimage). Hash inputs are constructed as `SHA256(cbor_array_header || cbor_bytes(field1) || ...)` — concatenated raw bytes, not a serialized CBOR value. See `aggregator/validation/state_id.rs` for these hash constructions and `aggregator/api/cbor.rs` for wire types.
 
-The Go aggregator reference is in `aggregator-go/`. Cross-validate any SMT or hashing changes against its test vectors.
+This is unrelated to the SMT tree's own leaf/node hashing (`rsmt/hash.rs`, `rsmt-verify/hash.rs`), which is plain domain-separated concatenation, not CBOR-based — see the "SMT (rsmt crate)" section above. The RSMT v6a hash formula (region + depth commitment, big-endian bit order) now matches `aggregator-go`'s `internal/smt`/`internal/smt/disk` implementation, which shipped the same v6a upgrade; the consistency-proof opcode stream, however, has no Go counterpart — `aggregator-go` does not implement consistency proofs at all. Cross-validate any SMT hashing changes against `aggregator-go/internal/smt` where a comparison point exists.

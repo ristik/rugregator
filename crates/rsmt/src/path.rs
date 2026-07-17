@@ -1,29 +1,30 @@
 //! SMT key and path operations.
 //!
-//! Primitive types (`SmtKey`, `KEY_BITS`, `key_bit_at`, `get_sort_key`) are
+//! Primitive types (`SmtKey`, `KEY_BITS`, `key_bit_at`, `prefix_region`) are
 //! defined in `rsmt-verify` (no_std-compatible) and re-exported here.
 //!
 //! `CompressedPath` is defined here; it is used only for tree navigation and
 //! is not needed by the verifier.
 
-pub use rsmt_verify::{get_sort_key, key_bit_at, SmtKey, KEY_BITS};
+pub use rsmt_verify::{key_bit_at, prefix_region, SmtKey, KEY_BITS};
 
 // ─── CompressedPath ──────────────────────────────────────────────────────────
 
 /// Compressed common-prefix for internal nodes.
 ///
 /// Stores up to 255 bits of common prefix.  Used only for tree navigation
-/// (routing keys through the trie), never in hash computations.
+/// (routing keys through the trie), never in hash computations (the node's
+/// `region` field, computed separately, is what gets hashed).
 ///
 /// Internal representation: `len` is the number of data bits (0..=255).
-/// `bits[0..ceil(len/8)]` store the prefix bits in LSB-first order (matching
-/// the key bit ordering).
+/// `bits[0..ceil(len/8)]` store the prefix bits in MSB-first order (matching
+/// the key bit ordering: bit 0 is the MSB of `bits[0]`).
 #[derive(Clone, Debug)]
 pub struct CompressedPath {
     /// Number of data bits (0 = empty path, i.e. the node is at a pure
     /// bifurcation with no shared prefix).
     pub len: u8,
-    /// Prefix bits, LSB-first.  Only the first `len` bits are meaningful.
+    /// Prefix bits, MSB-first.  Only the first `len` bits are meaningful.
     bits: [u8; 32],
 }
 
@@ -44,7 +45,7 @@ impl CompressedPath {
     #[inline]
     pub fn bit_at(&self, pos: usize) -> u8 {
         debug_assert!(pos < self.len as usize);
-        (self.bits[pos / 8] >> (pos % 8)) & 1
+        (self.bits[pos / 8] >> (7 - pos % 8)) & 1
     }
 
     /// Extract a range of bits from a key as a `CompressedPath`.
@@ -57,7 +58,7 @@ impl CompressedPath {
         for i in 0..n_bits {
             let b = key_bit_at(key, start_bit + i);
             if b != 0 {
-                cp.bits[i / 8] |= 1 << (i % 8);
+                cp.bits[i / 8] |= 0x80 >> (i % 8);
             }
         }
         cp
@@ -79,7 +80,7 @@ impl CompressedPath {
         // Check remaining bits.
         let remaining = n % 8;
         if remaining > 0 {
-            let mask = (1u8 << remaining) - 1;
+            let mask = 0xffu8 << (8 - remaining);
             let key_byte = extract_key_byte(key, start_bit + full_bytes * 8);
             if (key_byte & mask) != (self.bits[full_bytes] & mask) {
                 return false;
@@ -93,9 +94,9 @@ impl CompressedPath {
     pub fn set_bit(&mut self, pos: usize, val: u8) {
         debug_assert!(pos < self.len as usize);
         if val != 0 {
-            self.bits[pos / 8] |= 1 << (pos % 8);
+            self.bits[pos / 8] |= 0x80 >> (pos % 8);
         } else {
-            self.bits[pos / 8] &= !(1 << (pos % 8));
+            self.bits[pos / 8] &= !(0x80 >> (pos % 8));
         }
     }
 
@@ -127,7 +128,7 @@ impl PartialEq for CompressedPath {
         }
         let remaining = n % 8;
         if remaining > 0 {
-            let mask = (1u8 << remaining) - 1;
+            let mask = 0xffu8 << (8 - remaining);
             if (self.bits[full_bytes] & mask) != (other.bits[full_bytes] & mask) {
                 return false;
             }
@@ -141,7 +142,8 @@ impl Eq for CompressedPath {}
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Extract 8 consecutive bits from a key starting at `start_bit`, packed into
-/// a byte with the lowest-addressed bit in the LSB.
+/// a byte with the lowest-addressed (start_bit) bit in the MSB — matching
+/// `CompressedPath`'s MSB-first internal storage.
 #[inline]
 fn extract_key_byte(key: &SmtKey, start_bit: usize) -> u8 {
     let byte_idx = start_bit / 8;
@@ -153,7 +155,7 @@ fn extract_key_byte(key: &SmtKey, start_bit: usize) -> u8 {
         // Straddles two bytes.
         let lo = if byte_idx < 32 { key[byte_idx] } else { 0 };
         let hi = if byte_idx + 1 < 32 { key[byte_idx + 1] } else { 0 };
-        (lo >> bit_off) | (hi << (8 - bit_off))
+        (lo << bit_off) | (hi >> (8 - bit_off))
     }
 }
 
@@ -177,35 +179,10 @@ mod tests {
     #[test]
     fn key_bit_at_byte1() {
         let mut key = [0u8; 32];
-        key[1] = 0x01; // bit 8 set
+        key[1] = 0b1000_0000; // MSB of byte 1 = bit position 8
         assert_eq!(key_bit_at(&key, 7), 0);
         assert_eq!(key_bit_at(&key, 8), 1);
         assert_eq!(key_bit_at(&key, 9), 0);
-    }
-
-    #[test]
-    fn sort_key_matches_python() {
-        // Python get_sort_key: k.to_bytes(32,"big")[::-1].translate(BIT_REVERSE_TABLE)
-        // = reverse byte order (LSB byte first) then bit-reverse each byte.
-        // For key[0] = 0b0000_0001 (bit 0 set), byte 0 is the LSB byte,
-        // so it goes to sort_key[0] after byte-reversal, then bit-reversed:
-        // 0b0000_0001 → 0b1000_0000.
-        let mut key = [0u8; 32];
-        key[0] = 0b0000_0001; // bit 0 set
-        let sk = get_sort_key(&key);
-        // Rust implementation: bit-reverse each byte in place (no byte-order reversal).
-        // byte 0 of key → byte 0 of sort_key, bit-reversed: 0b0000_0001 → 0b1000_0000
-        assert_eq!(sk[0], 0b1000_0000);
-        assert_eq!(sk[31], 0); // byte 31 of key was 0
-    }
-
-    #[test]
-    fn sort_key_ordering() {
-        // Key with bit 0 = 0 should sort before key with bit 0 = 1
-        let k0 = [0u8; 32];
-        let mut k1 = [0u8; 32];
-        k1[0] = 0x01; // bit 0 set
-        assert!(get_sort_key(&k0) < get_sort_key(&k1));
     }
 
     #[test]
@@ -234,7 +211,7 @@ mod tests {
         assert!(cp.matches_key(&key, 0));
 
         let mut key2 = [0u8; 32];
-        key2[0] = 0b1010_0100; // bit 0 differs
+        key2[0] = 0b1010_0100; // bit 7 (LSB) differs
         assert!(!cp.matches_key(&key2, 0));
     }
 
@@ -263,9 +240,9 @@ mod tests {
     #[test]
     fn compressed_path_mid_key() {
         let mut key = [0u8; 32];
-        key[2] = 0b1111_0000; // bits 16..23
+        key[2] = 0b1111_0000; // MSB-first: bits 16..19 = 1, bits 20..23 = 0
         let cp = CompressedPath::from_key_range(&key, 16, 8);
-        assert_eq!(cp.bit_at(0), 0); // bit 16 of key
-        assert_eq!(cp.bit_at(4), 1); // bit 20 of key
+        assert_eq!(cp.bit_at(0), 1); // bit 16 of key
+        assert_eq!(cp.bit_at(4), 0); // bit 20 of key
     }
 }

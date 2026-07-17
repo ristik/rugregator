@@ -7,7 +7,7 @@
 //!
 //! # Public surface
 //!
-//! - **Primitives:** [`SmtKey`], [`KEY_BITS`], [`get_sort_key`], [`key_bit_at`]
+//! - **Primitives:** [`SmtKey`], [`KEY_BITS`], [`key_bit_at`], [`prefix_region`]
 //! - **Hash:** [`SmtHasher`], [`Sha256Hasher`]
 //! - **Proof types:** [`ProofOp`], [`ConsistencyProof`]
 //! - **Verification:** [`verify_consistency`], [`verify_consistency_with`]
@@ -27,4 +27,4 @@ pub use consistency::{
     verify_consistency, verify_consistency_with, ConsistencyProof, EnvelopeError, ProofOp,
 };
 pub use hash::{Sha256Hasher, SmtHasher};
-pub use path::{get_sort_key, key_bit_at, SmtKey, KEY_BITS};
+pub use path::{key_bit_at, prefix_region, SmtKey, KEY_BITS};

@@ -1,8 +1,9 @@
 //! SMT key primitives needed by the consistency proof verifier.
 //!
-//! Keys are plain 256-bit (32-byte) arrays.  Bit addressing is LSB-first:
-//! byte 0, bit 0 is position 0; byte 0, bit 7 is position 7; byte 1, bit 0
-//! is position 8; and so on.
+//! Keys are plain 256-bit (32-byte) arrays, read as big-endian bit strings
+//! (RSMT v6a): bit 0 is the most-significant bit of byte 0, bit 7 is the
+//! least-significant bit of byte 0, bit 8 is the most-significant bit of
+//! byte 1, and so on. Byte order itself (byte 0 first) is unchanged.
 
 /// A 256-bit SMT key.
 pub type SmtKey = [u8; 32];
@@ -10,52 +11,33 @@ pub type SmtKey = [u8; 32];
 /// Number of bits in an SMT key.
 pub const KEY_BITS: usize = 256;
 
-// Pre-computed table to reverse bits in a byte (for get_sort_key).
-pub(crate) const BIT_REVERSE_TABLE: [u8; 256] = {
-    let mut table = [0u8; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut reversed = 0u8;
-        let mut bit = 0;
-        while bit < 8 {
-            if (i >> bit) & 1 != 0 {
-                reversed |= 1 << (7 - bit);
-            }
-            bit += 1;
-        }
-        table[i] = reversed;
-        i += 1;
-    }
-    table
-};
-
 // ─── Bit access ──────────────────────────────────────────────────────────────
 
-/// Get the bit at `pos` from a 256-bit key (LSB-first).
+/// Get the bit at `pos` from a 256-bit key (MSB-first / big-endian).
 ///
-/// `pos = 0` is bit 0 of byte 0.  `pos = 255` is bit 7 of byte 31.
+/// `pos = 0` is the MSB of byte 0.  `pos = 255` is the LSB of byte 31.
 #[inline]
 pub fn key_bit_at(key: &SmtKey, pos: usize) -> u8 {
     debug_assert!(pos < KEY_BITS);
-    (key[pos / 8] >> (pos % 8)) & 1
+    (key[pos / 8] >> (7 - pos % 8)) & 1
 }
 
-// ─── Sort key ────────────────────────────────────────────────────────────────
-
-/// Convert a key to LSB-first lexicographic sort order.
-///
-/// Bit-reverse each byte in place (no byte-order reversal).  This makes
-/// bit 0 the most-significant bit in sort_key[0], producing true LSB-first
-/// ordering: items differing at bit 0 are separated first, then bit 1, etc.
+/// Pack the `depth`-bit region (key prefix `[0..depth)`) into a 32-byte
+/// big-endian bit string: the prefix occupies the first `depth` bits and
+/// the remaining suffix bits are zero. Together with `depth`, this packing
+/// is injective (RSMT v6a node-hash region commitment).
 #[inline]
-pub fn get_sort_key(key: &SmtKey) -> SmtKey {
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = BIT_REVERSE_TABLE[key[i] as usize];
-        i += 1;
+pub fn prefix_region(key: &SmtKey, depth: usize) -> SmtKey {
+    debug_assert!(depth <= KEY_BITS);
+    let mut region = [0u8; 32];
+    let full_bytes = depth / 8;
+    let partial_bits = depth % 8;
+    region[..full_bytes].copy_from_slice(&key[..full_bytes]);
+    if partial_bits != 0 {
+        let mask = 0xffu8 << (8 - partial_bits);
+        region[full_bytes] = key[full_bytes] & mask;
     }
-    out
+    region
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -65,29 +47,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sort_key_bit0() {
+    fn key_bit_at_byte0_msb_first() {
         let mut key = [0u8; 32];
-        key[0] = 0b0000_0001;
-        let sk = get_sort_key(&key);
-        assert_eq!(sk[0], 0b1000_0000);
-        assert_eq!(sk[31], 0);
-    }
-
-    #[test]
-    fn sort_key_ordering() {
-        let k0 = [0u8; 32];
-        let mut k1 = [0u8; 32];
-        k1[0] = 0x01;
-        assert!(get_sort_key(&k0) < get_sort_key(&k1));
-    }
-
-    #[test]
-    fn key_bit_at_byte0() {
-        let mut key = [0u8; 32];
-        key[0] = 0b1010_0101;
+        key[0] = 0b1100_0010; // MSB-first bits: 1,1,0,0,0,0,1,0
         assert_eq!(key_bit_at(&key, 0), 1);
-        assert_eq!(key_bit_at(&key, 1), 0);
-        assert_eq!(key_bit_at(&key, 2), 1);
-        assert_eq!(key_bit_at(&key, 7), 1);
+        assert_eq!(key_bit_at(&key, 1), 1);
+        assert_eq!(key_bit_at(&key, 2), 0);
+        assert_eq!(key_bit_at(&key, 6), 1);
+        assert_eq!(key_bit_at(&key, 7), 0);
+    }
+
+    #[test]
+    fn key_bit_at_byte1() {
+        let mut key = [0u8; 32];
+        key[1] = 0b1000_0000; // MSB of byte 1 = bit position 8
+        assert_eq!(key_bit_at(&key, 7), 0);
+        assert_eq!(key_bit_at(&key, 8), 1);
+        assert_eq!(key_bit_at(&key, 9), 0);
+    }
+
+    #[test]
+    fn prefix_region_zero_depth_is_empty() {
+        let key = [0xFFu8; 32];
+        assert_eq!(prefix_region(&key, 0), [0u8; 32]);
+    }
+
+    #[test]
+    fn prefix_region_byte_aligned() {
+        let mut key = [0u8; 32];
+        key[0] = 0xAB;
+        key[1] = 0xCD;
+        let region = prefix_region(&key, 8);
+        let mut expected = [0u8; 32];
+        expected[0] = 0xAB;
+        assert_eq!(region, expected);
+    }
+
+    #[test]
+    fn prefix_region_partial_byte() {
+        let mut key = [0u8; 32];
+        key[0] = 0b1111_1111;
+        // depth = 3: keep the top 3 bits, clear the rest.
+        let region = prefix_region(&key, 3);
+        let mut expected = [0u8; 32];
+        expected[0] = 0b1110_0000;
+        assert_eq!(region, expected);
+    }
+
+    #[test]
+    fn prefix_region_full_depth_is_key() {
+        let key = [0xA5u8; 32];
+        assert_eq!(prefix_region(&key, KEY_BITS), key);
     }
 }

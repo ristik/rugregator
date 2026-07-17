@@ -10,14 +10,18 @@
 //!
 //! ## Verification
 //!
+//! Regions are not transmitted on the wire — the verifier derives the
+//! expected region at each depth from the queried key itself (RSMT v6a).
+//!
 //! 1. `h = hash_leaf(key, value)`
 //! 2. For each set bit in `bitmap` (ascending = leaf-to-root):
-//!    - If `key_bit_at(key, depth) == 0`: `h = hash_node(h, sibling, depth)`
-//!    - Else: `h = hash_node(sibling, h, depth)`
+//!    - `region = prefix_region(key, depth)`
+//!    - If `key_bit_at(key, depth) == 0`: `h = hash_node(h, sibling, depth, region)`
+//!    - Else: `h = hash_node(sibling, h, depth, region)`
 //! 3. Accept iff `h == root`.
 
 use crate::hash::{hash_leaf, hash_node};
-use crate::path::{key_bit_at, SmtKey};
+use crate::path::{key_bit_at, prefix_region, SmtKey};
 use crate::tree::{SmtError, SparseMerkleTree};
 use crate::types::{branch_hash, Branch};
 
@@ -174,13 +178,14 @@ pub fn verify_inclusion(
         }
         sibling_idx -= 1;
         let sibling = &proof.siblings[sibling_idx];
+        let region = prefix_region(key, depth);
 
         if key_bit_at(key, depth) == 1 {
             // We went right at this depth, so sibling is left.
-            h = hash_node(sibling, &h, depth as u8);
+            h = hash_node(sibling, &h, depth as u8, &region);
         } else {
             // We went left, sibling is right.
-            h = hash_node(&h, sibling, depth as u8);
+            h = hash_node(&h, sibling, depth as u8, &region);
         }
     }
 

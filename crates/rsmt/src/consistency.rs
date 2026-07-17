@@ -7,43 +7,44 @@
 //!
 //! Both default to SHA-256; use the `_with::<H>` variants to select a hasher.
 //!
-//! ## Proof format (post-order, 3 opcodes)
+//! ## Proof format (post-order, RSMT v6a — 5 opcodes)
 //!
-//! The proof is a flat stream from LSB-first post-order traversal:
+//! The proof is a flat stream from big-endian (MSB-first) post-order traversal:
 //!
-//! | Opcode | Stream encoding | Meaning |
-//! |--------|----------------|---------|
-//! | `S`    | `['S', hash?]` | Unchanged subtree (hash or None for empty). |
-//! | `L`    |  `['L']`       | New leaf — consumer pops from sorted batch. |
-//! | `N`    | `['N', depth]` | Node at depth. Two children precede (left, right). |
+//! | Opcode         | Stream encoding                    | Meaning |
+//! |-----------------|-------------------------------------|---------|
+//! | `S`             | `['S', hash]`                       | Opaque preserved subtree — only valid where the parent junction already existed pre-round. |
+//! | `L`              | `['L']`                             | New leaf — consumer pops from sorted batch. |
+//! | `N`              | `['N', depth]`                      | Junction at depth. Two children precede (left, right). |
+//! | `O`              | `['O', depth, region, lh, rh]`      | Preserved junction, opened one level — required when it becomes the child of a junction created this round. |
+//! | `O_L`            | `['OL', key, value]`                | Preserved leaf, opened (same "new parent" trigger as `O`). |
 //!
-//! ## Verification (stack machine)
+//! ## Generation
 //!
-//! 1. Sort batch B by LSB-first traversal order (`get_sort_key`).
-//! 2. Scan tokens:
-//!    - `S(h)`: push `(h, h)`.
-//!    - `L`: pop `(k,v)` from sorted batch, push `(None, hash_leaf(k,v))`.
-//!    - `N(depth)`: pop right `(rh0,rh1)`, pop left `(lh0,lh1)`.
-//!      `h0 = resolve_pre_state(lh0, rh0, depth)`,
-//!      `h1 = hash_node(lh1, rh1, depth)`. Push `(h0, h1)`.
-//! 3. Accept iff streams exhausted, stack has one element = `(old_root, new_root)`.
+//! A post-order traversal of the touched part of the post-state tree, threading
+//! a `parent_new` flag through the recursion (mirrors the Yellowpaper's
+//! `rsmt6a` prototype): a subtree left untouched by this round's batch is
+//! emitted opaquely (`S`) if its parent junction already existed pre-round,
+//! or opened (`O` / `O_L`) if it has just become the child of a junction
+//! created this round (an edge split, including the leaf-merge case).
+//!
+//! ## Verification (region-aware stack machine)
+//!
+//! See `rsmt_verify::consistency::verify_consistency_with` for the full
+//! algorithm (stack of `(h_pre, h_post, advice)` triples, region derived from
+//! advised children at each `N`).
 //!
 //! ## Wire format (binary)
 //!
-//! [`consistency_proof_to_bytes`] encodes the proof as a flat byte slice:
-//!
-//! | Opcode | Bytes            | Size |
-//! |--------|------------------|------|
-//! | `S(h)` | `0x00` + `h[32]` | 33   |
-//! | `L`    | `0x01`           | 1    |
-//! | `N(d)` | `0x02` + `d`     | 2    |
+//! [`consistency_proof_to_bytes`] encodes the proof as a flat byte slice —
+//! see `rsmt_verify::consistency` for the per-opcode byte layout.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rsmt_verify::{SmtHasher, Sha256Hasher, get_sort_key, SmtKey};
 use rayon;
-use crate::path::{key_bit_at, CompressedPath, KEY_BITS};
+use rsmt_verify::{Sha256Hasher, SmtHasher, SmtKey};
+use crate::path::{key_bit_at, prefix_region, CompressedPath, KEY_BITS};
 use crate::tree::{SmtError, SparseMerkleTree};
 use crate::types::{branch_hash, make_leaf, make_node, Branch, NodeBranch};
 
@@ -94,46 +95,6 @@ pub fn batch_insert_with_proof_with<H: SmtHasher>(
     run_batch::<H>(tree, batch, true)
 }
 
-/// Legacy CBOR encoding — kept for callers that have not yet migrated.
-///
-/// Prefer [`consistency_proof_to_bytes`] for new deployments.
-pub fn consistency_proof_to_cbor(proof: &ConsistencyProof) -> Vec<u8> {
-    let mut out = cbor_array(proof.len());
-    for op in proof {
-        match op {
-            ProofOp::S(h) => {
-                out.extend_from_slice(&cbor_array(2));
-                out.push(0x00);
-                out.push(0x58);
-                out.push(32);
-                out.extend_from_slice(h);
-            }
-            ProofOp::L => {
-                out.extend_from_slice(&cbor_array(1));
-                out.push(0x01);
-            }
-            ProofOp::N(depth) => {
-                out.extend_from_slice(&cbor_array(2));
-                out.push(0x02);
-                out.push(0x18);
-                out.push(*depth);
-            }
-        }
-    }
-    out
-}
-
-fn cbor_array(len: usize) -> Vec<u8> {
-    if len < 24 {
-        vec![0x80 | len as u8]
-    } else if len < 256 {
-        vec![0x98, len as u8]
-    } else {
-        let n = len as u16;
-        vec![0x99, (n >> 8) as u8, n as u8]
-    }
-}
-
 // ─── Core algorithm ───────────────────────────────────────────────────────────
 
 fn run_batch<H: SmtHasher>(
@@ -160,15 +121,42 @@ fn run_batch<H: SmtHasher>(
         return Ok((vec![], vec![]));
     }
 
-    new_items.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
+    // RSMT v6a: plain key order is traversal order (rsmt_sort_key(k) = k).
+    new_items.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut proof = Vec::new();
     let old_root = tree.root.take();
     let proof_out = if with_proof { Some(&mut proof) } else { None };
-    let new_root = insert_proof::<H>(old_root, &new_items, 0, new_items.len(), 0, proof_out);
+    let new_root = insert_proof::<H>(old_root, &new_items, 0, new_items.len(), 0, false, proof_out);
     tree.root = new_root;
 
     Ok((new_items, proof))
+}
+
+// ─── emit_preserved ───────────────────────────────────────────────────────────
+
+/// A subtree untouched this round: opaque under a pre-existing junction,
+/// opened one level under a junction created this round (the split edge).
+fn emit_preserved(branch: &Branch, parent_new: bool, out: &mut Vec<ProofOp>) {
+    if !parent_new {
+        out.push(ProofOp::S(branch_hash(branch)));
+        return;
+    }
+    match branch {
+        Branch::Leaf(l) => out.push(ProofOp::OL {
+            key: l.key,
+            value: l.value.clone(),
+        }),
+        Branch::Node(n) => out.push(ProofOp::O {
+            depth: n.depth,
+            region: n.region,
+            left: branch_hash(&n.left),
+            right: branch_hash(&n.right),
+        }),
+        Branch::Stub(_) => {
+            panic!("emit_preserved: encountered Stub — materialize from disk first");
+        }
+    }
 }
 
 // ─── insert_proof ─────────────────────────────────────────────────────────────
@@ -179,6 +167,7 @@ fn insert_proof<H: SmtHasher>(
     start: usize,
     end: usize,
     start_bit: usize,
+    parent_new: bool,
     proof_out: Option<&mut Vec<ProofOp>>,
 ) -> Option<Arc<Branch>> {
     if start == end {
@@ -186,8 +175,8 @@ fn insert_proof<H: SmtHasher>(
             // node_opt is always Some here: internal nodes always have two
             // non-None children, and node_split_proof guarantees the
             // batch-only side is non-empty.
-            let h = branch_hash(node_opt.as_deref().expect("S(None) unreachable"));
-            p.push(ProofOp::S(h));
+            let branch = node_opt.as_deref().expect("preserved subtree unreachable");
+            emit_preserved(branch, parent_new, p);
         }
         return node_opt;
     }
@@ -209,12 +198,13 @@ fn insert_proof<H: SmtHasher>(
                 [(leaf.key, leaf.hash)].into_iter().collect();
             let mut mixed: Vec<(SmtKey, Vec<u8>)> = batch[start..end].to_vec();
             mixed.push((leaf.key, leaf.value));
-            mixed.sort_by(|a, b| get_sort_key(&a.0).cmp(&get_sort_key(&b.0)));
+            mixed.sort_by(|a, b| a.0.cmp(&b.0));
             Some(build_subtree::<H>(&mixed, 0, mixed.len(), start_bit, proof_out, &frozen))
         }
 
         Branch::Node(node) => {
             let n_path = node.path.path_len();
+            let region = node.region;
             let node_prefix_matches = |key: &SmtKey| -> usize {
                 first_divergence_in_prefix(&node.path, key, start_bit)
             };
@@ -240,12 +230,12 @@ fn insert_proof<H: SmtHasher>(
                         let left_arc  = node.left.clone();
                         let right_arc = node.right.clone();
                         rayon::join(
-                            || insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, None),
-                            || insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, None),
+                            || insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, false, None),
+                            || insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, false, None),
                         )
                     } else {
-                        let l = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, None);
-                        let r = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, None);
+                        let l = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, false, None);
+                        let r = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, false, None);
                         (l, r)
                     };
                     Some(make_node::<H>(
@@ -253,6 +243,7 @@ fn insert_proof<H: SmtHasher>(
                         new_left.expect("left child"),
                         new_right.expect("right child"),
                         split as u8,
+                        region,
                     ))
                 }
                 Some(p) => {
@@ -262,12 +253,12 @@ fn insert_proof<H: SmtHasher>(
                         let ((nl, lp), (nr, rp)) = rayon::join(
                             || {
                                 let mut lp = Vec::new();
-                                let nl = insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, Some(&mut lp));
+                                let nl = insert_proof::<H>(Some(left_arc),  batch, start, mid, split + 1, false, Some(&mut lp));
                                 (nl, lp)
                             },
                             || {
                                 let mut rp = Vec::new();
-                                let nr = insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, Some(&mut rp));
+                                let nr = insert_proof::<H>(Some(right_arc), batch, mid,   end, split + 1, false, Some(&mut rp));
                                 (nr, rp)
                             },
                         );
@@ -275,8 +266,8 @@ fn insert_proof<H: SmtHasher>(
                     } else {
                         let mut lp = Vec::new();
                         let mut rp = Vec::new();
-                        let nl = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, Some(&mut lp));
-                        let nr = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, Some(&mut rp));
+                        let nl = insert_proof::<H>(Some(node.left),  batch, start, mid, split + 1, false, Some(&mut lp));
+                        let nr = insert_proof::<H>(Some(node.right), batch, mid,   end, split + 1, false, Some(&mut rp));
                         (nl, nr, lp, rp)
                     };
                     p.extend(lp);
@@ -287,6 +278,7 @@ fn insert_proof<H: SmtHasher>(
                         new_left.expect("left child"),
                         new_right.expect("right child"),
                         split as u8,
+                        region,
                     ))
                 }
             }
@@ -313,8 +305,11 @@ fn build_subtree<H: SmtHasher>(
     if end - start == 1 {
         let (k, v) = &batch[start];
         if let Some(p) = proof_out {
-            if let Some(old_hash) = frozen.get(k) {
-                p.push(ProofOp::S(*old_hash));
+            if frozen.contains_key(k) {
+                // Every leaf `build_subtree` touches becomes a child of a
+                // freshly built junction, so a frozen (preserved) leaf must
+                // always be presented opened.
+                p.push(ProofOp::OL { key: *k, value: v.clone() });
             } else {
                 p.push(ProofOp::L);
             }
@@ -331,6 +326,7 @@ fn build_subtree<H: SmtHasher>(
 
     let n_common = split - start_bit;
     let cp = CompressedPath::from_key_range(&batch[start].0, start_bit, n_common);
+    let region = prefix_region(&batch[start].0, split);
 
     match proof_out {
         None => {
@@ -344,7 +340,7 @@ fn build_subtree<H: SmtHasher>(
                 let r = build_subtree::<H>(batch, mid,   end, split + 1, None, frozen);
                 (l, r)
             };
-            make_node::<H>(cp, ln, rn, split as u8)
+            make_node::<H>(cp, ln, rn, split as u8, region)
         }
         Some(p) => {
             let (ln, rn, lp, rp) = if end - start >= PAR_THRESHOLD {
@@ -371,7 +367,7 @@ fn build_subtree<H: SmtHasher>(
             p.extend(lp);
             p.extend(rp);
             p.push(ProofOp::N(split as u8));
-            make_node::<H>(cp, ln, rn, split as u8)
+            make_node::<H>(cp, ln, rn, split as u8, region)
         }
     }
 }
@@ -397,9 +393,12 @@ fn node_split_proof<H: SmtHasher>(
     node.hash = None;
     let lh = branch_hash(&node.left);
     let rh = branch_hash(&node.right);
-    node.hash = Some(H::hash_node(&lh, &rh, node.depth));
+    // node.depth and node.region are absolute properties of the preserved
+    // node and are unchanged by the split.
+    node.hash = Some(H::hash_node(&lh, &rh, node.depth, &node.region));
 
     let new_cp = CompressedPath::from_key_range(&batch[start].0, start_bit, n_common);
+    let new_region = prefix_region(&batch[start].0, new_split);
     let mid = partition_point(batch, start, end, new_split);
     let old_node: Option<Arc<Branch>> = Some(Arc::new(Branch::Node(node)));
 
@@ -409,23 +408,23 @@ fn node_split_proof<H: SmtHasher>(
                 if old_dir == 0 {
                     let old_node_r = old_node;
                     rayon::join(
-                        || insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, None),
-                        || insert_proof::<H>(None,       batch, mid,   end, new_split + 1, None),
+                        || insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, true, None),
+                        || insert_proof::<H>(None,       batch, mid,   end, new_split + 1, true, None),
                     )
                 } else {
                     let old_node_r = old_node;
                     rayon::join(
-                        || insert_proof::<H>(None,       batch, start, mid, new_split + 1, None),
-                        || insert_proof::<H>(old_node_r, batch, mid,   end, new_split + 1, None),
+                        || insert_proof::<H>(None,       batch, start, mid, new_split + 1, true, None),
+                        || insert_proof::<H>(old_node_r, batch, mid,   end, new_split + 1, true, None),
                     )
                 }
             } else if old_dir == 0 {
-                let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, None);
-                let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, None);
+                let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, true, None);
+                let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, true, None);
                 (nl, nr)
             } else {
-                let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, None);
-                let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, None);
+                let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, true, None);
+                let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, true, None);
                 (nl, nr)
             };
             make_node::<H>(
@@ -433,6 +432,7 @@ fn node_split_proof<H: SmtHasher>(
                 new_left.expect("left child"),
                 new_right.expect("right child"),
                 new_split as u8,
+                new_region,
             )
         }
         Some(p) => {
@@ -442,12 +442,12 @@ fn node_split_proof<H: SmtHasher>(
                     rayon::join(
                         || {
                             let mut lp = Vec::new();
-                            let nl = insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, Some(&mut lp));
+                            let nl = insert_proof::<H>(old_node_r, batch, start, mid, new_split + 1, true, Some(&mut lp));
                             (nl, lp)
                         },
                         || {
                             let mut rp = Vec::new();
-                            let nr = insert_proof::<H>(None, batch, mid, end, new_split + 1, Some(&mut rp));
+                            let nr = insert_proof::<H>(None, batch, mid, end, new_split + 1, true, Some(&mut rp));
                             (nr, rp)
                         },
                     )
@@ -456,12 +456,12 @@ fn node_split_proof<H: SmtHasher>(
                     rayon::join(
                         || {
                             let mut lp = Vec::new();
-                            let nl = insert_proof::<H>(None, batch, start, mid, new_split + 1, Some(&mut lp));
+                            let nl = insert_proof::<H>(None, batch, start, mid, new_split + 1, true, Some(&mut lp));
                             (nl, lp)
                         },
                         || {
                             let mut rp = Vec::new();
-                            let nr = insert_proof::<H>(old_node_r, batch, mid, end, new_split + 1, Some(&mut rp));
+                            let nr = insert_proof::<H>(old_node_r, batch, mid, end, new_split + 1, true, Some(&mut rp));
                             (nr, rp)
                         },
                     )
@@ -471,12 +471,12 @@ fn node_split_proof<H: SmtHasher>(
                 let mut lp = Vec::new();
                 let mut rp = Vec::new();
                 let (nl, nr) = if old_dir == 0 {
-                    let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, Some(&mut lp));
-                    let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, Some(&mut rp));
+                    let nl = insert_proof::<H>(old_node, batch, start, mid, new_split + 1, true, Some(&mut lp));
+                    let nr = insert_proof::<H>(None,     batch, mid,   end, new_split + 1, true, Some(&mut rp));
                     (nl, nr)
                 } else {
-                    let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, Some(&mut lp));
-                    let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, Some(&mut rp));
+                    let nl = insert_proof::<H>(None,     batch, start, mid, new_split + 1, true, Some(&mut lp));
+                    let nr = insert_proof::<H>(old_node, batch, mid,   end, new_split + 1, true, Some(&mut rp));
                     (nl, nr)
                 };
                 (nl, nr, lp, rp)
@@ -489,6 +489,7 @@ fn node_split_proof<H: SmtHasher>(
                 new_left.expect("left child"),
                 new_right.expect("right child"),
                 new_split as u8,
+                new_region,
             )
         }
     }
@@ -503,18 +504,21 @@ fn xor_keys(a: &SmtKey, b: &SmtKey) -> SmtKey {
     out
 }
 
+/// First set bit at or after `start_bit`, in MSB-first bit order (bit 0 =
+/// MSB of byte 0). Fast-path equivalent of scanning `key_bit_at` upward.
 fn first_set_bit_from(key: &SmtKey, start_bit: usize) -> usize {
     let byte_idx = start_bit / 8;
     let bit_off  = start_bit % 8;
     if byte_idx < 32 {
-        let masked = key[byte_idx] >> bit_off;
+        // Keep only bits at MSB-first offsets >= bit_off within this byte.
+        let masked = key[byte_idx] & (0xffu8 >> bit_off);
         if masked != 0 {
-            return start_bit + masked.trailing_zeros() as usize;
+            return byte_idx * 8 + masked.leading_zeros() as usize;
         }
     }
     for i in (byte_idx + 1)..32 {
         if key[i] != 0 {
-            return i * 8 + key[i].trailing_zeros() as usize;
+            return i * 8 + key[i].leading_zeros() as usize;
         }
     }
     KEY_BITS
@@ -576,7 +580,7 @@ mod tests {
         let mut tree = SparseMerkleTree::new();
         check::<H>(&mut tree, vec![(make_key(1), vec![1;32]), (make_key(2), vec![2;32])], "two");
 
-        // border leaf
+        // border leaf: edge split, exercises O/OL emission
         let mut tree = SparseMerkleTree::new();
         tree.add_leaf_with::<H>(make_key(1), vec![1;32]).unwrap();
         check::<H>(&mut tree, vec![(make_key(3), vec![3;32])], "border_leaf");
@@ -638,48 +642,66 @@ mod tests {
         assert!(verify_consistency_with::<H>(&proof, old, new, &items));
     }
 
+    /// A single existing leaf, split by one new leaf, must emit `OL` (opened),
+    /// never opaque `S`, for the preserved leaf.
+    #[test]
+    fn border_leaf_emits_ol_not_s() {
+        let mut tree = SparseMerkleTree::new();
+        tree.add_leaf_with::<Sha256Hasher>(make_key(1), vec![1; 32]).unwrap();
+        let old = tree.root_hash();
+        let (items, proof) = batch_insert_with_proof_with::<Sha256Hasher>(
+            &mut tree,
+            &[(make_key(3), vec![3; 32])],
+        ).unwrap();
+        let new = tree.root_hash();
+        assert!(verify_consistency_with::<Sha256Hasher>(&proof, old, new, &items));
+        assert!(
+            proof.iter().any(|op| matches!(op, ProofOp::OL { .. })),
+            "expected an OL opcode for the preserved leaf under the new split junction: {proof:?}"
+        );
+        assert!(
+            !proof.iter().any(|op| matches!(op, ProofOp::S(_))),
+            "no opaque S should appear when the only preserved subtree sits under a new edge: {proof:?}"
+        );
+    }
+
+    /// Round 1 builds an internal NodeBranch (two leaves diverging at bit 4,
+    /// sharing prefix bits 0..3 = "0000"). Round 2 inserts a key that
+    /// diverges from that shared prefix at bit 2 — *before* the existing
+    /// node's own depth — forcing a new junction above it and requiring the
+    /// preserved NodeBranch to be presented opened via `O`.
+    #[test]
+    fn deep_split_emits_o_opcode() {
+        let mut tree = SparseMerkleTree::new();
+        let mut key_a = [0u8; 32];
+        key_a[0] = 0b0000_0000; // bits 0..3 = 0000, bit 4 = 0
+        let mut key_b = [0u8; 32];
+        key_b[0] = 0b0000_1000; // bits 0..3 = 0000, bit 4 = 1
+        batch_insert_with::<Sha256Hasher>(
+            &mut tree,
+            &[(key_a, vec![1; 4]), (key_b, vec![2; 4])],
+        ).unwrap();
+
+        let old = tree.root_hash();
+        let mut key_c = [0u8; 32];
+        key_c[0] = 0b0010_0000; // bits 0..1 = 00, bit 2 = 1: diverges before depth 4
+        let batch = vec![(key_c, vec![0xEE; 4])];
+        let (items, proof) = batch_insert_with_proof_with::<Sha256Hasher>(&mut tree, &batch).unwrap();
+        let new = tree.root_hash();
+        assert!(verify_consistency_with::<Sha256Hasher>(&proof, old, new, &items));
+        assert!(
+            proof.iter().any(|op| matches!(op, ProofOp::O { .. })),
+            "expected an O opcode opening the preserved subtree under the new split junction: {proof:?}"
+        );
+    }
+
     /// Parse an `aggregator_rsmt_v1` envelope back into (leaves, proof) and
     /// run it through `verify_consistency`. This is the Rust-side mirror of
     /// the Go `rsmt.Verify` path and locks the wire format in place.
     fn decode_envelope_v1(
         bytes: &[u8],
     ) -> (Vec<(SmtKey, Vec<u8>)>, ConsistencyProof) {
-        assert!(bytes.len() >= 4, "envelope too short");
-        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let mut pos = 4;
-        let mut leaves = Vec::with_capacity(count);
-        for _ in 0..count {
-            assert!(pos + 32 + 2 <= bytes.len());
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes[pos..pos + 32]);
-            pos += 32;
-            let vlen = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-            pos += 2;
-            assert!(pos + vlen <= bytes.len());
-            let v = bytes[pos..pos + vlen].to_vec();
-            pos += vlen;
-            leaves.push((k, v));
-        }
-        let mut proof = Vec::new();
-        while pos < bytes.len() {
-            match bytes[pos] {
-                0x00 => {
-                    assert!(pos + 33 <= bytes.len());
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&bytes[pos + 1..pos + 33]);
-                    proof.push(ProofOp::S(h));
-                    pos += 33;
-                }
-                0x01 => { proof.push(ProofOp::L); pos += 1; }
-                0x02 => {
-                    assert!(pos + 2 <= bytes.len());
-                    proof.push(ProofOp::N(bytes[pos + 1]));
-                    pos += 2;
-                }
-                op => panic!("bad opcode 0x{op:02x}"),
-            }
-        }
-        (leaves, proof)
+        rsmt_verify::decode_aggregator_envelope_v1(bytes).expect("valid envelope")
     }
 
     #[test]
@@ -717,8 +739,8 @@ mod tests {
         let mut tree = SparseMerkleTree::new();
         let batch: Vec<_> = (1u8..=8).map(|i| (make_key(i ^ 0xA5), vec![i])).collect();
         let (items, proof) = batch_insert_with_proof_with::<Sha256Hasher>(&mut tree, &batch).unwrap();
-        // items is guaranteed sorted by consistency.rs:275; encoder's
-        // debug_assert! verifies this — if it trips, we have a regression.
+        // items is guaranteed sorted by consistency.rs; encoder's debug_assert!
+        // verifies this — if it trips, we have a regression.
         let _ = encode_aggregator_envelope_v1(&items, &proof);
     }
 
@@ -730,10 +752,6 @@ mod tests {
 
     #[test]
     fn blake2b_suite() { run_suite::<Blake2bHasher>(); }
-
-
-
-
 
     fn lcg_key(seed: &mut u64) -> SmtKey {
         let mut key = [0u8; 32];

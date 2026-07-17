@@ -104,7 +104,7 @@ fn materialize_inner(
     if root_node.hash.is_none() {
         let lh = branch_hash(&root_node.left);
         let rh = branch_hash(&root_node.right);
-        root_node.hash = Some(rsmt::hash_node(&lh, &rh, root_node.depth));
+        root_node.hash = Some(rsmt::hash_node(&lh, &rh, root_node.depth, &root_node.region));
     }
 
     let mut tree = SparseMerkleTree::new();
@@ -184,7 +184,7 @@ fn materialize_subtree(
     if node.hash.is_none() {
         let lh = branch_hash(&node.left);
         let rh = branch_hash(&node.right);
-        node.hash = Some(rsmt::hash_node(&lh, &rh, node.depth));
+        node.hash = Some(rsmt::hash_node(&lh, &rh, node.depth, &node.region));
     }
     Ok(Arc::new(Branch::Node(node)))
 }

@@ -6,8 +6,12 @@
 //!
 //! Encoding: `[depth_lo, depth_hi, prefix_bytes...]`
 //! - `depth` (u16, little-endian): number of bits in the prefix
-//! - `prefix_bytes`: `ceil(depth/8)` bytes, LSB of bit-0 is in byte 0 bit 0
-//!   (matches `key_bit_at` from rsmt::path)
+//! - `prefix_bytes`: `ceil(depth/8)` bytes, packed LSB-first (`prefix_set_bit`/
+//!   `prefix_get_bit` below): bit `i` lives in byte `i/8` at bit `i%8`. This
+//!   is a private on-disk addressing convention — it is never compared
+//!   byte-for-byte against a raw `SmtKey`, only bit-value-by-bit-value against
+//!   `CompressedPath::bit_at` (RSMT v6a MSB-first) via `prefix_copy_path`, so
+//!   it does not need to match `key_bit_at`'s bit order to stay correct.
 //!
 //! Root is a special sentinel: `[0xFF, 0xFF]` (depth = u16::MAX).
 
@@ -34,8 +38,9 @@ impl NodeKey {
     /// `depth` = number of routing bits accumulated from root (exclusive of
     /// root itself, which uses `NodeKey::root()`).
     ///
-    /// `prefix` = bit array where bit `i` (LSB-first) is the routing decision
-    /// at tree-depth `i`. Bits at positions >= `depth` are ignored.
+    /// `prefix` = bit array where bit `i`, in this accumulator's own
+    /// LSB-first packing (see module docs), is the routing decision at
+    /// tree-depth `i`. Bits at positions >= `depth` are ignored.
     pub fn from_depth_and_prefix(depth: usize, prefix: &PrefixBits) -> Self {
         let byte_count = (depth + 7) / 8;
         let mut out = Vec::with_capacity(2 + byte_count);
@@ -100,7 +105,7 @@ mod tests {
 
     #[test]
     fn distinct_left_right_depth1() {
-        let mut left_p = [0u8; 32];
+        let left_p = [0u8; 32];
         let mut right_p = [0u8; 32];
         right_p[0] = 1; // bit 0 = 1
         let left = NodeKey::from_depth_and_prefix(1, &left_p);

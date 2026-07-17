@@ -395,26 +395,31 @@ See [README-ZK.md](README-ZK.md) for full build and configuration instructions f
 **What it proves:** Let `h₀` be the root certified in the last UC and `h₁` be the root in the current Certification Request. The proof witnesses the exact set of (key, value) leaves appended to the tree going from `h₀` to `h₁`. A verifier can replay the proof to independently compute both `h₀` and `h₁` and confirm they match the Input Record hashes in consecutive UCs.
 
 
-**How:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat **post-order** opcode sequence (`ProofOp`):
+**How:** The round manager calls `batch_insert_with_proof` (in `crates/rsmt/src/consistency.rs`) instead of the plain `batch_insert`. This performs the same tree mutation in one pass while recording a flat **post-order** opcode sequence (`ProofOp`), per the RSMT v6a format (Unicity Yellowpaper, Appendix "Radix Sparse Merkle Trees" §Consistency Proof):
 
-| Opcode | CBOR encoding | Meaning |
+| Opcode | Wire encoding | Meaning |
 |--------|---------------|---------|
-| `S(h)` | `[0, bytes\|null]` | Unchanged subtree — hash, or `null` for empty |
-| `L`    | `[1]`         | New leaf — key/value consumed from sorted batch |
-| `N(d)` | `[2, depth]`  | Internal node at depth `d`; two children precede it on the stack |
+| `S(h)` | `0x00 ‖ h[32]` | Opaque preserved subtree — only valid where the parent junction already existed pre-round |
+| `L`    | `0x01` | New leaf — key/value consumed from sorted batch |
+| `N(d)` | `0x02 ‖ d` | Junction at depth `d`; two children precede it on the stack |
+| `O(d,p,hL,hR)` | `0x03 ‖ d ‖ p[32] ‖ hL[32] ‖ hR[32]` | Preserved junction, opened one level — required when it becomes the child of a junction created this round |
+| `O_L(k,v)` | `0x04 ‖ k[32] ‖ len(v) ‖ v` | Preserved leaf, opened (same "new parent" trigger as `O`) |
 
-The stream is **post-order** (left subtree, right subtree, then node), matching the tree's LSB-first traversal order. Only three opcodes are needed because nodes carry no path data — the verifier reconstructs hashes bottom-up using only the leaf values and the depth at each node.
+The stream is **post-order** (left subtree, right subtree, then node), matching the tree's lexicographic traversal order. An opaque `S` is only valid where its parent junction pre-existed; wherever a preserved subtree becomes the child of a junction created this round (an edge split, including the leaf-merge case), it must be presented opened as `O`/`O_L` so the verifier can check the new edge against the child's authenticated depth and region.
+
+Every internal-node hash commits to its absolute bifurcation depth and region (the key prefix shared by all descendant keys, packed into 32 bytes): `hash_node(left, right, depth, region) = H(0x01 ‖ depth ‖ region ‖ left ‖ right)`. This binds every node to its position in the key space, which is what lets the verifier check `O`/`O_L` openings against a newly created edge.
 
 **Verification** is a stack machine (in `verify_consistency`):
 
-1. Sort the batch by LSB-first key order (`get_sort_key`).
-2. Scan opcodes left to right, maintaining a stack of `(pre_hash, post_hash)` pairs:
-   - `S(h)`: push `(h, h)` — unchanged subtree, same hash in both states.
-   - `L`: pop `(key, value)` from the sorted batch, push `(None, hash_leaf(key, value))`.
-   - `N(depth)`: pop right `(rh₀, rh₁)`, pop left `(lh₀, lh₁)`. Resolve pre-state: if both children existed, `h₀ = hash_node(lh₀, rh₀, depth)`; if only one, propagate that child's hash (new junction). Compute `h₁ = hash_node(lh₁, rh₁, depth)`. Push `(h₀, h₁)`.
-3. Accept iff the stream is exhausted, the batch is consumed, and the stack contains exactly one element `(old_root, new_root)`.
+1. Sort the batch by plain key order.
+2. Scan opcodes left to right, maintaining a stack of `(pre_hash, post_hash, advice)` triples, where `advice` is the `(depth, region)` of the subtree's top node (`None` for opaque `S`):
+   - `S(h)`: push `(h, h, None)`.
+   - `O(d,p,hL,hR)` / `O_L(k,v)`: recompute the hash from the opened preimage, push `(h, h, Some((d, p)))` (`(256, k)` for a leaf).
+   - `L`: pop `(key, value)` from the sorted batch, push `(None, hash_leaf(key, value), Some((256, key)))`.
+   - `N(depth)`: pop right and left triples. Derive the junction's region from whichever child(ren) carry advice (they must agree; at least one is required). If the junction is absent pre-state (either child's pre-hash is `None`), *both* children must carry advice — an opaque `S` may never attach to a newly created edge. Resolve pre-state (`None`/`None` → `None`; one `None` → pass through the other; both present → `hash_node`); post-state is always `hash_node(l1, r1, depth, region)`. Push the result.
+3. Accept iff the stream is exhausted, the batch is consumed, and the stack contains exactly one element whose `(pre_hash, post_hash)` equals `(old_root, new_root)`.
 
-The opcode stream is CBOR-encoded and attached to the CR as the `zk_proof` field. BFT Core validators run `verify_consistency` before including the round in the certified ledger.
+The opcode stream is binary-encoded (`consistency_proof_to_bytes`) and attached to the CR as the `zk_proof` field. BFT Core validators run `verify_consistency` before including the round in the certified ledger.
 
 ### Configurable hash function
 
@@ -460,7 +465,7 @@ The `SmtHasher` trait is:
 ```rust
 pub trait SmtHasher: Copy + 'static {
     fn hash_leaf(key: &SmtKey, value: &[u8]) -> [u8; 32];
-    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8) -> [u8; 32];
+    fn hash_node(left: &[u8; 32], right: &[u8; 32], depth: u8, region: &[u8; 32]) -> [u8; 32];
 }
 ```
 
