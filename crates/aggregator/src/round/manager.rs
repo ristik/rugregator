@@ -20,7 +20,11 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use super::state::ProcessedRecord;
-use crate::api::cbor::CertDataFields;
+use crate::api::cbor::{
+    decode_cbor_value, unicity_certificate_state_root, CertDataFields, INPUT_RECORD_TAG,
+    SHARD_TREE_CERTIFICATE_TAG, UNICITY_CERTIFICATE_TAG, UNICITY_SEAL_TAG,
+    UNICITY_TREE_CERTIFICATE_TAG,
+};
 use crate::config::{ConsistencyProofMode, RoundConfig};
 use crate::smt::state_id_to_smt_key;
 use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord, PendingRound, WalRecord, WalStore};
@@ -262,7 +266,7 @@ fn stub_generate_uc(
     };
 
     let input_record_inner = cbor_array(&[
-        &cbor_uint(0),
+        &cbor_uint(1),
         &cbor_uint(block_number),
         &cbor_uint(0),
         &cbor_null(),
@@ -273,7 +277,7 @@ fn stub_generate_uc(
         &cbor_uint(0),
         &cbor_null(),
     ]);
-    let input_record_cbor = cbor_tag(1008, &input_record_inner);
+    let input_record_cbor = cbor_tag(INPUT_RECORD_TAG, &input_record_inner);
 
     let shard_config = [0u8; 32];
 
@@ -291,8 +295,8 @@ fn stub_generate_uc(
     let seal_hash_value: [u8; 32] = sha256(&seal_hash_preimage);
 
     let seal_no_sigs_inner = cbor_array(&[
-        &cbor_uint(0),
-        &cbor_uint(0),
+        &cbor_uint(1),
+        &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
         &cbor_uint(block_number),
         &cbor_uint(0),
         &cbor_uint(0),
@@ -300,7 +304,7 @@ fn stub_generate_uc(
         &cbor_bytes(&seal_hash_value),
         &cbor_null(),
     ]);
-    let seal_no_sigs_cbor = cbor_tag(1001, &seal_no_sigs_inner);
+    let seal_no_sigs_cbor = cbor_tag(UNICITY_SEAL_TAG, &seal_no_sigs_inner);
 
     let actual_seal_hash: [u8; 32] = sha256(&seal_no_sigs_cbor);
 
@@ -314,8 +318,8 @@ fn stub_generate_uc(
 
     let sig_map = cbor_map1(&cbor_text(node_id), &cbor_bytes(&sig_bytes));
     let seal_inner = cbor_array(&[
-        &cbor_uint(0),
-        &cbor_uint(0),
+        &cbor_uint(1),
+        &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
         &cbor_uint(block_number),
         &cbor_uint(0),
         &cbor_uint(0),
@@ -323,15 +327,20 @@ fn stub_generate_uc(
         &cbor_bytes(&seal_hash_value),
         &sig_map,
     ]);
-    let seal_cbor = cbor_tag(1001, &seal_inner);
+    let seal_cbor = cbor_tag(UNICITY_SEAL_TAG, &seal_inner);
 
-    let shard_tree_cert = cbor_array(&[&cbor_bytes(&[]), &cbor_array(&[])]);
+    let shard_tree_inner = cbor_array(&[
+        &cbor_uint(1),
+        &cbor_bytes(&[0x80]), // canonical empty ShardId end-marker encoding
+        &cbor_array(&[]),
+    ]);
+    let shard_tree_cert = cbor_tag(SHARD_TREE_CERTIFICATE_TAG, &shard_tree_inner);
 
-    let utc_inner = cbor_array(&[&cbor_uint(0), &cbor_uint(0), &cbor_array(&[])]);
-    let unicity_tree_cert = cbor_tag(1014, &utc_inner);
+    let utc_inner = cbor_array(&[&cbor_uint(1), &cbor_uint(0), &cbor_array(&[])]);
+    let unicity_tree_cert = cbor_tag(UNICITY_TREE_CERTIFICATE_TAG, &utc_inner);
 
     let uc_inner = cbor_array(&[
-        &cbor_uint(0),
+        &cbor_uint(1),
         &input_record_cbor,
         &cbor_null(),
         &cbor_bytes(&shard_config),
@@ -339,7 +348,7 @@ fn stub_generate_uc(
         &unicity_tree_cert,
         &seal_cbor,
     ]);
-    cbor_tag(1007, &uc_inner)
+    cbor_tag(UNICITY_CERTIFICATE_TAG, &uc_inner)
 }
 
 // ─── ProvingRoundData ─────────────────────────────────────────────────────────
@@ -1389,6 +1398,21 @@ impl<S: SmtStore> RoundManager<S> {
             }
         };
 
+        // The certificate encoding determines both the shard-root hash and the
+        // validator signing preimage. Enforce the one canonical profile before
+        // mutating or persisting the certified SMT state, regardless of which
+        // BftCommitter implementation supplied it.
+        let proposed_root = inf.new_root;
+        let uc_result = uc_result.and_then(|uc_cbor| {
+            let value = decode_cbor_value(&uc_cbor)?;
+            let certified_root = unicity_certificate_state_root(&value)?;
+            anyhow::ensure!(
+                certified_root == proposed_root,
+                "Unicity Certificate root does not match the proposed SMT root"
+            );
+            Ok(uc_cbor)
+        });
+
         match uc_result {
             Ok(uc_cbor) => {
                 // Commit the proposed snapshot.
@@ -1582,5 +1606,24 @@ impl<S: SmtStore> RoundManager<S> {
             });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_certificate_uses_the_canonical_profile() {
+        let encoded = stub_generate_uc(7, Some(&[0x77; 32]), [7; 32], "NODE");
+        let value = decode_cbor_value(&encoded).unwrap();
+        assert_eq!(
+            unicity_certificate_state_root(&value).unwrap(),
+            Some([0x77; 32])
+        );
+        assert!(matches!(
+            value,
+            ciborium::Value::Tag(UNICITY_CERTIFICATE_TAG, _)
+        ));
     }
 }

@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
 use super::{BftCommitter, CertRejection, CertStatus};
+use crate::api::cbor::{validate_unicity_certificate_value, INPUT_RECORD_TAG};
 
 // ─── Wire types ───────────────────────────────────────────────────────────────
 
@@ -156,7 +157,6 @@ struct PendingCert {
 const PROTO_CERT: &str = "/ab/block-certification/0.0.1";
 const PROTO_UC: &str = "/ab/certificates/0.0.1";
 const PROTO_HS: &str = "/ab/handshake/0.0.1";
-const TAG_INPUT_RECORD: u64 = 1008;
 
 /// Data for a cert request, sans round/epoch (filled in at transmission time).
 struct CertReqData {
@@ -451,7 +451,7 @@ fn cbor_cert_req(req: &BlockCertReq) -> anyhow::Result<Vec<u8>> {
     if let ciborium::value::Value::Array(ref mut arr) = val {
         if arr.len() >= 4 {
             let ir = arr[3].clone();
-            arr[3] = ciborium::value::Value::Tag(TAG_INPUT_RECORD, Box::new(ir));
+            arr[3] = ciborium::value::Value::Tag(INPUT_RECORD_TAG, Box::new(ir));
         }
     }
     let mut out = Vec::new();
@@ -498,6 +498,11 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
     };
     if arr.len() < 4 {
         error!("UC array too short");
+        return None;
+    }
+
+    if let Err(err) = validate_unicity_certificate_value(&arr[3]) {
+        warn!(%err, "UC does not use the canonical certificate profile");
         return None;
     }
 
@@ -988,5 +993,45 @@ async fn network_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certification_request_uses_the_canonical_input_record_tag() {
+        let request = BlockCertReq {
+            partition_id: 1,
+            shard_id: vec![0x80],
+            node_id: "NODE".into(),
+            input_record: InputRecord {
+                version: 1,
+                round_number: 2,
+                epoch: 0,
+                previous_hash: None,
+                hash: Some(vec![0x11; 32]),
+                summary_value: Some(vec![]),
+                timestamp: 3,
+                block_hash: Some(vec![0x11; 32]),
+                sum_of_earned_fees: 0,
+                et_hash: None,
+            },
+            zk_proof: None,
+            block_size: 1,
+            state_size: 1,
+            signature: None,
+        };
+
+        let encoded = cbor_cert_req(&request).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let ciborium::Value::Array(fields) = value else {
+            panic!("certification request must be an array")
+        };
+        assert!(matches!(
+            fields.get(3),
+            Some(ciborium::Value::Tag(INPUT_RECORD_TAG, _))
+        ));
     }
 }
