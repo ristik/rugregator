@@ -27,10 +27,20 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     pub fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
-        Self { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
+        Self {
+            jsonrpc: "2.0".into(),
+            result: Some(result),
+            error: None,
+            id,
+        }
     }
     pub fn error(id: serde_json::Value, err: JsonRpcError) -> Self {
-        Self { jsonrpc: "2.0".into(), result: None, error: Some(err), id }
+        Self {
+            jsonrpc: "2.0".into(),
+            result: None,
+            error: Some(err),
+            id,
+        }
     }
 }
 
@@ -50,12 +60,27 @@ impl JsonRpcError {
     pub const INTERNAL_ERROR: i32 = -32603;
     /// Application-level "not found" — maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32001;
+    /// The requested state is already in the certified tree, so the requested
+    /// non-inclusion relation is false.
+    pub const STATE_INCLUDED: i32 = -32002;
+    /// A known certification request has not reached a certified block yet.
+    pub const INCLUSION_PENDING: i32 = -32003;
+    /// The bounded proof service has no free admission slot.
+    pub const SERVER_BUSY: i32 = -32004;
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self { code: Self::INVALID_PARAMS, message: msg.into(), data: None }
+        Self {
+            code: Self::INVALID_PARAMS,
+            message: msg.into(),
+            data: None,
+        }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { code: Self::INTERNAL_ERROR, message: msg.into(), data: None }
+        Self {
+            code: Self::INTERNAL_ERROR,
+            message: msg.into(),
+            data: None,
+        }
     }
     pub fn method_not_found(method: &str) -> Self {
         Self {
@@ -65,9 +90,39 @@ impl JsonRpcError {
         }
     }
     pub fn not_found() -> Self {
-        Self { code: Self::NOT_FOUND, message: "not found".into(), data: None }
+        Self {
+            code: Self::NOT_FOUND,
+            message: "not found".into(),
+            data: None,
+        }
     }
-    pub fn is_not_found(&self) -> bool { self.code == Self::NOT_FOUND }
+    pub fn state_included() -> Self {
+        Self {
+            code: Self::STATE_INCLUDED,
+            message: "state is already included".into(),
+            data: None,
+        }
+    }
+    pub fn inclusion_pending() -> Self {
+        Self {
+            code: Self::INCLUSION_PENDING,
+            message: "certification is pending".into(),
+            data: None,
+        }
+    }
+    pub fn server_busy() -> Self {
+        Self {
+            code: Self::SERVER_BUSY,
+            message: "proof service is busy".into(),
+            data: None,
+        }
+    }
+    pub fn is_not_found(&self) -> bool {
+        self.code == Self::NOT_FOUND
+    }
+    pub fn is_server_busy(&self) -> bool {
+        self.code == Self::SERVER_BUSY
+    }
 }
 
 // ─── certification_request ────────────────────────────────────────────────────
@@ -79,8 +134,14 @@ pub struct CertificationResponse {
 }
 
 impl CertificationResponse {
-    pub fn success() -> Self { Self { status: "SUCCESS".into() } }
-    pub fn failure(msg: &str) -> Self { Self { status: msg.into() } }
+    pub fn success() -> Self {
+        Self {
+            status: "SUCCESS".into(),
+        }
+    }
+    pub fn failure(msg: &str) -> Self {
+        Self { status: msg.into() }
+    }
 }
 
 // ─── get_inclusion_proof.v2 ───────────────────────────────────────────────────
@@ -90,6 +151,16 @@ impl CertificationResponse {
 pub struct GetInclusionProofParams {
     #[serde(rename = "stateId")]
     pub state_id: String, // hex-encoded state ID
+}
+
+// ─── get_non_inclusion_proof.v1 ─────────────────────────────────────────────
+
+/// Params for `get_non_inclusion_proof.v1`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetNonInclusionProofParams {
+    #[serde(rename = "stateId")]
+    pub state_id: String,
 }
 
 // ─── get_block_height ─────────────────────────────────────────────────────────

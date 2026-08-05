@@ -4,7 +4,7 @@ pub mod traits;
 
 pub use disk::{DiskSmt, DiskSmtSnapshot};
 pub use mem::{MemSmt, MemSmtSnapshot, PersistMode};
-pub use traits::{SmtStore, SmtStoreSnapshot};
+pub use traits::{CertifiedSmtSnapshot, SmtStore, SmtStoreSnapshot, CERTIFIED_PROOF_MAX_IN_FLIGHT};
 
 /// Count persisted leaves in a RocksDB instance, regardless of which backend
 /// wrote the data.
@@ -14,8 +14,8 @@ pub use traits::{SmtStore, SmtStoreSnapshot};
 /// - `disk` does not write to `CF_SMT_LEAVES`; instead its leaves are stored as
 ///   TAG_LEAF entries inside `CF_SMT_NODES` (counted by scanning that CF).
 pub fn count_db_leaves(db: &rocksdb::DB) -> usize {
-    use rsmt::node_serde::TAG_LEAF;
     use disk::materializer::CF_SMT_NODES;
+    use rsmt::node_serde::TAG_LEAF;
 
     // mem-leaves / mem-full path.
     if let Some(cf) = db.cf_handle(mem::CF_SMT_LEAVES) {
@@ -27,7 +27,8 @@ pub fn count_db_leaves(db: &rocksdb::DB) -> usize {
 
     // disk path: count TAG_LEAF entries in CF_SMT_NODES.
     if let Some(cf) = db.cf_handle(CF_SMT_NODES) {
-        return db.iterator_cf(&cf, rocksdb::IteratorMode::Start)
+        return db
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start)
             .filter(|item| {
                 item.as_ref()
                     .map(|(_, v)| v.first() == Some(&TAG_LEAF))

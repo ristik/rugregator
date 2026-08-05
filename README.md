@@ -1,6 +1,6 @@
 # Unicity Aggregator — Rust
 
-An experimental aggregation node for the [Unicity](https://unicity.network) network. Accepts client transaction certification requests, batches them into rounds, proposes each round's state transition to BFT Core for certification, and returns verifiable inclusion proofs backed by a Radix / Sparse Merkle Tree (SMT).
+An experimental aggregation node for the [Unicity](https://unicity.network) network. Accepts client transaction certification requests, batches them into rounds, proposes each round's state transition to BFT Core for certification, and returns verifiable inclusion and non-inclusion proofs backed by a Radix / Sparse Merkle Tree (SMT).
 
 Focus areas:
 - SMT structure providing efficient consistency proofs for trustless operation
@@ -32,7 +32,8 @@ clients  ──POST /──>  JSON-RPC server  ──mpsc──>  RoundManager<S
 2. `certification_request` — hex-CBOR payload → predicate + signature + StateID validation → queued in `RoundManager` via `mpsc`
 3. `RoundManager` — collects requests, fires a round on a timer (default 1 s) or batch-size limit; creates an SMT snapshot, inserts leaves, proposes root hash to BFT Core, awaits the Unicity Certificate (UC)
 4. On UC success — commits snapshot, stores finalized records; on UC failure — discards snapshot, re-queues requests
-5. `get_inclusion_proof.v2` — returns `[blockNumber, [certData, merklePathCbor, ucCbor]]` from the certified SMT
+5. `get_inclusion_proof.v2` — returns `[blockNumber, InclusionProof]` from the certified SMT
+6. `get_non_inclusion_proof.v1` — proves a StateID absent from the latest certified SMT root
 
 **Speculative execution:** while waiting for the UC (~1.5 s), the next block's requests are inserted speculatively into a forked snapshot. On UC success the speculative snapshot is immediately promoted, eliminating dead time between rounds. On UC failure both snapshots are discarded and all requests are re-queued. The disk-backed path additionally uses a layered overlay so the speculative snapshot can read the proposed round's uncommitted mutations without any RocksDB writes.
 
@@ -212,7 +213,11 @@ Submit a state transition for certification.
 {"jsonrpc":"2.0","id":1,"method":"certification_request","params":"<hex-encoded CBOR>"}
 ```
 
-Response (success): `{"jsonrpc":"2.0","id":1,"result":{"status":"OK"}}`
+The payload uses the canonical SDK schema: tag 39030 over
+`[1, stateId, certificationData, 0]`, with tag-39031 certification data and a
+tag-39032 predicate. Untagged predecessor formats are rejected.
+
+Response (success): `{"jsonrpc":"2.0","id":1,"result":{"status":"SUCCESS"}}`
 
 ### `get_inclusion_proof.v2`
 
@@ -222,13 +227,40 @@ Retrieve a certified inclusion proof.
 {"jsonrpc":"2.0","id":2,"method":"get_inclusion_proof.v2","params":{"stateId":"<hex>"}}
 ```
 
-Returns a hex-encoded CBOR value: `[blockNumber, [certData, merklePathCbor, ucCbor]]`.
-Returns HTTP 404 while the state is pending certification (SDK retries automatically).
+Returns hex-encoded CBOR `[blockNumber, InclusionProof]`. `InclusionProof` is
+tag 39033 over `[1, certificationData, inclusionCertificate, UC]`.
+An accepted request that is still being certified returns JSON-RPC error
+`-32003`; clients may poll only that status. An unknown StateID returns HTTP
+404 immediately.
+
+### `get_non_inclusion_proof.v1`
+
+Retrieve a proof that a StateID is absent from the latest certified root.
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"get_non_inclusion_proof.v1","params":{"stateId":"<64 hex characters>"}}
+```
+
+The result is hex-encoded CBOR `[blockNumber, NonInclusionProof]`, where
+`NonInclusionProof` is tag 39034 over `[1, nonInclusionCertificate, UC]`.
+Both endpoints require the same canonical tag-39001 Unicity Certificate profile;
+alternative certificate tags are rejected before a round is finalized.
+The certificate authenticates the different terminal leaf reached by the
+requested StateID; for a certified empty tree it is the empty byte string.
+
+At commit, the round manager pins an immutable backend view (a RocksDB snapshot
+for `DiskSmt`) and atomically publishes it with `(blockNumber, root, UC)`. A
+separate bounded worker generates paths from that view, so client proof reads do
+not run on the block-production task and cannot pair a path with another root's
+UC. The service returns JSON-RPC error `-32002` if the StateID is present, HTTP
+404 if no certified root exists, and HTTP 429 when all proof slots are occupied.
+The result is a point-in-time statement at the returned root, not a promise that
+the StateID remains absent from later blocks.
 
 ### `get_block_height`
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"get_block_height","params":null}
+{"jsonrpc":"2.0","id":4,"method":"get_block_height","params":null}
 ```
 
 ---
@@ -516,7 +548,7 @@ rugregator/
     │       ├── hash.rs           # SmtHasher trait, Sha256Hasher, Blake2sHasher, Blake2bHasher
     │       ├── snapshot.rs       # O(1) copy-on-write snapshots (fork/commit/discard)
     │       ├── consistency.rs    # batch_insert_with_proof, ProofOp, CBOR encoding
-    │       ├── proof.rs          # get_path, MerkleTreePath, CBOR wire format
+    │       ├── proof.rs          # Inclusion/non-inclusion certificates and verification
     │       ├── node_serde.rs     # Compact binary node serialisation
     │       └── types.rs          # Branch, LeafBranch, NodeBranch, Stub
     ├── smt-store/                # SMT storage backends

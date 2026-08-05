@@ -2,11 +2,11 @@
 //!
 //! StateID = SHA256( CBOR_ARRAY(2) || predicate_cbor_bytes || CBOR_BYTES(source_state_hash) )
 //!
-//! Matches Go `CreateStateID` / `StateIDDataHash` and the `CertDataHash` function.
+//! Matches the canonical StateID and signature preimages used by the SDK.
 
-use sha2::{Digest, Sha256};
 use crate::smt::hash::{cbor_array, cbor_bytes};
 use crate::smt::SmtKey;
+use sha2::{Digest, Sha256};
 
 /// Compute the raw 32-byte StateID hash from the CBOR-encoded predicate and
 /// the source-state hash.
@@ -29,11 +29,7 @@ pub fn compute_state_id(predicate_cbor: &[u8], source_state_hash: &[u8]) -> [u8;
 }
 
 /// Validate that the provided StateID matches the expected value.
-pub fn validate_state_id(
-    state_id: &[u8],
-    predicate_cbor: &[u8],
-    source_state_hash: &[u8],
-) -> bool {
+pub fn validate_state_id(state_id: &[u8], predicate_cbor: &[u8], source_state_hash: &[u8]) -> bool {
     let expected = compute_state_id(predicate_cbor, source_state_hash);
     state_id == expected
 }
@@ -46,31 +42,6 @@ pub fn compute_sig_data_hash(source_state_hash: &[u8], transaction_hash: &[u8]) 
     h.update(cbor_array(2));
     h.update(cbor_bytes(source_state_hash));
     h.update(cbor_bytes(transaction_hash));
-    h.finalize().into()
-}
-
-/// Compute the `CertDataHash` (32 bytes) used as the SMT leaf value.
-///
-/// ```text
-/// SHA256( CBOR_ARRAY(4)
-///         || predicate_cbor          (raw, not wrapped)
-///         || CBOR_BYTES(source_state_hash)
-///         || CBOR_BYTES(transaction_hash)
-///         || CBOR_BYTES(witness)
-///       )
-/// ```
-pub fn compute_cert_data_hash(
-    predicate_cbor: &[u8],
-    source_state_hash: &[u8],
-    transaction_hash: &[u8],
-    witness: &[u8],
-) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(cbor_array(4));
-    h.update(predicate_cbor);         // raw CBOR bytes (not wrapped)
-    h.update(cbor_bytes(source_state_hash));
-    h.update(cbor_bytes(transaction_hash));
-    h.update(cbor_bytes(witness));
     h.finalize().into()
 }
 
@@ -89,9 +60,11 @@ mod tests {
         let mut out = Vec::new();
         out.push(0x83); // array(3)
         out.push(0x01); // uint(1) — engine
-        out.push(0x41); out.push(0x01); // bytes(1): [0x01] — code
-        // params: pubkey (33 bytes) → 0x58 0x21 <33 bytes>
-        out.push(0x58); out.push(0x21);
+        out.push(0x41);
+        out.push(0x01); // bytes(1): [0x01] — code
+                        // params: pubkey (33 bytes) → 0x58 0x21 <33 bytes>
+        out.push(0x58);
+        out.push(0x21);
         out.extend_from_slice(pubkey);
         out
     }
@@ -122,11 +95,5 @@ mod tests {
         let id = compute_state_id(&pred, &[0u8; 32]);
         // Different source hash → mismatch
         assert!(!validate_state_id(&id, &pred, &[1u8; 32]));
-    }
-
-    #[test]
-    fn cert_data_hash_is_32_bytes() {
-        let h = compute_cert_data_hash(&[0x83, 0x01], &[0u8; 32], &[0u8; 32], &[0u8; 65]);
-        assert_eq!(h.len(), 32);
     }
 }

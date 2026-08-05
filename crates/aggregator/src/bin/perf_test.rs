@@ -23,8 +23,8 @@
 //!   --db-path PATH        Fixed DB directory; default = fresh temp dir per sweep
 //!   --csv                 Also emit CSV rows
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
@@ -32,8 +32,7 @@ use rand::{Rng, SeedableRng};
 
 use rsmt::{Blake2bHasher, Blake2sHasher, Sha256Hasher, SmtHasher};
 use smt_store::{SmtStore, SmtStoreSnapshot};
-use uni_aggregator::smt::{SmtKey, state_id_to_smt_key};
-use uni_aggregator::validation::state_id::compute_cert_data_hash;
+use uni_aggregator::smt::{state_id_to_smt_key, SmtKey};
 
 // ─── Ctrl+C ──────────────────────────────────────────────────────────────────
 
@@ -49,7 +48,9 @@ fn install_ctrl_c_handler() {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async { tokio::signal::ctrl_c().await.ok(); });
+        rt.block_on(async {
+            tokio::signal::ctrl_c().await.ok();
+        });
         SHUTDOWN.store(true, Ordering::SeqCst);
         eprintln!("\nctrl+c received, finishing current round...");
     });
@@ -58,29 +59,29 @@ fn install_ctrl_c_handler() {
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 struct Config {
-    backend:        String,
-    hasher:         String,
-    rounds:         usize,
-    seed:           u64,
-    proof_sample:   usize,
-    batch_sizes:    Vec<usize>,
-    cache_mb:       usize,
-    db_path:        String,
-    csv:            bool,
+    backend: String,
+    hasher: String,
+    rounds: usize,
+    seed: u64,
+    proof_sample: usize,
+    batch_sizes: Vec<usize>,
+    cache_mb: usize,
+    db_path: String,
+    csv: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backend:        "mem".into(),
-            hasher:         "sha256".into(),
-            rounds:         6,
-            seed:           0, // resolved in parse_args
-            proof_sample:   200,
-            batch_sizes:    vec![1_000, 5_000, 10_000],
-            cache_mb:       0,
-            db_path:        String::new(),
-            csv:            false,
+            backend: "mem".into(),
+            hasher: "sha256".into(),
+            rounds: 6,
+            seed: 0, // resolved in parse_args
+            proof_sample: 200,
+            batch_sizes: vec![1_000, 5_000, 10_000],
+            cache_mb: 0,
+            db_path: String::new(),
+            csv: false,
         }
     }
 }
@@ -91,22 +92,53 @@ fn parse_args() -> Config {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--backend"         => { if let Some(v) = args.next() { cfg.backend         = v; } }
-            "--hasher"          => { if let Some(v) = args.next() { cfg.hasher          = v; } }
-            "--rounds"          => { if let Some(v) = args.next() { cfg.rounds          = v.parse().unwrap_or(cfg.rounds); } }
-            "--seed"            => { if let Some(v) = args.next() { seed_override       = v.parse().ok(); } }
-            "--proof-sample"    => { if let Some(v) = args.next() { cfg.proof_sample    = v.parse().unwrap_or(cfg.proof_sample); } }
-            "--cache-mb"        => { if let Some(v) = args.next() { cfg.cache_mb        = v.parse().unwrap_or(cfg.cache_mb); } }
-            "--db-path"         => { if let Some(v) = args.next() { cfg.db_path = v; } }
-            "--batch-sizes"     => {
+            "--backend" => {
                 if let Some(v) = args.next() {
-                    let parsed: Vec<usize> = v.split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    if !parsed.is_empty() { cfg.batch_sizes = parsed; }
+                    cfg.backend = v;
                 }
             }
-            "--csv" => { cfg.csv = true; }
+            "--hasher" => {
+                if let Some(v) = args.next() {
+                    cfg.hasher = v;
+                }
+            }
+            "--rounds" => {
+                if let Some(v) = args.next() {
+                    cfg.rounds = v.parse().unwrap_or(cfg.rounds);
+                }
+            }
+            "--seed" => {
+                if let Some(v) = args.next() {
+                    seed_override = v.parse().ok();
+                }
+            }
+            "--proof-sample" => {
+                if let Some(v) = args.next() {
+                    cfg.proof_sample = v.parse().unwrap_or(cfg.proof_sample);
+                }
+            }
+            "--cache-mb" => {
+                if let Some(v) = args.next() {
+                    cfg.cache_mb = v.parse().unwrap_or(cfg.cache_mb);
+                }
+            }
+            "--db-path" => {
+                if let Some(v) = args.next() {
+                    cfg.db_path = v;
+                }
+            }
+            "--batch-sizes" => {
+                if let Some(v) = args.next() {
+                    let parsed: Vec<usize> =
+                        v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    if !parsed.is_empty() {
+                        cfg.batch_sizes = parsed;
+                    }
+                }
+            }
+            "--csv" => {
+                cfg.csv = true;
+            }
             _ => {}
         }
     }
@@ -117,34 +149,35 @@ fn parse_args() -> Config {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
 
 fn fmt_dur(d: Duration) -> String {
     let us = d.as_secs_f64() * 1e6;
-    if us < 1_000.0          { format!("{:.1}µs",  us) }
-    else if us < 1_000_000.0 { format!("{:.2}ms",  us / 1_000.0) }
-    else                     { format!("{:.2}s",   us / 1_000_000.0) }
+    if us < 1_000.0 {
+        format!("{:.1}µs", us)
+    } else if us < 1_000_000.0 {
+        format!("{:.2}ms", us / 1_000.0)
+    } else {
+        format!("{:.2}s", us / 1_000_000.0)
+    }
 }
 
 fn gen_leaves(n: usize, rng: &mut StdRng) -> Vec<(SmtKey, Vec<u8>)> {
-    (0..n).map(|_| {
-        let mut state_id = [0u8; 32];
-        let mut pred     = [0u8; 38];
-        let mut ssh      = [0u8; 32];
-        let mut txh      = [0u8; 32];
-        let mut wit      = [0u8; 65];
-        rng.fill(&mut state_id[..]);
-        rng.fill(&mut pred[..]);
-        rng.fill(&mut ssh[..]);
-        rng.fill(&mut txh[..]);
-        rng.fill(&mut wit[..]);
-        let key   = state_id_to_smt_key(&state_id);
-        let value = compute_cert_data_hash(&pred, &ssh, &txh, &wit);
-        (key, value.to_vec())
-    }).collect()
+    (0..n)
+        .map(|_| {
+            let mut state_id = [0u8; 32];
+            let mut txh = [0u8; 32];
+            rng.fill(&mut state_id[..]);
+            rng.fill(&mut txh[..]);
+            let key = state_id_to_smt_key(&state_id);
+            (key, txh.to_vec())
+        })
+        .collect()
 }
 
 fn open_db(path: &str, block_cache_bytes: usize) -> anyhow::Result<Arc<rocksdb::DB>> {
@@ -156,14 +189,14 @@ fn open_db(path: &str, block_cache_bytes: usize) -> anyhow::Result<Arc<rocksdb::
 
 #[derive(Debug)]
 struct Row {
-    batch_size:   usize,
-    pre_fill:     usize,
-    inserted:     usize,
+    batch_size: usize,
+    pre_fill: usize,
+    inserted: usize,
     /// SMT work: add_leaf loop + root hash computation (and for disk: materialise + overlay).
-    insert_ms:    f64,
+    insert_ms: f64,
     /// Persistence work: DB write (zero for `mem` backend).
-    commit_ms:    f64,
-    throughput:   f64,
+    commit_ms: f64,
+    throughput: f64,
     proof_p50_us: f64,
     proof_p95_us: f64,
 }
@@ -171,14 +204,14 @@ struct Row {
 // ─── Generic measurement ──────────────────────────────────────────────────────
 
 fn measure_round<S: SmtStore, H: SmtHasher>(
-    store:        &mut S,
-    pre_fill:     usize,
-    batch:        &[(SmtKey, Vec<u8>)],
+    store: &mut S,
+    pre_fill: usize,
+    batch: &[(SmtKey, Vec<u8>)],
     proof_sample: usize,
-    rng:          &mut StdRng,
+    rng: &mut StdRng,
 ) -> anyhow::Result<Row> {
     let batch_size = batch.len();
-    let mut snap   = store.create_snapshot();
+    let mut snap = store.create_snapshot();
     let t_ins = Instant::now();
     let (flags, _proof) = snap.insert_batch_with::<H>(batch, false)?;
     let inserted = flags.iter().filter(|&&f| f).count();
@@ -211,9 +244,9 @@ fn measure_round<S: SmtStore, H: SmtHasher>(
         batch_size,
         pre_fill,
         inserted,
-        insert_ms:    insert_dur.as_secs_f64() * 1e3,
-        commit_ms:    commit_dur.as_secs_f64() * 1e3,
-        throughput:   inserted as f64 / insert_dur.as_secs_f64(),
+        insert_ms: insert_dur.as_secs_f64() * 1e3,
+        commit_ms: commit_dur.as_secs_f64() * 1e3,
+        throughput: inserted as f64 / insert_dur.as_secs_f64(),
         proof_p50_us: percentile(&proof_times, 50.0),
         proof_p95_us: percentile(&proof_times, 95.0),
     })
@@ -238,17 +271,22 @@ fn print_row(row: &Row, csv: bool) {
         row.pre_fill,
         row.inserted,
         row.throughput,
-        fmt_dur(Duration::from_secs_f64(row.insert_ms  / 1e3)),
-        fmt_dur(Duration::from_secs_f64(row.commit_ms  / 1e3)),
+        fmt_dur(Duration::from_secs_f64(row.insert_ms / 1e3)),
+        fmt_dur(Duration::from_secs_f64(row.commit_ms / 1e3)),
         row.proof_p50_us,
         row.proof_p95_us,
     );
     if csv {
         println!(
             "{},{},{},{:.3},{:.0},{:.3},{:.2},{:.2}",
-            row.batch_size, row.pre_fill, row.inserted,
-            row.insert_ms, row.throughput, row.commit_ms,
-            row.proof_p50_us, row.proof_p95_us,
+            row.batch_size,
+            row.pre_fill,
+            row.inserted,
+            row.insert_ms,
+            row.throughput,
+            row.commit_ms,
+            row.proof_p50_us,
+            row.proof_p95_us,
         );
     }
 }
@@ -271,7 +309,12 @@ fn do_shutdown_persist<S: SmtStore>(store: &mut S) {
 /// first round (non-zero when loading from a pre-existing DB).  Pre-fill
 /// accumulates globally across all batch-size sweeps so the output accurately
 /// reflects the growing tree.
-fn run_sweeps<S: SmtStore, H: SmtHasher>(store: &mut S, cfg: &Config, label: &str, initial_prefill: usize) {
+fn run_sweeps<S: SmtStore, H: SmtHasher>(
+    store: &mut S,
+    cfg: &Config,
+    label: &str,
+    initial_prefill: usize,
+) {
     if cfg.csv {
         println!("batch_size,pre_fill,inserted,insert_ms,throughput_leaves_per_s,commit_ms,proof_p50_us,proof_p95_us");
     }
@@ -279,18 +322,22 @@ fn run_sweeps<S: SmtStore, H: SmtHasher>(store: &mut S, cfg: &Config, label: &st
     let mut pre_fill = initial_prefill;
 
     for &batch_size in &cfg.batch_sizes {
-        if interrupted() { break; }
+        if interrupted() {
+            break;
+        }
         print_header(label, batch_size);
         let mut rng = StdRng::seed_from_u64(cfg.seed);
 
         for round in 0..cfg.rounds {
-            if interrupted() { break; }
+            if interrupted() {
+                break;
+            }
             let batch = gen_leaves(batch_size, &mut rng);
-            let mut proof_rng = StdRng::seed_from_u64(
-                cfg.seed.wrapping_add(round as u64 * 999_983)
-            );
-            let row = measure_round::<S, H>(store, pre_fill, &batch, cfg.proof_sample, &mut proof_rng)
-                .expect("measure_round failed");
+            let mut proof_rng =
+                StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
+            let row =
+                measure_round::<S, H>(store, pre_fill, &batch, cfg.proof_sample, &mut proof_rng)
+                    .expect("measure_round failed");
             print_row(&row, cfg.csv);
             pre_fill += row.inserted;
         }
@@ -307,7 +354,12 @@ fn count_leaves_in_db(db: &rocksdb::DB) -> usize {
 /// Make a temp DB path unique to this process and sweep index.
 fn temp_db_path(tag: &str, sweep: usize) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("perf_test_{}_{}_{}", tag, std::process::id(), sweep));
+    p.push(format!(
+        "perf_test_{}_{}_{}",
+        tag,
+        std::process::id(),
+        sweep
+    ));
     let _ = std::fs::remove_dir_all(&p);
     p
 }
@@ -319,8 +371,14 @@ fn main() -> anyhow::Result<()> {
     let cfg = parse_args();
     let cache_bytes = cfg.cache_mb * 1024 * 1024;
 
-    println!("SMT Performance Benchmark  [{}]  hasher={}", cfg.backend, cfg.hasher);
-    println!("  rounds={}, seed={}, proof_sample={}", cfg.rounds, cfg.seed, cfg.proof_sample);
+    println!(
+        "SMT Performance Benchmark  [{}]  hasher={}",
+        cfg.backend, cfg.hasher
+    );
+    println!(
+        "  rounds={}, seed={}, proof_sample={}",
+        cfg.rounds, cfg.seed, cfg.proof_sample
+    );
     println!("  batch_sizes={:?}", cfg.batch_sizes);
     if cfg.backend != "mem" {
         println!("  cache_mb={}", cfg.cache_mb);
@@ -340,7 +398,6 @@ fn main() -> anyhow::Result<()> {
 
 fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result<()> {
     match cfg.backend.as_str() {
-
         // ── Pure in-memory: no DB at all ──────────────────────────────────────
         "mem" => {
             let mut store = smt_store::MemSmt::new();
@@ -351,16 +408,18 @@ fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result
         "mem-leaves" | "mem-leaves-x" | "mem-full" => {
             use smt_store::mem::PersistMode;
             let mode = match cfg.backend.as_str() {
-                "mem-leaves"   => PersistMode::LeavesOnly,
+                "mem-leaves" => PersistMode::LeavesOnly,
                 "mem-leaves-x" => PersistMode::LeavesWithShutdownSnapshot,
-                _              => PersistMode::Full,
+                _ => PersistMode::Full,
             };
             let label = cfg.backend.as_str();
 
             if cfg.db_path.is_empty() {
                 // Temp mode: fresh DB per batch-size sweep, cleaned up after.
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
-                    if interrupted() { break; }
+                    if interrupted() {
+                        break;
+                    }
                     let tmp = temp_db_path(label, sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
                     let arc_db = open_db(&db_path, cache_bytes)?;
@@ -370,10 +429,19 @@ fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result
                     let mut pre_fill = 0usize;
                     let mut rng = StdRng::seed_from_u64(cfg.seed);
                     for round in 0..cfg.rounds {
-                        if interrupted() { break; }
+                        if interrupted() {
+                            break;
+                        }
                         let batch = gen_leaves(batch_size, &mut rng);
-                        let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
-                        let row = measure_round::<_, H>(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
+                        let mut prng =
+                            StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
+                        let row = measure_round::<_, H>(
+                            &mut store,
+                            pre_fill,
+                            &batch,
+                            cfg.proof_sample,
+                            &mut prng,
+                        )?;
                         print_row(&row, cfg.csv);
                         pre_fill += row.inserted;
                     }
@@ -395,7 +463,12 @@ fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result
                 let mut store = smt_store::MemSmt::open(Arc::clone(&arc_db), mode)?;
                 let load_dur = t_load.elapsed();
                 println!("  done in {}", fmt_dur(load_dur));
-                println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
+                println!(
+                    "  root = {}",
+                    smt_store::SmtStore::root_hash(&store)
+                        .map(|r| hex::encode(r))
+                        .unwrap_or_else(|| "empty".into())
+                );
                 println!();
 
                 run_sweeps::<_, H>(&mut store, cfg, label, existing);
@@ -408,7 +481,9 @@ fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result
             if cfg.db_path.is_empty() {
                 // Temp mode: fresh DB per batch-size sweep, cleaned up after.
                 for (sweep, &batch_size) in cfg.batch_sizes.iter().enumerate() {
-                    if interrupted() { break; }
+                    if interrupted() {
+                        break;
+                    }
                     let tmp = temp_db_path("disk", sweep);
                     let db_path = tmp.to_str().unwrap().to_string();
                     let arc_db = open_db(&db_path, cache_bytes)?;
@@ -418,31 +493,49 @@ fn run_backend<H: SmtHasher>(cfg: &Config, cache_bytes: usize) -> anyhow::Result
                     let mut pre_fill = 0usize;
                     let mut rng = StdRng::seed_from_u64(cfg.seed);
                     for round in 0..cfg.rounds {
-                        if interrupted() { break; }
+                        if interrupted() {
+                            break;
+                        }
                         let batch = gen_leaves(batch_size, &mut rng);
-                        let mut prng = StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
-                        let row = measure_round::<_, H>(&mut store, pre_fill, &batch, cfg.proof_sample, &mut prng)?;
+                        let mut prng =
+                            StdRng::seed_from_u64(cfg.seed.wrapping_add(round as u64 * 999_983));
+                        let row = measure_round::<_, H>(
+                            &mut store,
+                            pre_fill,
+                            &batch,
+                            cfg.proof_sample,
+                            &mut prng,
+                        )?;
                         print_row(&row, cfg.csv);
                         pre_fill += row.inserted;
                     }
                     println!();
                     let _ = std::fs::remove_dir_all(&db_path);
-                    if interrupted() { break; }
+                    if interrupted() {
+                        break;
+                    }
                 }
             } else {
                 // Persistent mode: open once (root hash only; nodes are lazy), keep DB.
                 let arc_db = open_db(&cfg.db_path, cache_bytes)?;
                 let existing = count_leaves_in_db(&arc_db);
 
-                print!("Opening disk-SMT '{}' ({} persisted leaves)...", cfg.db_path, existing);
+                print!(
+                    "Opening disk-SMT '{}' ({} persisted leaves)...",
+                    cfg.db_path, existing
+                );
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 let t_open = Instant::now();
                 let mut store = smt_store::DiskSmt::open(Arc::clone(&arc_db), cache_bytes)?;
                 let open_dur = t_open.elapsed();
                 println!("  done in {}", fmt_dur(open_dur));
-                println!("  root = {}", smt_store::SmtStore::root_hash(&store).map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into()));
+                println!(
+                    "  root = {}",
+                    smt_store::SmtStore::root_hash(&store)
+                        .map(|r| hex::encode(r))
+                        .unwrap_or_else(|| "empty".into())
+                );
                 println!();
-
 
                 run_sweeps::<_, H>(&mut store, cfg, "disk", existing);
             }

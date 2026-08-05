@@ -1,6 +1,12 @@
 //! Re-exports from the `rsmt` crate plus aggregator-local helpers.
 pub use rsmt::*;
 
+/// Leaf-value width in the Unicity aggregation profile.
+///
+/// The generic RSMT wire format permits arbitrary byte-string values. Unicity
+/// restricts them to one raw SHA-256 transaction hash.
+pub const AGGREGATION_TREE_VALUE_SIZE: usize = 32;
+
 /// Convert a 32-byte StateID to an SMT key.
 ///
 /// In the new tree format the key is simply the raw 32-byte StateID.
@@ -14,7 +20,7 @@ pub fn state_id_to_smt_key(state_id: &[u8]) -> SmtKey {
 // ─── Local CBOR helpers ───────────────────────────────────────────────────────
 //
 // These used to live in rsmt::hash but were removed when Go-compatibility was
-// dropped.  They are still needed here for StateID / CertDataHash computation.
+// dropped. They remain here for StateID and signature preimage computation.
 
 pub mod hash {
     /// CBOR array header for `n` items.
@@ -38,7 +44,13 @@ pub mod hash {
         } else if n < 0x10000 {
             vec![0x59, (n >> 8) as u8, n as u8]
         } else {
-            vec![0x5A, (n >> 24) as u8, (n >> 16) as u8, (n >> 8) as u8, n as u8]
+            vec![
+                0x5A,
+                (n >> 24) as u8,
+                (n >> 16) as u8,
+                (n >> 8) as u8,
+                n as u8,
+            ]
         };
         hdr.extend_from_slice(data);
         hdr

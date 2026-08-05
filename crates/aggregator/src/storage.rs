@@ -5,15 +5,18 @@
 //!   - Stores finalized record info (StateID → block + cert data).
 //!   - Stores finalized block info (block number → root hash + UC CBOR).
 //!   - Exposes a channel for submitting validated requests to the round manager.
-//!   - Merkle proofs are pre-computed at finalization time and stored in RecordInfo.
+//!   - Merkle inclusion proofs are pre-computed at finalization time.
+//!   - Publishes an immutable certified SMT snapshot to a bounded proof service.
 
-use std::sync::Arc;
-use dashmap::DashMap;
-use tokio::sync::{mpsc, RwLock};
+use dashmap::{mapref::entry::Entry, DashMap};
+use smt_store::{CertifiedSmtSnapshot, CERTIFIED_PROOF_MAX_IN_FLIGHT};
+use std::sync::{Arc, RwLock as StdRwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::debug;
 
-use crate::validation::ValidatedRequest;
 use crate::api::cbor::CertDataFields;
+use crate::smt::AGGREGATION_TREE_VALUE_SIZE;
+use crate::validation::ValidatedRequest;
 
 // ─── Store trait ──────────────────────────────────────────────────────────────
 
@@ -71,7 +74,7 @@ pub trait WalStore: Send + Sync {
 
 pub struct RecoveredState {
     pub block_number: u64,
-    pub records: Vec<(String, RecordInfo)>,  // (state_id_hex, RecordInfo)
+    pub records: Vec<(String, RecordInfo)>, // (state_id_hex, RecordInfo)
     pub blocks: Vec<BlockInfo>,
 }
 
@@ -100,7 +103,7 @@ pub struct BlockInfo {
     pub uc_cbor: Vec<u8>,
 }
 
-// ─── Inclusion proof result ───────────────────────────────────────────────────
+// ─── Proof lookup results ─────────────────────────────────────────────────────
 
 /// All data needed to build an inclusion proof response.
 pub struct InclusionProofData {
@@ -108,6 +111,42 @@ pub struct InclusionProofData {
     pub cert_data: Option<CertDataFields>,
     pub merkle_path_cbor: Vec<u8>,
     pub uc_cbor: Vec<u8>,
+}
+
+/// Result of an inclusion-proof lookup.
+pub enum InclusionProofLookup {
+    /// The state is certified and its proof is available.
+    Proof(InclusionProofData),
+    /// A validated request for this state is awaiting certification.
+    Pending,
+    /// The aggregator has neither a certified record nor a pending request.
+    NotFound,
+}
+
+/// All data needed to build a non-inclusion proof response against one
+/// atomically selected certified state.
+pub struct NonInclusionProofData {
+    pub block_number: u64,
+    pub certificate: Vec<u8>,
+    pub uc_cbor: Vec<u8>,
+}
+
+/// Result of looking up a non-inclusion proof at the latest certified root.
+pub enum NonInclusionProofLookup {
+    /// No certified block is available yet.
+    CertifiedStateUnavailable,
+    /// The requested key is present, so a non-inclusion proof must not be returned.
+    StateIncluded,
+    /// The bounded proof service has reached its in-flight admission limit.
+    Busy,
+    /// A proof tied to the indicated block and Unicity Certificate.
+    Proof(NonInclusionProofData),
+}
+
+/// One atomically published certified state used by the proof-serving plane.
+struct CertifiedProofState {
+    block: BlockInfo,
+    smt: CertifiedSmtSnapshot,
 }
 
 // ─── AggregatorState ──────────────────────────────────────────────────────────
@@ -118,22 +157,34 @@ pub struct AggregatorState {
     block_number: RwLock<u64>,
     /// StateID (hex) → record info.
     records: DashMap<String, RecordInfo>,
+    /// Validated requests accepted but not yet resolved by a certified round.
+    pending_state_ids: DashMap<String, usize>,
     /// Block number → block info.
     blocks: DashMap<u64, BlockInfo>,
     /// Channel to submit validated requests to the round manager.
     request_tx: mpsc::Sender<ValidatedRequest>,
     /// Optional persistence backend.
     store: Option<Arc<dyn Store>>,
+    /// Latest block metadata and immutable SMT view, replaced atomically.
+    certified_proof_state: StdRwLock<Option<Arc<CertifiedProofState>>>,
+    /// Admission control in front of the bounded proof worker queue.
+    proof_permits: Arc<Semaphore>,
 }
 
 impl AggregatorState {
-    pub fn new(request_tx: mpsc::Sender<ValidatedRequest>, store: Option<Arc<dyn Store>>) -> Arc<Self> {
+    pub fn new(
+        request_tx: mpsc::Sender<ValidatedRequest>,
+        store: Option<Arc<dyn Store>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             block_number: RwLock::new(1),
             records: DashMap::new(),
+            pending_state_ids: DashMap::new(),
             blocks: DashMap::new(),
             request_tx,
             store,
+            certified_proof_state: StdRwLock::new(None),
+            proof_permits: Arc::new(Semaphore::new(CERTIFIED_PROOF_MAX_IN_FLIGHT)),
         })
     }
 
@@ -169,11 +220,43 @@ impl AggregatorState {
     // ── Request submission ────────────────────────────────────────────────────
 
     pub async fn submit_request(&self, req: ValidatedRequest) -> anyhow::Result<()> {
-        self.request_tx
-            .send(req)
-            .await
-            .map_err(|_| anyhow::anyhow!("round manager channel closed"))?;
-        Ok(())
+        let state_id = hex::encode(&req.state_id);
+        self.add_pending_state_id(&state_id);
+        match self.request_tx.send(req).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.resolve_state_id_hex(&state_id);
+                Err(anyhow::anyhow!("round manager channel closed"))
+            }
+        }
+    }
+
+    pub(crate) fn mark_pending_state_id(&self, state_id: &[u8]) {
+        self.add_pending_state_id(&hex::encode(state_id));
+    }
+
+    /// Resolve pending status after a batch is certified or permanently dropped.
+    pub(crate) fn resolve_requests(&self, requests: &[ValidatedRequest]) {
+        for request in requests {
+            self.resolve_state_id_hex(&hex::encode(&request.state_id));
+        }
+    }
+
+    pub(crate) fn resolve_state_id_hex(&self, state_id_hex: &str) {
+        if let Entry::Occupied(mut entry) = self.pending_state_ids.entry(state_id_hex.to_owned()) {
+            if *entry.get() > 1 {
+                *entry.get_mut() -= 1;
+            } else {
+                entry.remove();
+            }
+        }
+    }
+
+    fn add_pending_state_id(&self, state_id_hex: &str) {
+        self.pending_state_ids
+            .entry(state_id_hex.to_owned())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
     }
 
     // ── Finalization ──────────────────────────────────────────────────────────
@@ -182,11 +265,14 @@ impl AggregatorState {
     pub fn finalize_records(&self, records: Vec<FinalizedRecord>) {
         for r in records {
             debug!(state_id = %r.state_id_hex, block = r.block_number, "finalizing record");
-            self.records.insert(r.state_id_hex, RecordInfo {
-                block_number: r.block_number,
-                cert_data: r.cert_data,
-                merkle_path_cbor: r.merkle_path_cbor,
-            });
+            self.records.insert(
+                r.state_id_hex,
+                RecordInfo {
+                    block_number: r.block_number,
+                    cert_data: r.cert_data,
+                    merkle_path_cbor: r.merkle_path_cbor,
+                },
+            );
         }
     }
 
@@ -214,29 +300,129 @@ impl AggregatorState {
     pub async fn get_inclusion_proof(
         &self,
         state_id: &[u8],
-    ) -> anyhow::Result<Option<InclusionProofData>> {
+    ) -> anyhow::Result<InclusionProofLookup> {
         let key = hex::encode(state_id);
         let record = match self.records.get(&key) {
             Some(r) => r.clone(),
-            None => return Ok(None),
+            None if self.pending_state_ids.contains_key(&key) => {
+                return Ok(InclusionProofLookup::Pending)
+            }
+            None => return Ok(InclusionProofLookup::NotFound),
         };
 
-        let merkle_path_cbor = match record.merkle_path_cbor {
-            Some(p) => p,
-            None => return Ok(None), // still pending (shouldn't happen after finalization)
-        };
+        let merkle_path_cbor = record.merkle_path_cbor.ok_or_else(|| {
+            anyhow::anyhow!("finalized record is missing its inclusion certificate")
+        })?;
 
-        let block = match self.blocks.get(&record.block_number) {
-            Some(b) => b.clone(),
-            None => return Ok(None),
-        };
+        let block = self
+            .blocks
+            .get(&record.block_number)
+            .map(|block| block.clone())
+            .ok_or_else(|| anyhow::anyhow!("finalized record refers to a missing block"))?;
 
-        Ok(Some(InclusionProofData {
+        Ok(InclusionProofLookup::Proof(InclusionProofData {
             block_number: record.block_number,
             cert_data: Some(record.cert_data),
             merkle_path_cbor,
             uc_cbor: block.uc_cbor,
         }))
+    }
+
+    /// Atomically publish a root-pinned SMT view together with the certificate
+    /// metadata that authenticates that exact root.
+    pub(crate) fn publish_certified_snapshot(
+        &self,
+        block: BlockInfo,
+        snapshot: CertifiedSmtSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            block.root_hash == snapshot.root_hash(),
+            "cannot publish mismatched certified block and SMT snapshot roots"
+        );
+        let mut slot = self
+            .certified_proof_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::new(CertifiedProofState {
+            block,
+            smt: snapshot,
+        }));
+        Ok(())
+    }
+
+    /// Stop new lookups from selecting an older root while a newly certified
+    /// root is being pinned and published. Already-admitted lookups retain the
+    /// old immutable snapshot and remain valid snapshot statements.
+    pub(crate) fn clear_certified_snapshot(&self) {
+        let mut slot = self
+            .certified_proof_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+
+    /// Generate a proof outside the round-manager task using the latest
+    /// atomically published certified snapshot.
+    pub async fn get_non_inclusion_proof(
+        &self,
+        state_id: [u8; 32],
+    ) -> anyhow::Result<NonInclusionProofLookup> {
+        let Some(certified) = self
+            .certified_proof_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
+        };
+
+        let permit = match Arc::clone(&self.proof_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Ok(NonInclusionProofLookup::Busy),
+        };
+        let worker = certified.smt.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            worker.get_non_inclusion_proof(state_id)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("non-inclusion proof task failed: {error}"))??;
+
+        match outcome {
+            rsmt::NonInclusionProofOutcome::StateIncluded => {
+                Ok(NonInclusionProofLookup::StateIncluded)
+            }
+            rsmt::NonInclusionProofOutcome::Proof(proof) => {
+                anyhow::ensure!(
+                    rsmt::verify_non_inclusion(
+                        &proof,
+                        certified.block.root_hash.as_ref(),
+                        &state_id,
+                    ),
+                    "generated non-inclusion certificate did not reproduce the certified root"
+                );
+                if let Some(value) = proof.terminal_value() {
+                    anyhow::ensure!(
+                        value.len() == AGGREGATION_TREE_VALUE_SIZE,
+                        "Unicity aggregation-tree terminal value must be \
+                         {AGGREGATION_TREE_VALUE_SIZE} bytes, got {}",
+                        value.len()
+                    );
+                }
+                Ok(NonInclusionProofLookup::Proof(NonInclusionProofData {
+                    block_number: certified.block.block_number,
+                    certificate: proof.to_bytes(),
+                    uc_cbor: certified.block.uc_cbor.clone(),
+                }))
+            }
+        }
+    }
+
+    /// Latest certified block, used to publish a proof snapshot on startup.
+    pub(crate) async fn latest_certified_block(&self) -> Option<BlockInfo> {
+        let next = *self.block_number.read().await;
+        let latest = next.checked_sub(1)?;
+        self.blocks.get(&latest).map(|block| block.clone())
     }
 }
 
@@ -250,4 +436,104 @@ pub struct FinalizedRecord {
     ///
     /// Always `Some` for finalized records (generated at finalization time).
     pub merkle_path_cbor: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smt_store::{MemSmt, SmtStore, SmtStoreSnapshot};
+
+    fn request(state_id: [u8; 32]) -> ValidatedRequest {
+        ValidatedRequest {
+            state_id: state_id.to_vec(),
+            predicate_cbor: vec![1],
+            source_state_hash: vec![2; 32],
+            transaction_hash: vec![3; AGGREGATION_TREE_VALUE_SIZE],
+            witness: vec![4; 65],
+            public_key: vec![5; 33],
+        }
+    }
+
+    #[tokio::test]
+    async fn inclusion_lookup_distinguishes_pending_from_unknown() {
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        let state = AggregatorState::new(request_tx, None);
+        let state_id = [7u8; 32];
+
+        state.submit_request(request(state_id)).await.unwrap();
+        state.submit_request(request(state_id)).await.unwrap();
+        assert!(matches!(
+            state.get_inclusion_proof(&state_id).await.unwrap(),
+            InclusionProofLookup::Pending
+        ));
+
+        let first = request_rx.recv().await.unwrap();
+        state.resolve_requests(&[first]);
+        assert!(matches!(
+            state.get_inclusion_proof(&state_id).await.unwrap(),
+            InclusionProofLookup::Pending
+        ));
+
+        let second = request_rx.recv().await.unwrap();
+        state.resolve_requests(&[second]);
+        assert!(matches!(
+            state.get_inclusion_proof(&state_id).await.unwrap(),
+            InclusionProofLookup::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn certified_snapshot_serves_explicit_relation_outcomes_with_admission_limit() {
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let state = AggregatorState::new(request_tx, None);
+        let included_key = [0x11u8; 32];
+        let absent_key = [0x22u8; 32];
+
+        let mut smt = MemSmt::new();
+        let mut mutation = smt.create_snapshot();
+        mutation
+            .add_leaf(included_key, vec![0x33; AGGREGATION_TREE_VALUE_SIZE])
+            .unwrap();
+        mutation.commit(&mut smt).unwrap();
+        let root = smt.root_hash();
+        state
+            .publish_certified_snapshot(
+                BlockInfo {
+                    block_number: 1,
+                    root_hash: root,
+                    uc_cbor: vec![0xaa],
+                },
+                smt.create_certified_snapshot().unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state.get_non_inclusion_proof(included_key).await.unwrap(),
+            NonInclusionProofLookup::StateIncluded
+        ));
+        let NonInclusionProofLookup::Proof(proof_data) =
+            state.get_non_inclusion_proof(absent_key).await.unwrap()
+        else {
+            panic!("absent key must produce a proof");
+        };
+        let proof = rsmt::NonInclusionProof::from_bytes(&proof_data.certificate).unwrap();
+        assert!(rsmt::verify_non_inclusion(
+            &proof,
+            root.as_ref(),
+            &absent_key
+        ));
+
+        let held_permits: Vec<_> = (0..CERTIFIED_PROOF_MAX_IN_FLIGHT)
+            .map(|_| {
+                Arc::clone(&state.proof_permits)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        assert!(matches!(
+            state.get_non_inclusion_proof(absent_key).await.unwrap(),
+            NonInclusionProofLookup::Busy
+        ));
+        drop(held_permits);
+    }
 }

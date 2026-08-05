@@ -27,8 +27,9 @@ use crate::api::cbor::{
 };
 use crate::config::{ConsistencyProofMode, RoundConfig};
 use crate::smt::state_id_to_smt_key;
-use crate::storage::{AggregatorState, BlockInfo, FinalizedRecord, PendingRound, WalRecord, WalStore};
-use crate::validation::state_id::compute_cert_data_hash;
+use crate::storage::{
+    AggregatorState, BlockInfo, FinalizedRecord, PendingRound, WalRecord, WalStore,
+};
 use crate::validation::ValidatedRequest;
 use async_trait::async_trait;
 
@@ -106,6 +107,14 @@ pub trait BftCommitter: Send + Sync {
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>>;
 }
 
+/// Canonical aggregation-tree relation: `StateID -> TransactionHash`.
+fn request_smt_pair(request: &ValidatedRequest) -> (rsmt::SmtKey, Vec<u8>) {
+    (
+        state_id_to_smt_key(&request.state_id),
+        request.transaction_hash.clone(),
+    )
+}
+
 // ─── Stub implementation ──────────────────────────────────────────────────────
 
 pub struct BftCommitterStub {
@@ -134,7 +143,9 @@ impl BftCommitter for BftCommitterStub {
         _block_size: u64,
         _state_size: u64,
     ) -> anyhow::Result<()> {
-        let root_hex = new_root.map(|r| hex::encode(r)).unwrap_or_else(|| "empty".into());
+        let root_hex = new_root
+            .map(|r| hex::encode(r))
+            .unwrap_or_else(|| "empty".into());
         info!(block = block_number, root = %root_hex, "BftCommitterStub: commit_block");
         *self.pending_root.lock().unwrap() = new_root;
         Ok(())
@@ -356,17 +367,17 @@ fn stub_generate_uc(
 /// Data held while a ZK proof is being generated in a background thread.
 /// When the proof arrives we use this to write the WAL and call `commit_block`.
 struct ProvingRoundData<S: SmtStore> {
-    block_number:      u64,
-    new_root:          Option<[u8; 32]>,
-    prev_root:         Option<[u8; 32]>,
-    new_leaves:        u64,
-    state_size:        u64,
-    proposed_snap:     S::Snapshot,
-    spec_snap:         S::Snapshot,
-    batch:             Vec<ValidatedRequest>,
-    inserted:          Vec<ProcessedRecord>,
-    dropped:           usize,
-    proof_started_at:  std::time::Instant,
+    block_number: u64,
+    new_root: Option<[u8; 32]>,
+    prev_root: Option<[u8; 32]>,
+    new_leaves: u64,
+    state_size: u64,
+    proposed_snap: S::Snapshot,
+    spec_snap: S::Snapshot,
+    batch: Vec<ValidatedRequest>,
+    inserted: Vec<ProcessedRecord>,
+    dropped: usize,
+    proof_started_at: std::time::Instant,
 }
 
 // ─── InFlightRound ────────────────────────────────────────────────────────────
@@ -526,6 +537,7 @@ impl<S: SmtStore> RoundManager<S> {
     pub async fn run(mut self) {
         // On startup, replay any round that was in-flight when the process last crashed.
         self.recover_pending_round().await;
+        self.publish_current_certified_snapshot().await;
 
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -578,6 +590,50 @@ impl<S: SmtStore> RoundManager<S> {
         }
     }
 
+    /// Publish the recovered committed root without routing any proof reads
+    /// through the round-manager event loop.
+    async fn publish_current_certified_snapshot(&self) {
+        let Some(block) = self.state.latest_certified_block().await else {
+            return;
+        };
+        let uc_root = match decode_cbor_value(&block.uc_cbor)
+            .and_then(|certificate| unicity_certificate_state_root(&certificate))
+        {
+            Ok(root) => root,
+            Err(error) => {
+                error!(
+                    block = block.block_number,
+                    err = %error,
+                    "recovered Unicity Certificate is invalid; proof service unavailable"
+                );
+                self.state.clear_certified_snapshot();
+                return;
+            }
+        };
+        if uc_root != block.root_hash
+            || block.root_hash != self.current_root
+            || self.smt.root_hash() != self.current_root
+        {
+            warn!(
+                block = block.block_number,
+                "recovered UC, block, and committed SMT root are out of sync; proof service unavailable"
+            );
+            self.state.clear_certified_snapshot();
+            return;
+        }
+        match self.smt.create_certified_snapshot() {
+            Ok(snapshot) => {
+                if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
+                    error!(err = %error, "failed to publish recovered certified SMT snapshot");
+                }
+            }
+            Err(error) => {
+                error!(err = %error, "failed to pin recovered certified SMT snapshot");
+                self.state.clear_certified_snapshot();
+            }
+        }
+    }
+
     // ── WAL recovery ──────────────────────────────────────────────────────────
 
     /// If a WAL entry exists from a previous crashed run, replay the round.
@@ -589,12 +645,12 @@ impl<S: SmtStore> RoundManager<S> {
     async fn recover_pending_round(&mut self) {
         let wal = match &self.wal {
             Some(w) => Arc::clone(w),
-            None    => return,
+            None => return,
         };
 
         let pending = match wal.load_pending_round() {
             Ok(Some(p)) => p,
-            Ok(None)    => return,
+            Ok(None) => return,
             Err(e) => {
                 error!(err = %e, "WAL: failed to load pending round on startup");
                 return;
@@ -604,7 +660,10 @@ impl<S: SmtStore> RoundManager<S> {
         let current_block = self.state.current_block_number().await;
         if pending.block_number < current_block {
             // Round was already committed (block number advanced past it).
-            warn!(block = pending.block_number, "WAL: stale entry for already-committed block, clearing");
+            warn!(
+                block = pending.block_number,
+                "WAL: stale entry for already-committed block, clearing"
+            );
             if let Err(e) = wal.clear_pending_round() {
                 error!(err = %e, "WAL: failed to clear stale entry");
             }
@@ -616,20 +675,22 @@ impl<S: SmtStore> RoundManager<S> {
             count = pending.inserted.len(),
             "WAL: recovering in-flight round from previous run"
         );
+        for record in &pending.inserted {
+            self.state.mark_pending_state_id(&record.state_id);
+        }
 
         // Reconstruct SMT pairs.  If the SMT was already committed before the crash
         // these insertions will all be no-ops (DuplicateLeaf), leaving the root intact.
-        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = pending.inserted.iter().map(|r| {
-            (
-                state_id_to_smt_key(&r.state_id),
-                compute_cert_data_hash(
-                    &r.predicate_cbor,
-                    &r.source_state_hash,
-                    &r.transaction_hash,
-                    &r.witness,
-                ).to_vec(),
-            )
-        }).collect();
+        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = pending
+            .inserted
+            .iter()
+            .map(|record| {
+                (
+                    state_id_to_smt_key(&record.state_id),
+                    record.transaction_hash.clone(),
+                )
+            })
+            .collect();
 
         let mut proposed_snap = self.smt.create_snapshot();
         // We don't need a new consistency proof here; use the one stored in the WAL.
@@ -658,33 +719,45 @@ impl<S: SmtStore> RoundManager<S> {
         }
 
         // Reconstruct ProcessedRecord list from the WAL records.
-        let inserted: Vec<ProcessedRecord> = pending.inserted.iter().map(|r| ProcessedRecord {
-            state_id_hex: hex::encode(&r.state_id),
-            cert_data: CertDataFields {
-                predicate_cbor:    r.predicate_cbor.clone(),
-                source_state_hash: r.source_state_hash.clone(),
-                transaction_hash:  r.transaction_hash.clone(),
-                witness:           r.witness.clone(),
-            },
-        }).collect();
+        let inserted: Vec<ProcessedRecord> = pending
+            .inserted
+            .iter()
+            .map(|r| ProcessedRecord {
+                state_id_hex: hex::encode(&r.state_id),
+                cert_data: CertDataFields {
+                    predicate_cbor: r.predicate_cbor.clone(),
+                    source_state_hash: r.source_state_hash.clone(),
+                    transaction_hash: r.transaction_hash.clone(),
+                    witness: r.witness.clone(),
+                },
+            })
+            .collect();
 
         let spec_snap = proposed_snap.fork();
 
         // WAL entry already exists from the previous run — no need to re-write.
-        if let Err(e) = self.bft.commit_block(
-            pending.block_number,
-            pending.new_root,   // use the stored root, not the recomputed one
-            pending.prev_root,
-            pending.zk_proof.clone(),
-            pending.new_leaves,
-            pending.state_size,
-        ).await {
+        if let Err(e) = self
+            .bft
+            .commit_block(
+                pending.block_number,
+                pending.new_root, // use the stored root, not the recomputed one
+                pending.prev_root,
+                pending.zk_proof.clone(),
+                pending.new_leaves,
+                pending.state_size,
+            )
+            .await
+        {
             error!(block = pending.block_number, err = %e, "WAL recovery: commit_block failed");
             proposed_snap.discard();
             spec_snap.discard();
             // Clear the WAL so we don't loop on every startup.
             if let Err(ce) = wal.clear_pending_round() {
                 error!(err = %ce, "WAL recovery: failed to clear WAL after commit_block failure");
+            }
+            for record in &pending.inserted {
+                self.state
+                    .resolve_state_id_hex(&hex::encode(&record.state_id));
             }
             return;
         }
@@ -697,19 +770,22 @@ impl<S: SmtStore> RoundManager<S> {
             let _ = uc_tx.send(result).await;
         });
 
-        info!(block = pending.block_number, "WAL recovery: re-submitted to BFT Core, waiting for UC");
+        info!(
+            block = pending.block_number,
+            "WAL recovery: re-submitted to BFT Core, waiting for UC"
+        );
 
         self.inflight = Some(InFlightRound {
-            block_number:  pending.block_number,
-            new_root:      pending.new_root,
+            block_number: pending.block_number,
+            new_root: pending.new_root,
             proposed_snap,
             spec: SpecState::Collecting {
                 snap: spec_snap,
                 buffer: Vec::new(),
             },
-            submitted_batch: Vec::new(),  // original requests not re-available after crash
+            submitted_batch: Vec::new(), // original requests not re-available after crash
             inserted,
-            dropped:         0,
+            dropped: 0,
         });
     }
 
@@ -776,37 +852,24 @@ impl<S: SmtStore> RoundManager<S> {
         let block_number = self.state.current_block_number().await;
         info!(block = block_number, count = batch.len(), "starting round");
 
-        // Build (key, leaf_value) pairs.
-        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = batch
-            .par_iter()
-            .map(|req| {
-                (
-                    state_id_to_smt_key(&req.state_id),
-                    compute_cert_data_hash(
-                        &req.predicate_cbor,
-                        &req.source_state_hash,
-                        &req.transaction_hash,
-                        &req.witness,
-                    )
-                    .to_vec(),
-                )
-            })
-            .collect();
+        // The authenticated SMT relation is StateID -> TransactionHash. The
+        // remaining certification fields are verified by request validation
+        // and returned so clients can bind the proof to their transaction.
+        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = batch.par_iter().map(request_smt_pair).collect();
 
         let mut proposed_snap = self.smt.create_snapshot();
 
         // Request the consistency-proof envelope for Rsmt and Zk modes.
         let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
-        let (flags, envelope) =
-            match proposed_snap.insert_batch(&pairs, with_proof) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
-                    proposed_snap.discard();
-                    self.pending.extend(batch);
-                    return;
-                }
-            };
+        let (flags, envelope) = match proposed_snap.insert_batch(&pairs, with_proof) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
+                proposed_snap.discard();
+                self.pending.extend(batch);
+                return;
+            }
+        };
 
         let inserted: Vec<ProcessedRecord> = batch
             .iter()
@@ -859,7 +922,10 @@ impl<S: SmtStore> RoundManager<S> {
                 let envelope = match envelope {
                     Some(e) => e,
                     None => {
-                        error!(block = block_number, "ZK mode but insert_batch returned no envelope");
+                        error!(
+                            block = block_number,
+                            "ZK mode but insert_batch returned no envelope"
+                        );
                         proposed_snap.discard();
                         spec_snap.discard();
                         self.pending.extend(batch);
@@ -869,17 +935,21 @@ impl<S: SmtStore> RoundManager<S> {
                 let kind_str = self.config.zk_proof_kind.clone();
                 let proof_tx = self.proof_tx.clone();
                 let prev = prev_root.unwrap_or([0u8; 32]);
-                let new  = new_root.unwrap_or([0u8; 32]);
+                let new = new_root.unwrap_or([0u8; 32]);
                 std::thread::spawn(move || {
                     let result = (|| -> anyhow::Result<Vec<u8>> {
-                        let kind = kind_str.parse::<zk_host::ZkProofKind>()
+                        let kind = kind_str
+                            .parse::<zk_host::ZkProofKind>()
                             .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
                         prover.prove_with_kind(&envelope, prev, new, kind)
                     })();
                     let _ = proof_tx.blocking_send(result);
                 });
                 let proof_started_at = std::time::Instant::now();
-                info!(block = block_number, "ZK proof started in background thread");
+                info!(
+                    block = block_number,
+                    "ZK proof started in background thread"
+                );
                 self.proving_data = Some(ProvingRoundData {
                     block_number,
                     new_root,
@@ -901,9 +971,9 @@ impl<S: SmtStore> RoundManager<S> {
 
         // Off / Rsmt: synchronous path — proof is ready now.
         let zk_proof = match self.config.proof_mode {
-            ConsistencyProofMode::Off  => None,
+            ConsistencyProofMode::Off => None,
             ConsistencyProofMode::Rsmt => envelope,
-            ConsistencyProofMode::Zk   => unreachable!(),
+            ConsistencyProofMode::Zk => unreachable!(),
         };
 
         // Write WAL before BFT submission so the batch is durable on disk.
@@ -916,13 +986,16 @@ impl<S: SmtStore> RoundManager<S> {
                 zk_proof: zk_proof.clone(),
                 new_leaves,
                 state_size,
-                inserted: inserted.iter().map(|r| WalRecord {
-                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
-                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
-                    source_state_hash: r.cert_data.source_state_hash.clone(),
-                    transaction_hash:  r.cert_data.transaction_hash.clone(),
-                    witness:           r.cert_data.witness.clone(),
-                }).collect(),
+                inserted: inserted
+                    .iter()
+                    .map(|r| WalRecord {
+                        state_id: hex::decode(&r.state_id_hex).unwrap_or_default(),
+                        predicate_cbor: r.cert_data.predicate_cbor.clone(),
+                        source_state_hash: r.cert_data.source_state_hash.clone(),
+                        transaction_hash: r.cert_data.transaction_hash.clone(),
+                        witness: r.cert_data.witness.clone(),
+                    })
+                    .collect(),
             };
             if let Err(e) = wal.write_pending_round(&wal_entry) {
                 error!(block = block_number, err = %e, "WAL write failed — aborting round");
@@ -1033,45 +1106,30 @@ impl<S: SmtStore> RoundManager<S> {
         let block_number = inf.block_number.saturating_add(1);
         let count = buffer.len();
 
-        // Build (key, value) pairs in parallel, mirroring start_round.
-        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = buffer
-            .par_iter()
-            .map(|req| {
-                (
-                    state_id_to_smt_key(&req.state_id),
-                    compute_cert_data_hash(
-                        &req.predicate_cbor,
-                        &req.source_state_hash,
-                        &req.transaction_hash,
-                        &req.witness,
-                    )
-                    .to_vec(),
-                )
-            })
-            .collect();
+        // Build StateID -> TransactionHash pairs, mirroring start_round.
+        let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = buffer.par_iter().map(request_smt_pair).collect();
 
         let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
-        let (flags, zk_proof) =
-            match snap.insert_batch(&pairs, with_proof) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        block = block_number,
-                        err = %e,
-                        "spec prep insert_batch failed — requeuing buffer"
-                    );
-                    snap.discard();
-                    self.pending.extend(buffer);
-                    // Replace spec with a fresh empty Collecting fork so the
-                    // next wave of requests can still accumulate.
-                    inf.spec = SpecState::Collecting {
-                        snap: inf.proposed_snap.fork(),
-                        buffer: Vec::new(),
-                    };
-                    self.inflight = Some(inf);
-                    return;
-                }
-            };
+        let (flags, zk_proof) = match snap.insert_batch(&pairs, with_proof) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    block = block_number,
+                    err = %e,
+                    "spec prep insert_batch failed — requeuing buffer"
+                );
+                snap.discard();
+                self.pending.extend(buffer);
+                // Replace spec with a fresh empty Collecting fork so the
+                // next wave of requests can still accumulate.
+                inf.spec = SpecState::Collecting {
+                    snap: inf.proposed_snap.fork(),
+                    buffer: Vec::new(),
+                };
+                self.inflight = Some(inf);
+                return;
+            }
+        };
 
         let inserted: Vec<ProcessedRecord> = buffer
             .iter()
@@ -1148,7 +1206,10 @@ impl<S: SmtStore> RoundManager<S> {
             let prover = match self.prover.as_ref() {
                 Some(p) => Arc::clone(p),
                 None => {
-                    error!(block = block_number, "ZK mode but prover not initialized (spec submit)");
+                    error!(
+                        block = block_number,
+                        "ZK mode but prover not initialized (spec submit)"
+                    );
                     snap.discard();
                     self.pending.extend(batch);
                     return;
@@ -1157,7 +1218,10 @@ impl<S: SmtStore> RoundManager<S> {
             let envelope = match zk_proof {
                 Some(e) => e,
                 None => {
-                    error!(block = block_number, "ZK mode but spec round has no envelope");
+                    error!(
+                        block = block_number,
+                        "ZK mode but spec round has no envelope"
+                    );
                     snap.discard();
                     self.pending.extend(batch);
                     return;
@@ -1168,17 +1232,21 @@ impl<S: SmtStore> RoundManager<S> {
             let kind_str = self.config.zk_proof_kind.clone();
             let proof_tx = self.proof_tx.clone();
             let prev = prev_root.unwrap_or([0u8; 32]);
-            let new  = new_root.unwrap_or([0u8; 32]);
+            let new = new_root.unwrap_or([0u8; 32]);
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<Vec<u8>> {
-                    let kind = kind_str.parse::<zk_host::ZkProofKind>()
+                    let kind = kind_str
+                        .parse::<zk_host::ZkProofKind>()
                         .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
                     prover.prove_with_kind(&envelope, prev, new, kind)
                 })();
                 let _ = proof_tx.blocking_send(result);
             });
             let proof_started_at = std::time::Instant::now();
-            info!(block = block_number, "ZK proof started in background thread (spec submit)");
+            info!(
+                block = block_number,
+                "ZK proof started in background thread (spec submit)"
+            );
             self.proving_data = Some(ProvingRoundData {
                 block_number,
                 new_root,
@@ -1320,18 +1388,22 @@ impl<S: SmtStore> RoundManager<S> {
         if let Some(wal) = &self.wal {
             let wal_entry = PendingRound {
                 block_number: data.block_number,
-                prev_root:    data.prev_root,
-                new_root:     data.new_root,
-                zk_proof:     Some(proof_bytes.clone()),
-                new_leaves:   data.new_leaves,
-                state_size:   data.state_size,
-                inserted: data.inserted.iter().map(|r| WalRecord {
-                    state_id:          hex::decode(&r.state_id_hex).unwrap_or_default(),
-                    predicate_cbor:    r.cert_data.predicate_cbor.clone(),
-                    source_state_hash: r.cert_data.source_state_hash.clone(),
-                    transaction_hash:  r.cert_data.transaction_hash.clone(),
-                    witness:           r.cert_data.witness.clone(),
-                }).collect(),
+                prev_root: data.prev_root,
+                new_root: data.new_root,
+                zk_proof: Some(proof_bytes.clone()),
+                new_leaves: data.new_leaves,
+                state_size: data.state_size,
+                inserted: data
+                    .inserted
+                    .iter()
+                    .map(|r| WalRecord {
+                        state_id: hex::decode(&r.state_id_hex).unwrap_or_default(),
+                        predicate_cbor: r.cert_data.predicate_cbor.clone(),
+                        source_state_hash: r.cert_data.source_state_hash.clone(),
+                        transaction_hash: r.cert_data.transaction_hash.clone(),
+                        witness: r.cert_data.witness.clone(),
+                    })
+                    .collect(),
             };
             if let Err(e) = wal.write_pending_round(&wal_entry) {
                 error!(block = data.block_number, err = %e, "WAL write failed after ZK proof — aborting round");
@@ -1342,14 +1414,18 @@ impl<S: SmtStore> RoundManager<S> {
             }
         }
 
-        if let Err(e) = self.bft.commit_block(
-            data.block_number,
-            data.new_root,
-            data.prev_root,
-            Some(proof_bytes),
-            data.new_leaves,
-            data.state_size,
-        ).await {
+        if let Err(e) = self
+            .bft
+            .commit_block(
+                data.block_number,
+                data.new_root,
+                data.prev_root,
+                Some(proof_bytes),
+                data.new_leaves,
+                data.state_size,
+            )
+            .await
+        {
             error!(block = data.block_number, err = %e, "commit_block after ZK proof failed — rolling back");
             data.proposed_snap.discard();
             data.spec_snap.discard();
@@ -1365,23 +1441,26 @@ impl<S: SmtStore> RoundManager<S> {
             let _ = uc_tx.send(result).await;
         });
 
-        let root_hex = data.new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
+        let root_hex = data
+            .new_root
+            .map(hex::encode)
+            .unwrap_or_else(|| "empty".into());
         info!(
             block = data.block_number, count = data.batch.len(), root = %root_hex,
             "ZK round proposed, waiting for UC"
         );
 
         self.inflight = Some(InFlightRound {
-            block_number:   data.block_number,
-            new_root:       data.new_root,
-            proposed_snap:  data.proposed_snap,
+            block_number: data.block_number,
+            new_root: data.new_root,
+            proposed_snap: data.proposed_snap,
             spec: SpecState::Collecting {
-                snap:   data.spec_snap,
+                snap: data.spec_snap,
                 buffer: Vec::new(),
             },
             submitted_batch: data.batch,
-            inserted:        data.inserted,
-            dropped:         data.dropped,
+            inserted: data.inserted,
+            dropped: data.dropped,
         });
 
         self.drain_pending_into_spec_buffer();
@@ -1434,23 +1513,61 @@ impl<S: SmtStore> RoundManager<S> {
                 self.current_root = inf.new_root;
                 self.leaf_count += inf.inserted.len() as u64;
 
+                // The committed root has advanced. Stop new callers from
+                // selecting the old certified view, then pin the new backend
+                // view before any later round can mutate the store again.
+                self.state.clear_certified_snapshot();
+                let certified_snapshot = match self.smt.create_certified_snapshot() {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        error!(
+                            block = inf.block_number,
+                            err = %error,
+                            "failed to pin certified SMT snapshot; proof service unavailable"
+                        );
+                        None
+                    }
+                };
+
+                let recovered_state_ids = if inf.submitted_batch.is_empty() {
+                    inf.inserted
+                        .iter()
+                        .map(|record| record.state_id_hex.clone())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+
                 // Generate proofs from committed store.
                 let finalized = self.generate_proofs(inf.inserted, inf.block_number);
 
                 let unique_count = finalized.len();
                 let dropped_count = inf.dropped;
 
-                let root_hex = inf.new_root.map(hex::encode).unwrap_or_else(|| "empty".into());
-                self.state
-                    .finalize_round(
-                        BlockInfo {
-                            block_number: inf.block_number,
-                            root_hash: inf.new_root,
-                            uc_cbor,
-                        },
-                        finalized,
-                    )
-                    .await;
+                let root_hex = inf
+                    .new_root
+                    .map(hex::encode)
+                    .unwrap_or_else(|| "empty".into());
+                let block = BlockInfo {
+                    block_number: inf.block_number,
+                    root_hash: inf.new_root,
+                    uc_cbor,
+                };
+                self.state.finalize_round(block.clone(), finalized).await;
+                self.state.resolve_requests(&inf.submitted_batch);
+                for state_id_hex in &recovered_state_ids {
+                    self.state.resolve_state_id_hex(state_id_hex);
+                }
+                if let Some(snapshot) = certified_snapshot {
+                    if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
+                        error!(
+                            block = inf.block_number,
+                            err = %error,
+                            "failed to publish certified SMT snapshot"
+                        );
+                        self.state.clear_certified_snapshot();
+                    }
+                }
 
                 info!(
                     block   = inf.block_number,
@@ -1497,7 +1614,10 @@ impl<S: SmtStore> RoundManager<S> {
                 // vs generic transport error (connection dropped, sender closed).
                 // Treat generic transport errors like Transient — retry the batch.
                 let rejection = e.downcast_ref::<CertRejection>().cloned();
-                let status = rejection.as_ref().map(|r| r.status).unwrap_or(CertStatus::Transient);
+                let status = rejection
+                    .as_ref()
+                    .map(|r| r.status)
+                    .unwrap_or(CertStatus::Transient);
 
                 match status {
                     CertStatus::ProofInvalid => {
@@ -1509,6 +1629,12 @@ impl<S: SmtStore> RoundManager<S> {
                         inf.proposed_snap.discard();
                         // DROP submitted_batch — its proof is inconsistent with
                         // the batch itself; replaying would fail the same way.
+                        self.state.resolve_requests(&inf.submitted_batch);
+                        if inf.submitted_batch.is_empty() {
+                            for record in &inf.inserted {
+                                self.state.resolve_state_id_hex(&record.state_id_hex);
+                            }
+                        }
                         let dropped = inf.submitted_batch.len();
                         drop(inf.submitted_batch);
                         warn!(dropped_requests = dropped, "discarded proof-invalid batch");
@@ -1534,6 +1660,12 @@ impl<S: SmtStore> RoundManager<S> {
                             "FATAL rejection from BFT Core — shutting down round manager"
                         );
                         inf.proposed_snap.discard();
+                        self.state.resolve_requests(&inf.submitted_batch);
+                        if inf.submitted_batch.is_empty() {
+                            for record in &inf.inserted {
+                                self.state.resolve_state_id_hex(&record.state_id_hex);
+                            }
+                        }
                         match inf.spec {
                             SpecState::Collecting { snap, .. } => snap.discard(),
                             SpecState::Prepared { snap, .. } => snap.discard(),
@@ -1612,6 +1744,22 @@ impl<S: SmtStore> RoundManager<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregation_tree_leaf_value_is_the_transaction_hash() {
+        let request = ValidatedRequest {
+            state_id: vec![0x11; 32],
+            predicate_cbor: vec![0x22],
+            source_state_hash: vec![0x33; 32],
+            transaction_hash: vec![0x44; 32],
+            witness: vec![0x55; 65],
+            public_key: vec![0x66; 33],
+        };
+
+        let (key, value) = request_smt_pair(&request);
+        assert_eq!(key, [0x11; 32]);
+        assert_eq!(value, request.transaction_hash);
+    }
 
     #[test]
     fn stub_certificate_uses_the_canonical_profile() {

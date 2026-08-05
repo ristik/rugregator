@@ -2,20 +2,22 @@
 
 use std::sync::Arc;
 
-use rocksdb::{DB, WriteBatch};
-use rsmt::{
-    Branch, SmtError, SmtKey, InclusionProof, SparseMerkleTree, SmtSnapshot,
-    encode_aggregator_envelope_v1, branch_hash,
-};
+use rocksdb::{WriteBatch, DB};
 use rsmt::consistency::batch_insert;
-use rsmt::node_serde::{TAG_LEAF, TAG_NODE, deserialize_leaf, deserialize_node, serialize_leaf, serialize_node};
+use rsmt::node_serde::{
+    deserialize_leaf, deserialize_node, serialize_leaf, serialize_node, TAG_LEAF, TAG_NODE,
+};
+use rsmt::{
+    branch_hash, encode_aggregator_envelope_v1, Branch, InclusionProof, NonInclusionProofOutcome,
+    SmtError, SmtKey, SmtSnapshot, SparseMerkleTree,
+};
 
-use crate::traits::{SmtStore, SmtStoreSnapshot};
 use crate::disk::materializer::CF_SMT_NODES;
-use crate::disk::node_key::{NodeKey, PrefixBits, prefix_set_bit, prefix_copy_path};
+use crate::disk::node_key::{prefix_copy_path, prefix_set_bit, NodeKey, PrefixBits};
+use crate::traits::{CertifiedSmtSnapshot, SmtStore, SmtStoreSnapshot};
 use rsmt::path::key_bit_at;
 
-const CF_SMT_META:       &str = "smt_meta";
+const CF_SMT_META: &str = "smt_meta";
 pub const CF_SMT_LEAVES: &str = "smt_leaves";
 const KEY_ROOT_HASH: &[u8] = b"root_hash";
 
@@ -50,7 +52,12 @@ impl MemSmt {
     /// Create a new in-memory SMT (no persistence).
     pub fn new() -> Self {
         let tree = SparseMerkleTree::new();
-        Self { tree, current_root: None, db: None, persist_mode: PersistMode::None }
+        Self {
+            tree,
+            current_root: None,
+            db: None,
+            persist_mode: PersistMode::None,
+        }
     }
 
     /// Open a DB-backed in-memory SMT, recovering state according to `persist_mode`.
@@ -58,7 +65,12 @@ impl MemSmt {
         match persist_mode {
             PersistMode::None => {
                 let tree = SparseMerkleTree::new();
-                Ok(Self { tree, current_root: None, db: Some(db), persist_mode })
+                Ok(Self {
+                    tree,
+                    current_root: None,
+                    db: Some(db),
+                    persist_mode,
+                })
             }
 
             PersistMode::LeavesOnly | PersistMode::LeavesWithShutdownSnapshot => {
@@ -91,7 +103,12 @@ impl MemSmt {
                     }
                 }
                 tracing::info!(recovery = recovery_kind, "SMT recovery completed");
-                Ok(Self { tree, current_root, db: Some(db), persist_mode })
+                Ok(Self {
+                    tree,
+                    current_root,
+                    db: Some(db),
+                    persist_mode,
+                })
             }
 
             PersistMode::Full => {
@@ -108,7 +125,12 @@ impl MemSmt {
                         );
                     }
                 }
-                Ok(Self { tree, current_root, db: Some(db), persist_mode })
+                Ok(Self {
+                    tree,
+                    current_root,
+                    db: Some(db),
+                    persist_mode,
+                })
             }
         }
     }
@@ -147,8 +169,35 @@ impl SmtStore for MemSmt {
         }
     }
 
+    fn create_certified_snapshot(&self) -> anyhow::Result<CertifiedSmtSnapshot> {
+        let tree = self.tree.deep_clone();
+        let root = self.current_root;
+        CertifiedSmtSnapshot::spawn_worker(root, "smt-proof-mem", move |requests, ready| {
+            if ready.send(Ok(())).is_err() {
+                return;
+            }
+            for request in requests {
+                let result = tree
+                    .get_non_inclusion_proof(&request.key)
+                    .map_err(|error| anyhow::anyhow!(error));
+                let _ = request.respond_to.send(result);
+            }
+        })
+    }
+
     fn get_inclusion_proof(&mut self, key: &SmtKey) -> anyhow::Result<InclusionProof> {
-        self.tree.get_inclusion_proof(key).map_err(|e| anyhow::anyhow!("{e}"))
+        self.tree
+            .get_inclusion_proof(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn get_non_inclusion_proof(
+        &mut self,
+        key: &SmtKey,
+    ) -> anyhow::Result<NonInclusionProofOutcome> {
+        self.tree
+            .get_non_inclusion_proof(key)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     fn shutdown_persist(&mut self) -> anyhow::Result<()> {
@@ -228,7 +277,8 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
                     let mut seen = std::collections::HashSet::new();
-                    let flags: Vec<bool> = batch.iter()
+                    let flags: Vec<bool> = batch
+                        .iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
                     // Build the aggregator_rsmt_v1 envelope while we still
@@ -246,7 +296,8 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
                     let mut seen = std::collections::HashSet::new();
-                    let flags: Vec<bool> = batch.iter()
+                    let flags: Vec<bool> = batch
+                        .iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
                     self.pending.extend(inserted_pairs);
@@ -268,7 +319,8 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
                     let mut seen = std::collections::HashSet::new();
-                    let flags: Vec<bool> = batch.iter()
+                    let flags: Vec<bool> = batch
+                        .iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
                     let envelope = encode_aggregator_envelope_v1(&inserted_pairs, &proof);
@@ -283,7 +335,8 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
                     let mut seen = std::collections::HashSet::new();
-                    let flags: Vec<bool> = batch.iter()
+                    let flags: Vec<bool> = batch
+                        .iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
                     self.pending.extend(inserted_pairs);
@@ -302,9 +355,11 @@ fn persist_leaves_and_root(
     pending: &[(SmtKey, Vec<u8>)],
     root: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
-    let cf_leaves = db.cf_handle(CF_SMT_LEAVES)
+    let cf_leaves = db
+        .cf_handle(CF_SMT_LEAVES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_LEAVES))?;
-    let cf_meta = db.cf_handle(CF_SMT_META)
+    let cf_meta = db
+        .cf_handle(CF_SMT_META)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_META))?;
 
     let mut batch = WriteBatch::default();
@@ -333,11 +388,14 @@ fn persist_full(
     tree: &SparseMerkleTree,
     root: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
-    let cf_leaves = db.cf_handle(CF_SMT_LEAVES)
+    let cf_leaves = db
+        .cf_handle(CF_SMT_LEAVES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_LEAVES))?;
-    let cf_nodes = db.cf_handle(CF_SMT_NODES)
+    let cf_nodes = db
+        .cf_handle(CF_SMT_NODES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    let cf_meta = db.cf_handle(CF_SMT_META)
+    let cf_meta = db
+        .cf_handle(CF_SMT_META)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_META))?;
 
     let mut batch = WriteBatch::default();
@@ -404,8 +462,13 @@ fn persist_delta_node(
             // Left child.
             let left_nk = NodeKey::from_depth_and_prefix(split + 1, &base_acc);
             persist_delta_node(
-                &n.left, left_nk, split + 1, &base_acc,
-                &pending[..mid], cf, batch,
+                &n.left,
+                left_nk,
+                split + 1,
+                &base_acc,
+                &pending[..mid],
+                cf,
+                batch,
             );
 
             // Right child.
@@ -413,8 +476,13 @@ fn persist_delta_node(
             prefix_set_bit(&mut right_acc, split);
             let right_nk = NodeKey::from_depth_and_prefix(split + 1, &right_acc);
             persist_delta_node(
-                &n.right, right_nk, split + 1, &right_acc,
-                &pending[mid..], cf, batch,
+                &n.right,
+                right_nk,
+                split + 1,
+                &right_acc,
+                &pending[mid..],
+                cf,
+                batch,
             );
         }
         Branch::Stub(_) => {}
@@ -468,7 +536,12 @@ fn load_full_tree(db: &DB) -> anyhow::Result<SparseMerkleTree> {
     // Recompute hash.
     let lh = branch_hash(&root_node.left);
     let rh = branch_hash(&root_node.right);
-    root_node.hash = Some(rsmt::hash_node(&lh, &rh, root_node.depth, &root_node.region));
+    root_node.hash = Some(rsmt::hash_node(
+        &lh,
+        &rh,
+        root_node.depth,
+        &root_node.region,
+    ));
 
     let mut tree = SparseMerkleTree::new();
     tree.root = Some(Arc::new(Branch::Node(root_node)));
@@ -487,7 +560,8 @@ fn load_full_branch(
     }
     let nk = NodeKey::from_depth_and_prefix(split + 1, &child_acc);
 
-    let cf = db.cf_handle(CF_SMT_NODES)
+    let cf = db
+        .cf_handle(CF_SMT_NODES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
     let bytes = match db.get_cf(&cf, nk.as_bytes())? {
         None => return Ok(Arc::new(Branch::Stub([0u8; 32]))),
@@ -580,9 +654,11 @@ fn persist_entire_tree(
     tree: &SparseMerkleTree,
     root: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
-    let cf_nodes = db.cf_handle(CF_SMT_NODES)
+    let cf_nodes = db
+        .cf_handle(CF_SMT_NODES)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_NODES))?;
-    let cf_meta = db.cf_handle(CF_SMT_META)
+    let cf_meta = db
+        .cf_handle(CF_SMT_META)
         .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_SMT_META))?;
 
     let mut batch = WriteBatch::default();
@@ -598,8 +674,24 @@ fn persist_entire_tree(
                 prefix_copy_path(&mut acc, 0, &n.path);
                 let split = n.path.path_len();
 
-                persist_entire_branch(&n.left, false, split, &acc, &cf_nodes, &mut batch, &mut node_count);
-                persist_entire_branch(&n.right, true, split, &acc, &cf_nodes, &mut batch, &mut node_count);
+                persist_entire_branch(
+                    &n.left,
+                    false,
+                    split,
+                    &acc,
+                    &cf_nodes,
+                    &mut batch,
+                    &mut node_count,
+                );
+                persist_entire_branch(
+                    &n.right,
+                    true,
+                    split,
+                    &acc,
+                    &cf_nodes,
+                    &mut batch,
+                    &mut node_count,
+                );
             }
             Branch::Leaf(l) => {
                 batch.put_cf(&cf_nodes, root_nk.as_bytes(), &serialize_leaf(l));
@@ -613,7 +705,10 @@ fn persist_entire_tree(
         batch.put_cf(&cf_meta, KEY_ROOT_HASH, &h);
     }
     db.write(batch)?;
-    tracing::info!(nodes = node_count, "shutdown snapshot written to CF_SMT_NODES");
+    tracing::info!(
+        nodes = node_count,
+        "shutdown snapshot written to CF_SMT_NODES"
+    );
     Ok(())
 }
 

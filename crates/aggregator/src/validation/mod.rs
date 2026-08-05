@@ -6,11 +6,11 @@ pub mod state_id;
 
 use thiserror::Error;
 
+use crate::smt::AGGREGATION_TREE_VALUE_SIZE;
+
 pub use predicate::{validate_pay_to_public_key, PredicateError};
 pub use signature::{verify_signature, SignatureError};
-pub use state_id::{
-    compute_cert_data_hash, compute_sig_data_hash, compute_state_id, validate_state_id,
-};
+pub use state_id::{compute_sig_data_hash, compute_state_id, validate_state_id};
 
 // ─── Validation status (matches Go ValidationStatus) ─────────────────────────
 
@@ -31,11 +31,17 @@ impl std::fmt::Display for ValidationStatus {
         match self {
             ValidationStatus::Success => write!(f, "SUCCESS"),
             ValidationStatus::StateIdMismatch => write!(f, "STATE_ID_MISMATCH"),
-            ValidationStatus::SignatureVerificationFailed => write!(f, "SIGNATURE_VERIFICATION_FAILED"),
+            ValidationStatus::SignatureVerificationFailed => {
+                write!(f, "SIGNATURE_VERIFICATION_FAILED")
+            }
             ValidationStatus::InvalidSignatureFormat => write!(f, "INVALID_SIGNATURE_FORMAT"),
             ValidationStatus::InvalidPublicKeyFormat => write!(f, "INVALID_PUBLIC_KEY_FORMAT"),
-            ValidationStatus::InvalidSourceStateHashFormat => write!(f, "INVALID_SOURCE_STATE_HASH_FORMAT"),
-            ValidationStatus::InvalidTransactionHashFormat => write!(f, "INVALID_TRANSACTION_HASH_FORMAT"),
+            ValidationStatus::InvalidSourceStateHashFormat => {
+                write!(f, "INVALID_SOURCE_STATE_HASH_FORMAT")
+            }
+            ValidationStatus::InvalidTransactionHashFormat => {
+                write!(f, "INVALID_TRANSACTION_HASH_FORMAT")
+            }
             ValidationStatus::InvalidOwnerPredicate => write!(f, "INVALID_OWNER_PREDICATE"),
         }
     }
@@ -117,10 +123,13 @@ pub fn validate_request(
     }
 
     // 5. Validate transaction hash length.
-    if transaction_hash.len() != 32 {
+    if transaction_hash.len() != AGGREGATION_TREE_VALUE_SIZE {
         return Err(ValidationError {
             status: ValidationStatus::InvalidTransactionHashFormat,
-            message: format!("transaction hash must be 32 bytes, got {}", transaction_hash.len()),
+            message: format!(
+                "transaction hash must be {AGGREGATION_TREE_VALUE_SIZE} bytes, got {}",
+                transaction_hash.len()
+            ),
         });
     }
 
