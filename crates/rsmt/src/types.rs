@@ -1,8 +1,8 @@
 //! SMT branch types: `LeafBranch`, `NodeBranch`, and the `Branch` enum.
 
+use crate::hash::{Sha256Hasher, SmtHasher};
+use crate::path::{CompressedPath, SmtKey};
 use std::sync::Arc;
-use crate::hash::{SmtHasher, Sha256Hasher};
-use crate::path::{SmtKey, CompressedPath};
 
 // ─── Branch enum ─────────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ pub enum Branch {
 pub struct LeafBranch {
     /// Full 32-byte key.
     pub key: SmtKey,
-    /// The leaf value (e.g. CertDataHash, 32 bytes).
+    /// The opaque leaf value (a transaction hash in the aggregation tree).
     pub value: Vec<u8>,
     /// Hash, always computed at construction.
     pub hash: [u8; 32],
@@ -75,7 +75,9 @@ pub struct NodeBranch {
 pub fn branch_hash(b: &Branch) -> [u8; 32] {
     match b {
         Branch::Leaf(l) => l.hash,
-        Branch::Node(n) => n.hash.expect("Arc<Branch::Node> must have pre-computed hash"),
+        Branch::Node(n) => n
+            .hash
+            .expect("Arc<Branch::Node> must have pre-computed hash"),
         Branch::Stub(h) => *h,
     }
 }

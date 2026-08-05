@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::hash::{SmtHasher, Sha256Hasher};
+use crate::hash::{Sha256Hasher, SmtHasher};
 use crate::path::{key_bit_at, prefix_region, CompressedPath, SmtKey, KEY_BITS};
 use crate::types::{branch_hash, make_leaf, make_node, Branch, LeafBranch, NodeBranch};
 
@@ -46,12 +46,18 @@ impl SparseMerkleTree {
 
     /// O(1) CoW clone — just clones the root Arc.
     pub fn deep_clone(&self) -> Self {
-        Self { root: self.root.clone() }
+        Self {
+            root: self.root.clone(),
+        }
     }
 
     /// Add a single leaf using the given hasher.
     /// Returns `Err(DuplicateLeaf)` if the key already exists.
-    pub fn add_leaf_with<H: SmtHasher>(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
+    pub fn add_leaf_with<H: SmtHasher>(
+        &mut self,
+        key: SmtKey,
+        value: Vec<u8>,
+    ) -> Result<(), SmtError> {
         if self.find_leaf(&key).is_some() {
             return Err(SmtError::DuplicateLeaf);
         }
@@ -80,11 +86,19 @@ impl Default for SparseMerkleTree {
 
 // ─── Leaf lookup ────────────────────────────────────────────────────────────
 
-fn find_leaf_in<'a>(node: Option<&'a Branch>, key: &SmtKey, start_bit: usize) -> Option<&'a LeafBranch> {
+fn find_leaf_in<'a>(
+    node: Option<&'a Branch>,
+    key: &SmtKey,
+    start_bit: usize,
+) -> Option<&'a LeafBranch> {
     let b = node?;
     match b {
         Branch::Leaf(l) => {
-            if l.key == *key { Some(l) } else { None }
+            if l.key == *key {
+                Some(l)
+            } else {
+                None
+            }
         }
         Branch::Node(n) => {
             let n_path = n.path.path_len();
@@ -205,11 +219,7 @@ fn first_diverging_bit(a: &SmtKey, b: &SmtKey, start_bit: usize) -> usize {
     KEY_BITS
 }
 
-fn first_divergence_in_prefix(
-    path: &CompressedPath,
-    key: &SmtKey,
-    start_bit: usize,
-) -> usize {
+fn first_divergence_in_prefix(path: &CompressedPath, key: &SmtKey, start_bit: usize) -> usize {
     let n = path.path_len();
     for i in 0..n {
         if path.bit_at(i) != key_bit_at(key, start_bit + i) {
@@ -222,7 +232,11 @@ fn first_divergence_in_prefix(
 // ─── CompressedPath extension ───────────────────────────────────────────────
 
 impl CompressedPath {
-    pub fn from_key_range_with_path_bits(src: &CompressedPath, start: usize, n_bits: usize) -> Self {
+    pub fn from_key_range_with_path_bits(
+        src: &CompressedPath,
+        start: usize,
+        n_bits: usize,
+    ) -> Self {
         let mut cp = Self::empty();
         cp.len = n_bits as u8;
         for i in 0..n_bits {
@@ -255,7 +269,8 @@ mod tests {
 
         // single leaf
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf_with::<H>(make_key(1), vec![0xAB; 32]).unwrap();
+        tree.add_leaf_with::<H>(make_key(1), vec![0xAB; 32])
+            .unwrap();
         assert!(tree.root_hash().is_some());
 
         // two leaves
@@ -266,8 +281,12 @@ mod tests {
 
         // duplicate rejected
         let mut tree = SparseMerkleTree::new();
-        tree.add_leaf_with::<H>(make_key(42), vec![0u8; 32]).unwrap();
-        assert_eq!(tree.add_leaf_with::<H>(make_key(42), vec![1u8; 32]), Err(SmtError::DuplicateLeaf));
+        tree.add_leaf_with::<H>(make_key(42), vec![0u8; 32])
+            .unwrap();
+        assert_eq!(
+            tree.add_leaf_with::<H>(make_key(42), vec![1u8; 32]),
+            Err(SmtError::DuplicateLeaf)
+        );
 
         // find leaf
         let mut tree = SparseMerkleTree::new();
@@ -280,7 +299,9 @@ mod tests {
         let mut tree = SparseMerkleTree::new();
         tree.add_leaf_with::<H>(make_key(1), vec![1u8; 32]).unwrap();
         let mut clone = tree.deep_clone();
-        clone.add_leaf_with::<H>(make_key(2), vec![2u8; 32]).unwrap();
+        clone
+            .add_leaf_with::<H>(make_key(2), vec![2u8; 32])
+            .unwrap();
         assert!(tree.find_leaf(&make_key(2)).is_none());
 
         // deterministic root
@@ -304,15 +325,19 @@ mod tests {
     }
 
     #[test]
-    fn sha256_tree() { run_tests::<Sha256Hasher>(); }
+    fn sha256_tree() {
+        run_tests::<Sha256Hasher>();
+    }
 
     #[test]
-    fn blake2s_tree() { run_tests::<Blake2sHasher>(); }
+    fn blake2s_tree() {
+        run_tests::<Blake2sHasher>();
+    }
 
     #[test]
-    fn blake2b_tree() { run_tests::<Blake2bHasher>(); }
-
-
+    fn blake2b_tree() {
+        run_tests::<Blake2bHasher>();
+    }
 
     #[test]
     fn default_add_leaf_uses_sha256() {
@@ -324,6 +349,4 @@ mod tests {
         t2.add_leaf_with::<Sha256Hasher>(k, v).unwrap();
         assert_eq!(t1.root_hash(), t2.root_hash());
     }
-
-
 }
