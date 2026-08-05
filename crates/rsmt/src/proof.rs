@@ -5,7 +5,8 @@
 //!
 //! ## Format
 //!
-//! - `bitmap`: `[u8; 32]` — set bits indicate node depths on the path.
+//! - `bitmap`: `[u8; 32]` — set bits indicate node depths on the path, with
+//!   depth `d` represented by the `d`-th most-significant bit.
 //! - `siblings`: `Vec<[u8; 32]>` — sibling hashes ordered leaf-to-root.
 //!
 //! ## Verification
@@ -130,7 +131,7 @@ fn generate_proof(
             debug_assert_eq!(depth, start_bit + n_path);
 
             // Set bit in bitmap at this depth.
-            bitmap[depth / 8] |= 1 << (depth % 8);
+            bitmap[depth / 8] |= 0x80 >> (depth % 8);
 
             if key_bit_at(key, depth) == 1 {
                 // Target is right; sibling is left.
@@ -170,7 +171,7 @@ pub fn verify_inclusion(
 
     // Iterate set bits in bitmap descending (deepest = leaf-to-root).
     for depth in (0..256usize).rev() {
-        if (proof.bitmap[depth / 8] >> (depth % 8)) & 1 == 0 {
+        if proof.bitmap[depth / 8] & (0x80 >> (depth % 8)) == 0 {
             continue;
         }
         if sibling_idx == 0 {
@@ -236,6 +237,16 @@ mod tests {
 
         let p2 = tree.get_inclusion_proof(&k2).unwrap();
         assert!(verify_inclusion(&p2, &root, &k2, &v2));
+    }
+
+    #[test]
+    fn bitmap_uses_msb_first_depth_bits() {
+        let mut tree = SparseMerkleTree::new();
+        tree.add_leaf(make_key(0x00), vec![1; 32]).unwrap();
+        tree.add_leaf(make_key(0x80), vec![2; 32]).unwrap();
+
+        let proof = tree.get_inclusion_proof(&make_key(0x00)).unwrap();
+        assert_eq!(proof.bitmap[0], 0x80, "depth zero is the bitmap MSB");
     }
 
     #[test]
