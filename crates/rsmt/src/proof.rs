@@ -143,9 +143,7 @@ fn generate_proof(
                 generate_proof(&n.left, key, depth + 1, bitmap, siblings)
             }
         }
-        Branch::Stub(_) => {
-            panic!("generate_proof: Stub on proof path — materialize first");
-        }
+        Branch::Stub(_) => Err(SmtError::UnmaterializedBranch),
     }
 }
 
@@ -247,6 +245,28 @@ mod tests {
 
         let proof = tree.get_inclusion_proof(&make_key(0x00)).unwrap();
         assert_eq!(proof.bitmap[0], 0x80, "depth zero is the bitmap MSB");
+    }
+
+    #[test]
+    fn unmaterialized_client_selected_branch_returns_error() {
+        use std::sync::Arc;
+
+        use crate::path::CompressedPath;
+        use crate::types::{make_leaf_sha256, make_node_sha256};
+
+        // Model a partially materialized disk tree. The untrusted target selects
+        // the left stub; the right sibling is sufficiently represented by its
+        // hash. This must fail the request, never unwind the round manager.
+        let left = Arc::new(Branch::Stub([0xabu8; 32]));
+        let right = make_leaf_sha256(make_key(0x80), vec![2; 32]);
+        let root = make_node_sha256(CompressedPath::empty(), left, right, 0, [0u8; 32]);
+        let tree = SparseMerkleTree { root: Some(root) };
+        let target = make_key(0x00);
+
+        assert_eq!(
+            tree.get_inclusion_proof(&target),
+            Err(SmtError::UnmaterializedBranch)
+        );
     }
 
     #[test]

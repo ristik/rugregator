@@ -15,6 +15,8 @@ pub enum SmtError {
     DuplicateLeaf,
     #[error("smt: leaf not found")]
     LeafNotFound,
+    #[error("smt: proof path contains an unmaterialized branch")]
+    UnmaterializedBranch,
 }
 
 // ─── SparseMerkleTree ────────────────────────────────────────────────────────
