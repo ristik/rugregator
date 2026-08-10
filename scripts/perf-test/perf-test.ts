@@ -22,15 +22,12 @@
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 import { CertificationData } from '@unicitylabs/state-transition-sdk/lib/api/CertificationData.js';
 import { CertificationStatus } from '@unicitylabs/state-transition-sdk/lib/api/CertificationResponse.js';
+import { NetworkId } from '@unicitylabs/state-transition-sdk/lib/api/NetworkId.js';
 import { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
-import { PayToPublicKeyPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/PayToPublicKeyPredicate.js';
-import { CborSerializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
+import { SignaturePredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js';
 import { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient.js';
 import { MintTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js';
-import { Address } from '@unicitylabs/state-transition-sdk/lib/transaction/Address.js';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenId.js';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -102,13 +99,8 @@ class TokenBucket {
 
 async function makeCertData(): Promise<{ certData: CertificationData; stateId: StateId }> {
   const signingService = new SigningService(SigningService.generatePrivateKey());
-  const predicate = PayToPublicKeyPredicate.fromSigningService(signingService);
-  const mintTx = await MintTransaction.create(
-    await Address.fromPredicate(predicate),
-    new TokenId(crypto.getRandomValues(new Uint8Array(32))),
-    new TokenType(crypto.getRandomValues(new Uint8Array(32))),
-    CborSerializer.encodeArray(),
-  );
+  const predicate = SignaturePredicate.fromSigningService(signingService);
+  const mintTx = await MintTransaction.create(NetworkId.LOCAL, predicate);
   const certData = await CertificationData.fromMintTransaction(mintTx);
   const stateId = await StateId.fromCertificationData(certData);
   return { certData, stateId };

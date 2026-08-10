@@ -16,9 +16,21 @@
  */
 
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
+
+// tsx's `--import tsx` loader hook does not reliably attach to a worker_thread's
+// own entry-point module resolution (Node resolves the entry's format before the
+// hook finishes registering). Bootstrapping the worker with an eval'd script that
+// registers tsx's loader via its programmatic API before importing the real entry
+// file sidesteps that race.
+const workerBootstrap = `
+  import('tsx/esm/api').then(({ register }) => {
+    register();
+    import(${JSON.stringify(pathToFileURL(__filename).href)});
+  });
+`;
 
 // ── Worker thread body ────────────────────────────────────────────────────────
 
@@ -40,13 +52,10 @@ async function runWorker(cfg: WorkerData): Promise<void> {
   const { CertificationData } = await import('@unicitylabs/state-transition-sdk/lib/api/CertificationData.js');
   const { CertificationStatus } = await import('@unicitylabs/state-transition-sdk/lib/api/CertificationResponse.js');
   const { SigningService } = await import('@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js');
-  const { PayToPublicKeyPredicate } = await import('@unicitylabs/state-transition-sdk/lib/predicate/builtin/PayToPublicKeyPredicate.js');
-  const { CborSerializer } = await import('@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js');
+  const { SignaturePredicate } = await import('@unicitylabs/state-transition-sdk/lib/predicate/builtin/SignaturePredicate.js');
   const { StateTransitionClient } = await import('@unicitylabs/state-transition-sdk/lib/StateTransitionClient.js');
   const { MintTransaction } = await import('@unicitylabs/state-transition-sdk/lib/transaction/MintTransaction.js');
-  const { Address } = await import('@unicitylabs/state-transition-sdk/lib/transaction/Address.js');
-  const { TokenId } = await import('@unicitylabs/state-transition-sdk/lib/transaction/TokenId.js');
-  const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js');
+  const { NetworkId } = await import('@unicitylabs/state-transition-sdk/lib/api/NetworkId.js');
 
   const client = new StateTransitionClient(new AggregatorClient(cfg.url));
   const endTime = Date.now() + cfg.durationMs;
@@ -56,13 +65,8 @@ async function runWorker(cfg: WorkerData): Promise<void> {
 
   async function makeCertData(): Promise<CertificationData> {
     const s = new SigningService(SigningService.generatePrivateKey());
-    const p = PayToPublicKeyPredicate.fromSigningService(s);
-    const tx = await MintTransaction.create(
-      await Address.fromPredicate(p),
-      new TokenId(crypto.getRandomValues(new Uint8Array(32))),
-      new TokenType(crypto.getRandomValues(new Uint8Array(32))),
-      CborSerializer.encodeArray(),
-    );
+    const p = SignaturePredicate.fromSigningService(s);
+    const tx = await MintTransaction.create(NetworkId.LOCAL, p);
     return CertificationData.fromMintTransaction(tx);
   }
 
@@ -123,7 +127,8 @@ async function main() {
   const results = await Promise.all(
     Array.from({ length: cfg.threads }, () =>
       new Promise<WorkerResult>((resolve, reject) => {
-        const w = new Worker(__filename, {
+        const w = new Worker(workerBootstrap, {
+          eval: true,
           workerData: { url: cfg.url, concurrency: cfg.workers, durationMs } satisfies WorkerData,
         });
         w.once('message', resolve);

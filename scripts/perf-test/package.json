@@ -6,7 +6,7 @@
     "perf-test": "tsx perf-test-mt.ts"
   },
   "dependencies": {
-    "@unicitylabs/state-transition-sdk": "github:unicitynetwork/state-transition-sdk-js#inclusion_proof.v2"
+    "@unicitylabs/state-transition-sdk": "^2.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
