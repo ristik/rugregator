@@ -1596,16 +1596,18 @@ impl<S: SmtStore> RoundManager<S> {
                     SpecState::Collecting { snap, buffer } => {
                         // Spec was still accumulating (timer hadn't ticked and
                         // batch_limit wasn't reached). Drop the old fork and
-                        // requeue its buffer; the next start_round() will pick
-                        // them up into a fresh speculative snapshot over the
-                        // newly committed state.
+                        // requeue its buffer into `self.pending` with no round
+                        // inflight; the normal round_duration timer or
+                        // batch_limit trigger (handle_new_request/on_timer_tick)
+                        // will call start_round() once actually due. Starting
+                        // it here unconditionally would fire a new round on
+                        // every UC round-trip, collapsing the round cadence to
+                        // the BFT commit latency instead of the configured
+                        // timer/batch_limit.
                         snap.discard();
                         let mut merged = buffer;
                         merged.extend(std::mem::take(&mut self.pending));
                         self.pending = merged;
-                        if !self.pending.is_empty() {
-                            self.start_round().await;
-                        }
                     }
                 }
             }
