@@ -876,7 +876,7 @@ impl<S: SmtStore> RoundManager<S> {
             .zip(flags.iter())
             .filter(|(_, &inserted)| inserted)
             .map(|(req, _)| ProcessedRecord {
-                state_id_hex: hex::encode(&req.state_id),
+                state_id_hex: req.state_id_hex.clone(),
                 cert_data: CertDataFields {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
@@ -1136,7 +1136,7 @@ impl<S: SmtStore> RoundManager<S> {
             .zip(flags.iter())
             .filter(|(_, &ok)| ok)
             .map(|(req, _)| ProcessedRecord {
-                state_id_hex: hex::encode(&req.state_id),
+                state_id_hex: req.state_id_hex.clone(),
                 cert_data: CertDataFields {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
@@ -1750,6 +1750,7 @@ mod tests {
     #[test]
     fn aggregation_tree_leaf_value_is_the_transaction_hash() {
         let request = ValidatedRequest {
+            state_id_hex: hex::encode([0x11; 32]),
             state_id: vec![0x11; 32],
             predicate_cbor: vec![0x22],
             source_state_hash: vec![0x33; 32],

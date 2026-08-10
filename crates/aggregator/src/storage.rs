@@ -220,12 +220,12 @@ impl AggregatorState {
     // ── Request submission ────────────────────────────────────────────────────
 
     pub async fn submit_request(&self, req: ValidatedRequest) -> anyhow::Result<()> {
-        let state_id = hex::encode(&req.state_id);
-        self.add_pending_state_id(&state_id);
+        self.add_pending_state_id(&req.state_id_hex);
+        let state_id_hex = req.state_id_hex.clone();
         match self.request_tx.send(req).await {
             Ok(()) => Ok(()),
             Err(_) => {
-                self.resolve_state_id_hex(&state_id);
+                self.resolve_state_id_hex(&state_id_hex);
                 Err(anyhow::anyhow!("round manager channel closed"))
             }
         }
@@ -238,7 +238,7 @@ impl AggregatorState {
     /// Resolve pending status after a batch is certified or permanently dropped.
     pub(crate) fn resolve_requests(&self, requests: &[ValidatedRequest]) {
         for request in requests {
-            self.resolve_state_id_hex(&hex::encode(&request.state_id));
+            self.resolve_state_id_hex(&request.state_id_hex);
         }
     }
 
@@ -445,6 +445,7 @@ mod tests {
 
     fn request(state_id: [u8; 32]) -> ValidatedRequest {
         ValidatedRequest {
+            state_id_hex: hex::encode(state_id),
             state_id: state_id.to_vec(),
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],

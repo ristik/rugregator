@@ -61,6 +61,11 @@ pub struct ValidationError {
 pub struct ValidatedRequest {
     /// Raw 32-byte StateID (hash, not imprint).
     pub state_id: Vec<u8>,
+    /// Lower-hex encoding of `state_id`, computed once here (on the parallel
+    /// HTTP handler task) so downstream code — in particular the single
+    /// `RoundManager` task, which would otherwise redo this for every request
+    /// in a batch — can reuse it instead of re-deriving it from raw bytes.
+    pub state_id_hex: String,
     /// Re-encoded CBOR of the Predicate (for hashing).
     pub predicate_cbor: Vec<u8>,
     /// Raw 32-byte source-state hash.
@@ -141,6 +146,7 @@ pub fn validate_request(
     })?;
 
     Ok(ValidatedRequest {
+        state_id_hex: hex::encode(state_id),
         state_id: state_id.to_vec(),
         predicate_cbor: predicate_cbor.to_vec(),
         source_state_hash: source_state_hash.to_vec(),

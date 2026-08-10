@@ -170,6 +170,7 @@ mod tests {
 
     fn validated_request(state_id: [u8; 32]) -> crate::validation::ValidatedRequest {
         crate::validation::ValidatedRequest {
+            state_id_hex: hex::encode(state_id),
             state_id: state_id.to_vec(),
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],

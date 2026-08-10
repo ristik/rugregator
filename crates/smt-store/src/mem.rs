@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use rocksdb::{WriteBatch, DB};
 use rsmt::consistency::batch_insert;
 use rsmt::node_serde::{
@@ -189,6 +190,19 @@ impl SmtStore for MemSmt {
         self.tree
             .get_inclusion_proof(key)
             .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn get_inclusion_proofs_batch(
+        &mut self,
+        keys: &[SmtKey],
+    ) -> anyhow::Result<Vec<InclusionProof>> {
+        let tree = &self.tree;
+        keys.par_iter()
+            .map(|key| {
+                tree.get_inclusion_proof(key)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .collect()
     }
 
     fn get_non_inclusion_proof(
