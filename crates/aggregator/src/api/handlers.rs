@@ -43,7 +43,7 @@ pub async fn handle_certification_request(
     // Assign the deadline before validating so the same value is enforced at
     // admission and again when the leaf is materialised. Without a consensus
     // reference time there is nothing to assign or check against.
-    let effective_timeout = match state.effective_timeout(parsed.timeout) {
+    let effective_timeout = match state.effective_timeout(parsed.expires_at) {
         Some(t) => t,
         None => {
             return Err(JsonRpcError {
@@ -63,7 +63,7 @@ pub async fn handle_certification_request(
         &parsed.params,
         &parsed.source_state_hash,
         &parsed.transaction_hash,
-        parsed.timeout,
+        parsed.expires_at,
         effective_timeout,
         &parsed.witness,
     )
@@ -91,7 +91,7 @@ pub async fn handle_certification_request(
         return Err(JsonRpcError {
             code: JsonRpcError::INVALID_PARAMS,
             message: "REQUEST_EXPIRED".into(),
-            data: Some("round reference time has reached the request timeout".into()),
+            data: Some("round reference time has reached the request deadline".into()),
         });
     }
 
@@ -202,8 +202,8 @@ pub async fn handle_get_block_height(
 mod tests {
     use super::*;
 
-    /// Exclusive certification request timeout every fixture in this module uses.
-    const TEST_TIMEOUT: u64 = 1_755_003_600;
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
     use tokio::sync::mpsc;
 
     fn validated_request(state_id: [u8; 32]) -> crate::validation::ValidatedRequest {
@@ -213,8 +213,8 @@ mod tests {
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],
             transaction_hash: vec![3; crate::smt::AGGREGATION_TREE_VALUE_SIZE],
-            timeout: Some(TEST_TIMEOUT),
-            effective_timeout: TEST_TIMEOUT,
+            expires_at: Some(TEST_EXPIRES_AT),
+            effective_timeout: TEST_EXPIRES_AT,
             witness: vec![4; 65],
             public_key: vec![5; 33],
         }

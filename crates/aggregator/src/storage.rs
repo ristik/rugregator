@@ -42,9 +42,9 @@ pub struct WalRecord {
     pub predicate_cbor: Vec<u8>,
     pub source_state_hash: Vec<u8>,
     pub transaction_hash: Vec<u8>,
-    /// Explicit exclusive certification request timeout in Unix seconds, or
+    /// Exclusive certification request deadline in Unix seconds, or
     /// `None` when the service assigned one.
-    pub timeout: Option<u64>,
+    pub expires_at: Option<u64>,
     /// Absolute deadline the request is held to, so recovery re-applies the
     /// same admission decision the original round made.
     pub effective_timeout: u64,
@@ -191,7 +191,7 @@ pub struct AggregatorState {
     /// manager so admission can fail an already-expired request immediately.
     reference_time: AtomicU64,
     /// Default request lifetime in seconds, added to the reference time at
-    /// admission when a request carries no explicit timeout.
+    /// admission when a request carries no explicit deadline.
     default_request_ttl: AtomicU64,
 }
 
@@ -239,10 +239,10 @@ impl AggregatorState {
 
     /// The absolute deadline a request admitted now is held to.
     ///
-    /// An explicit timeout is used verbatim; otherwise the service's default
+    /// An explicit deadline is used verbatim; otherwise the service's default
     /// lifetime is added to the current reference time. The assigned value is
     /// service metadata and does not enter the transaction hash, so a requester
-    /// that omits the timeout needs no clock of its own. `None` means no
+    /// that omits it needs no clock of its own. `None` means no
     /// consensus reference time is available yet.
     pub fn effective_timeout(&self, explicit: Option<u64>) -> Option<u64> {
         let reference_time = self.reference_time();
@@ -525,9 +525,9 @@ pub struct FinalizedRecord {
 mod tests {
     use super::*;
 
-    /// Omitting the timeout delegates assignment to the service: the deadline
+    /// Omitting the deadline delegates assignment to the service: the deadline
     /// is the default lifetime added to the consensus reference time, so the
-    /// requester needs no clock of its own. An explicit timeout is used
+    /// requester needs no clock of its own. An explicit deadline is used
     /// verbatim, and neither value enters the transaction hash.
     #[test]
     fn effective_timeout_is_assigned_only_when_omitted() {
@@ -557,8 +557,8 @@ mod tests {
         assert_eq!(state.reference_time(), 1_755_000_000);
     }
 
-    /// Exclusive certification request timeout every fixture in this module uses.
-    const TEST_TIMEOUT: u64 = 1_755_003_600;
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
     use smt_store::{MemSmt, SmtStore, SmtStoreSnapshot};
 
     fn request(state_id: [u8; 32]) -> ValidatedRequest {
@@ -568,8 +568,8 @@ mod tests {
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],
             transaction_hash: vec![3; AGGREGATION_TREE_VALUE_SIZE],
-            timeout: Some(TEST_TIMEOUT),
-            effective_timeout: TEST_TIMEOUT,
+            expires_at: Some(TEST_EXPIRES_AT),
+            effective_timeout: TEST_EXPIRES_AT,
             witness: vec![4; 65],
             public_key: vec![5; 33],
         }

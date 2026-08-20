@@ -71,8 +71,11 @@ pub const INCLUSION_PROOF_TAG: u64 = 39033;
 /// CBOR tag for the relation-specific non-inclusion proof object.
 pub const NON_INCLUSION_PROOF_TAG: u64 = 39034;
 const VERSION: u64 = 1;
-/// CertificationData profile that carries an explicit request timeout.
-const CERT_DATA_VERSION_TIMEOUT: u64 = 2;
+/// The only accepted CertificationData wire version. One version, one element
+/// count: `expiresAt` holds its slot as CBOR null when the requester left the
+/// deadline to the service.
+const CERT_DATA_VERSION: u64 = 2;
+const CERT_DATA_FIELD_COUNT: usize = 6;
 
 pub fn val_as_bool(v: &Value, path: &str) -> Result<bool, CborError> {
     match v {
@@ -122,9 +125,9 @@ pub struct ParsedCertificationRequest {
     /// 32-byte transaction hash. It commits to `timeout`, so the witness signs
     /// the timeout along with the rest of the transaction.
     pub transaction_hash: Vec<u8>,
-    /// Explicit exclusive certification request timeout in Unix seconds, or
-    /// `None` when the requester delegates timeout assignment to the service.
-    pub timeout: Option<u64>,
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the requester leaves the deadline to the service.
+    pub expires_at: Option<u64>,
     /// 65-byte witness.
     pub witness: Vec<u8>,
 }
@@ -180,28 +183,8 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
 
     let state_id = val_as_bytes(&arr[1], "StateID")?;
     let cert = val_as_tag(&arr[2], CERTIFICATION_DATA_TAG, "CertificationData")?;
-    let cert_version = match cert {
-        Value::Array(fields) if !fields.is_empty() => {
-            val_as_u64(&fields[0], "CertificationData.version")?
-        }
-        _ => {
-            return Err(CborError::TypeMismatch {
-                path: "CertificationData".into(),
-                msg: "expected non-empty array".into(),
-            })
-        }
-    };
-    let expected_len = match cert_version {
-        VERSION => 5,
-        CERT_DATA_VERSION_TIMEOUT => 6,
-        other => {
-            return Err(CborError::TypeMismatch {
-                path: "CertificationData.version".into(),
-                msg: format!("unsupported version {other}"),
-            })
-        }
-    };
-    let cert_arr = val_as_exact_array(cert, expected_len, "CertificationData")?;
+    let cert_arr = val_as_exact_array(cert, CERT_DATA_FIELD_COUNT, "CertificationData")?;
+    require_version(&cert_arr[0], CERT_DATA_VERSION, "CertificationData.version")?;
 
     let predicate = &cert_arr[1];
     let predicate_inner = val_as_tag(predicate, PREDICATE_TAG, "Predicate")?;
@@ -213,14 +196,11 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
 
     let source_state_hash = val_as_bytes(&cert_arr[2], "SourceStateHash")?;
     let transaction_hash = val_as_bytes(&cert_arr[3], "TransactionHash")?;
-    let (timeout, witness) = if cert_version == CERT_DATA_VERSION_TIMEOUT {
-        (
-            Some(val_as_u64(&cert_arr[4], "Timeout")?),
-            val_as_bytes(&cert_arr[5], "Witness")?,
-        )
-    } else {
-        (None, val_as_bytes(&cert_arr[4], "Witness")?)
+    let expires_at = match &cert_arr[4] {
+        Value::Null => None,
+        v => Some(val_as_u64(v, "ExpiresAt")?),
     };
+    let witness = val_as_bytes(&cert_arr[5], "Witness")?;
     if val_as_u64(&arr[3], "CertificationRequest.reserved")? != 0 {
         return Err(CborError::TypeMismatch {
             path: "CertificationRequest.reserved".into(),
@@ -236,7 +216,7 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
         params,
         source_state_hash,
         transaction_hash,
-        timeout,
+        expires_at,
         witness,
     })
 }
@@ -532,9 +512,9 @@ pub struct CertDataFields {
     pub predicate_cbor: Vec<u8>, // raw predicate CBOR (decoded, for embedding)
     pub source_state_hash: Vec<u8>,
     pub transaction_hash: Vec<u8>,
-    /// Explicit exclusive certification request timeout in Unix seconds, or
-    /// `None` when the requester delegates timeout assignment to the service.
-    pub timeout: Option<u64>,
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the requester leaves the deadline to the service.
+    pub expires_at: Option<u64>,
     pub witness: Vec<u8>,
 }
 
@@ -543,22 +523,19 @@ fn build_cert_data_value(cd: &CertDataFields) -> Result<Value, CborError> {
     let pred_val = decode_cbor_value(&cd.predicate_cbor)?;
     let predicate = val_as_tag(&pred_val, PREDICATE_TAG, "Predicate")?;
     val_as_exact_array(predicate, 3, "Predicate")?;
-    // Re-encode in the profile the request used: version 1 omits the timeout,
-    // version 2 carries it. The transaction hash commits to the timeout only in
-    // version 2, so the profile cannot be changed on re-encoding.
-    let mut fields = vec![
-        Value::Integer(ciborium::value::Integer::from(match cd.timeout {
-            None => VERSION,
-            Some(_) => CERT_DATA_VERSION_TIMEOUT,
-        })),
+    // One shape: the deadline holds its slot either way, so re-encoding cannot
+    // change the element count and the transaction hash stays reproducible.
+    let fields = vec![
+        Value::Integer(ciborium::value::Integer::from(CERT_DATA_VERSION)),
         pred_val,
         Value::Bytes(cd.source_state_hash.clone()),
         Value::Bytes(cd.transaction_hash.clone()),
+        match cd.expires_at {
+            None => Value::Null,
+            Some(expires_at) => Value::Integer(ciborium::value::Integer::from(expires_at)),
+        },
+        Value::Bytes(cd.witness.clone()),
     ];
-    if let Some(timeout) = cd.timeout {
-        fields.push(Value::Integer(ciborium::value::Integer::from(timeout)));
-    }
-    fields.push(Value::Bytes(cd.witness.clone()));
 
     Ok(Value::Tag(
         CERTIFICATION_DATA_TAG,
@@ -570,8 +547,8 @@ fn build_cert_data_value(cd: &CertDataFields) -> Result<Value, CborError> {
 mod tests {
     use super::*;
 
-    /// Exclusive certification request timeout every fixture in this module uses.
-    const TEST_TIMEOUT: u64 = 1_755_003_600;
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
 
     fn uint(value: u64) -> Value {
         Value::Integer(ciborium::value::Integer::from(value))
@@ -632,14 +609,14 @@ mod tests {
         )
     }
 
-    /// The version 1 certification request the JS, Java, Rust and Go SDKs all
-    /// produce for the shared cross-implementation vector: no timeout, the
-    /// service assigns the deadline.
-    const V1_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778501d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c7791258419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000";
+    /// The certification request the JS, Java, Rust and Go SDKs all produce for
+    /// the shared cross-implementation vector when the requester leaves the
+    /// deadline to the service: `expiresAt` holds its slot as CBOR null.
+    const ABSENT_DEADLINE_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820c034e096d7bdf71ba759558663b5cafb7279ecb7e284443e5e6cbce0461aceeef6584154ca6b19a7dbcae7a6adc38af5c8672f81943ecaf51345436684299b4b7ac81a57db2653f32048981e37913db4749ca08d998d1fac4a52ab5579988bc2c50de90000";
 
-    /// The same request in the version 2 profile: the explicit timeout sits
-    /// between the transaction hash and the witness, and the transaction hash
-    /// commits to it.
+    /// The same request with a sender-chosen deadline in that slot. Same
+    /// version, same element count; the transaction hash commits to whichever
+    /// value the slot holds.
     const V2_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820ed275ff0a0694d1b61ec22f13914a431569220ba7f2f043d7940aac78d02c2f91a689b2cc0584111f0f7929d70e0e32db9159b7e23b6e0043502bc36609728e9dc0353251c241a7b1adb047c9234cd77ed519c409048a6c8bc247f0262c1f161b03d6fee49426e0000";
 
     #[test]
@@ -665,15 +642,14 @@ mod tests {
         assert!(val_as_u64(&negative, "unsigned").is_err());
     }
 
-    /// A version 2 CertificationData carries the explicit timeout between the
-    /// transaction hash and the witness. The profile comes from the version
-    /// field, never from an ambiguous field value.
+    /// The deadline sits between the transaction hash and the witness, and is
+    /// read from that fixed position rather than inferred from the shape.
     #[test]
     fn parses_explicit_timeout_certification_request() {
         let request = hex::decode(V2_REQUEST).unwrap();
         let parsed = parse_certification_request_bytes(&request).unwrap();
 
-        assert_eq!(parsed.timeout, Some(1_755_000_000));
+        assert_eq!(parsed.expires_at, Some(1_755_000_000));
         assert_eq!(parsed.witness.len(), 65);
     }
 
@@ -683,7 +659,7 @@ mod tests {
     /// and every SDK would reject the proof.
     #[test]
     fn re_encoding_preserves_the_certification_data_bytes() {
-        for request in [V1_REQUEST, V2_REQUEST] {
+        for request in [ABSENT_DEADLINE_REQUEST, V2_REQUEST] {
             let bytes = hex::decode(request).unwrap();
             let parsed = parse_certification_request_bytes(&bytes).unwrap();
 
@@ -691,7 +667,7 @@ mod tests {
                 predicate_cbor: parsed.predicate_cbor.clone(),
                 source_state_hash: parsed.source_state_hash.clone(),
                 transaction_hash: parsed.transaction_hash.clone(),
-                timeout: parsed.timeout,
+                expires_at: parsed.expires_at,
                 witness: parsed.witness.clone(),
             };
             let encoded = hex::encode(
@@ -705,14 +681,13 @@ mod tests {
         }
     }
 
-    /// Each version pairs with exactly one field count. A five-element array
-    /// declaring version 2 promises a timeout it does not carry, and a
-    /// six-element array declaring version 1 carries bytes its transaction
-    /// hash does not commit to. Neither is a recognised profile.
+    /// There is one version and one element count. Anything else is rejected,
+    /// including the retired encodings that omitted the deadline slot.
     #[test]
-    fn rejects_mismatched_certification_data_profiles() {
+    fn rejects_any_other_certification_data_version() {
         for mutated in [
-            V1_REQUEST.replace("d998778501", "d998778502"),
+            ABSENT_DEADLINE_REQUEST.replace("d998778602", "d998778601"),
+            ABSENT_DEADLINE_REQUEST.replace("d998778602", "d998778603"),
             V2_REQUEST.replace("d998778602", "d998778601"),
         ] {
             let bytes = hex::decode(mutated).unwrap();
@@ -723,7 +698,7 @@ mod tests {
 
     #[test]
     fn parses_versioned_sdk_certification_request_golden_vector() {
-        let request = hex::decode(V1_REQUEST).unwrap();
+        let request = hex::decode(ABSENT_DEADLINE_REQUEST).unwrap();
         let parsed = parse_certification_request_bytes(&request).unwrap();
 
         assert_eq!(
@@ -735,7 +710,7 @@ mod tests {
         assert_eq!(parsed.params.len(), 33);
         assert_eq!(parsed.source_state_hash.len(), 32);
         assert_eq!(parsed.transaction_hash.len(), 32);
-        assert_eq!(parsed.timeout, None);
+        assert_eq!(parsed.expires_at, None);
         assert_eq!(parsed.witness.len(), 65);
 
         let mut trailing = request;
@@ -773,7 +748,7 @@ mod tests {
             predicate_cbor: encode_cbor_value(&predicate).unwrap(),
             source_state_hash: vec![3; 32],
             transaction_hash: vec![4; 32],
-            timeout: Some(TEST_TIMEOUT),
+            expires_at: Some(TEST_EXPIRES_AT),
             witness: vec![5; 65],
         };
         let encoded = encode_inclusion_proof_response(

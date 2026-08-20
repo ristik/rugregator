@@ -33,8 +33,8 @@ pub struct Config {
     pub batch_limit: usize,
 
     /// Default request lifetime in seconds, assigned when a certification
-    /// request carries no explicit timeout. Measured in consensus reference
-    /// time, so a requester that omits the timeout needs no clock of its own.
+    /// request carries no explicit deadline. Measured in consensus reference
+    /// time, so a requester that omits it needs no clock of its own.
     #[arg(
         long,
         env = "AGGREGATOR_DEFAULT_REQUEST_TTL_SECS",

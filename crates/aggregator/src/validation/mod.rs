@@ -72,10 +72,10 @@ pub struct ValidatedRequest {
     pub source_state_hash: Vec<u8>,
     /// Raw 32-byte transaction hash.
     pub transaction_hash: Vec<u8>,
-    /// Explicit exclusive certification request timeout in Unix seconds, or
-    /// `None` when the requester delegates timeout assignment to the service.
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the requester leaves the deadline to the service.
     /// The transaction hash commits to it only when it is explicit.
-    pub timeout: Option<u64>,
+    pub expires_at: Option<u64>,
     /// Absolute deadline the request is actually held to: the explicit timeout
     /// when there is one, otherwise the service's default lifetime added to the
     /// reference time at admission. It is service metadata and does not enter
@@ -101,7 +101,7 @@ pub fn validate_request(
     params: &[u8],
     source_state_hash: &[u8],
     transaction_hash: &[u8],
-    timeout: Option<u64>,
+    expires_at: Option<u64>,
     effective_timeout: u64,
     witness: &[u8],
 ) -> Result<ValidatedRequest, ValidationError> {
@@ -162,7 +162,7 @@ pub fn validate_request(
         predicate_cbor: predicate_cbor.to_vec(),
         source_state_hash: source_state_hash.to_vec(),
         transaction_hash: transaction_hash.to_vec(),
-        timeout,
+        expires_at,
         effective_timeout,
         witness: witness.to_vec(),
         public_key: pred.public_key,

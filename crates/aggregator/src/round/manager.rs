@@ -784,7 +784,7 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: r.predicate_cbor.clone(),
                     source_state_hash: r.source_state_hash.clone(),
                     transaction_hash: r.transaction_hash.clone(),
-                    timeout: r.timeout,
+                    expires_at: r.expires_at,
                     witness: r.witness.clone(),
                 },
                 effective_timeout: r.effective_timeout,
@@ -967,7 +967,7 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
-                    timeout: req.timeout,
+                    expires_at: req.expires_at,
                     witness: req.witness.clone(),
                 },
                 effective_timeout: req.effective_timeout,
@@ -1083,7 +1083,7 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
-                        timeout: r.cert_data.timeout,
+                        expires_at: r.cert_data.expires_at,
                         effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
@@ -1257,7 +1257,7 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
-                    timeout: req.timeout,
+                    expires_at: req.expires_at,
                     witness: req.witness.clone(),
                 },
                 effective_timeout: req.effective_timeout,
@@ -1405,7 +1405,7 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
-                        timeout: r.cert_data.timeout,
+                        expires_at: r.cert_data.expires_at,
                         effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
@@ -1529,7 +1529,7 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
-                        timeout: r.cert_data.timeout,
+                        expires_at: r.cert_data.expires_at,
                         effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
@@ -1890,8 +1890,8 @@ impl<S: SmtStore> RoundManager<S> {
 mod tests {
     use super::*;
 
-    /// Exclusive certification request timeout every fixture in this module uses.
-    const TEST_TIMEOUT: u64 = 1_755_003_600;
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
 
     #[test]
     fn the_declared_batch_carries_the_transaction_hash() {
@@ -1901,8 +1901,8 @@ mod tests {
             predicate_cbor: vec![0x22],
             source_state_hash: vec![0x33; 32],
             transaction_hash: vec![0x44; 32],
-            timeout: Some(TEST_TIMEOUT),
-            effective_timeout: TEST_TIMEOUT,
+            expires_at: Some(TEST_EXPIRES_AT),
+            effective_timeout: TEST_EXPIRES_AT,
             witness: vec![0x55; 65],
             public_key: vec![0x66; 33],
         };
@@ -1926,7 +1926,7 @@ mod tests {
             predicate_cbor: vec![0x22],
             source_state_hash: vec![0x33; 32],
             transaction_hash: vec![0x44; 32],
-            timeout: None,
+            expires_at: None,
             effective_timeout,
             witness: vec![0x55; 65],
             public_key: vec![0x66; 33],

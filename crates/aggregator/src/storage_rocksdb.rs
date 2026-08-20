@@ -197,7 +197,7 @@ fn encode_record(
     write_var(&mut buf, &cert.predicate_cbor);
     buf.extend_from_slice(&cert.source_state_hash);
     buf.extend_from_slice(&cert.transaction_hash);
-    write_opt_u64(&mut buf, cert.timeout);
+    write_opt_u64(&mut buf, cert.expires_at);
     write_var(&mut buf, &cert.witness);
     write_var(&mut buf, merkle_path_cbor);
     buf
@@ -227,7 +227,7 @@ fn decode_record(key: &[u8], val: &[u8]) -> anyhow::Result<(String, RecordInfo)>
     let predicate_cbor = read_var(val, &mut p)?;
     let source_state_hash = read_exact(val, &mut p, 32)?;
     let transaction_hash = read_exact(val, &mut p, 32)?;
-    let timeout = read_opt_u64(val, &mut p)?;
+    let expires_at = read_opt_u64(val, &mut p)?;
     let witness = read_var(val, &mut p)?;
     let merkle_path_cbor = read_var(val, &mut p)?;
 
@@ -240,7 +240,7 @@ fn decode_record(key: &[u8], val: &[u8]) -> anyhow::Result<(String, RecordInfo)>
                 predicate_cbor,
                 source_state_hash,
                 transaction_hash,
-                timeout,
+                expires_at,
                 witness,
             },
             merkle_path_cbor: Some(merkle_path_cbor),
@@ -310,7 +310,7 @@ fn encode_pending_round(r: &PendingRound) -> Vec<u8> {
         write_var(&mut buf, &rec.predicate_cbor);
         buf.extend_from_slice(&pad32(&rec.source_state_hash));
         buf.extend_from_slice(&pad32(&rec.transaction_hash));
-        write_opt_u64(&mut buf, rec.timeout);
+        write_opt_u64(&mut buf, rec.expires_at);
         buf.extend_from_slice(&rec.effective_timeout.to_be_bytes());
         write_var(&mut buf, &rec.witness);
     }
@@ -338,7 +338,7 @@ fn decode_pending_round(buf: &[u8]) -> anyhow::Result<PendingRound> {
         let predicate_cbor = read_var(buf, &mut p)?;
         let source_state_hash = read_exact(buf, &mut p, 32)?;
         let transaction_hash = read_exact(buf, &mut p, 32)?;
-        let timeout = read_opt_u64(buf, &mut p)?;
+        let expires_at = read_opt_u64(buf, &mut p)?;
         let effective_timeout = read_u64(buf, &mut p)?;
         let witness = read_var(buf, &mut p)?;
         inserted.push(WalRecord {
@@ -346,7 +346,7 @@ fn decode_pending_round(buf: &[u8]) -> anyhow::Result<PendingRound> {
             predicate_cbor,
             source_state_hash,
             transaction_hash,
-            timeout,
+            expires_at,
             effective_timeout,
             witness,
         });
@@ -364,7 +364,7 @@ fn decode_pending_round(buf: &[u8]) -> anyhow::Result<PendingRound> {
 }
 
 /// Encode an optional u64 as a presence flag followed by the value. A request
-/// that carried no explicit timeout must decode back as absent, not as zero.
+/// that carried no explicit deadline must decode back as absent, not as zero.
 fn write_opt_u64(buf: &mut Vec<u8>, v: Option<u64>) {
     match v {
         Some(value) => {
