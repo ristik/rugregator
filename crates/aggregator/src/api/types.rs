@@ -58,15 +58,27 @@ impl JsonRpcError {
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
-    /// Application-level "not found" — maps to HTTP 404.
-    pub const NOT_FOUND: i32 = -32001;
+    // JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
+    // errors. Within that range the Unicity aggregators split the space:
+    //
+    //   -32000..-32019  implementation-private. aggregator-go allocates
+    //                   -32000..-32006 here, so nothing shared may use them.
+    //   -32020..-32039  shared proof-lookup states, below. These describe the
+    //                   protocol rather than one implementation, so another
+    //                   aggregator can adopt them verbatim and a client can
+    //                   read them without knowing which server it reached.
+    //
+    /// The aggregator has no record of this state id: neither certified nor
+    /// pending. Maps to HTTP 404.
+    pub const NOT_FOUND: i32 = -32020;
+    /// A known certification request has not reached a certified block yet.
+    /// The client should keep polling.
+    pub const INCLUSION_PENDING: i32 = -32021;
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
-    pub const STATE_INCLUDED: i32 = -32002;
-    /// A known certification request has not reached a certified block yet.
-    pub const INCLUSION_PENDING: i32 = -32003;
+    pub const STATE_INCLUDED: i32 = -32022;
     /// The bounded proof service has no free admission slot.
-    pub const SERVER_BUSY: i32 = -32004;
+    pub const SERVER_BUSY: i32 = -32023;
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
