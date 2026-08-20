@@ -9,4 +9,7 @@ use crate::api::cbor::CertDataFields;
 pub struct ProcessedRecord {
     pub state_id_hex: String,
     pub cert_data: CertDataFields,
+    /// Absolute deadline the request was held to, carried into the WAL so
+    /// recovery re-applies the same admission decision.
+    pub effective_timeout: u64,
 }

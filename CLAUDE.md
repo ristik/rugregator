@@ -73,6 +73,7 @@ State is shared as `Arc<AggregatorState>` between HTTP handlers and the round ma
 1. **Predicate**: engine=1, code=`[0x01]`, params=33-byte compressed secp256k1 pubkey
 2. **StateID**: must equal `SHA256(CborArray(2) || cbor(predicate) || CborBytes(sourceStateHash))` as a 32-byte raw hash
 3. **Signature**: secp256k1 over `SHA256(CborArray(2) || CborBytes(sourceStateHash) || CborBytes(transactionHash))`
+4. **Timeout**: a request may only be inserted in a round whose reference time is strictly below its deadline. `CertificationData` version 1 carries no timeout and the service assigns `reference_time + AGGREGATOR_DEFAULT_REQUEST_TTL_SECS`; version 2 carries an explicit one, which the transaction hash commits to. The assigned deadline is service metadata and never enters the transaction hash, so a requester that omits the timeout needs no clock of its own. Admission fails an already-expired request early; the authoritative check runs where the leaf is materialised, against that round's pinned reference time.
 
 Leaf value stored in the SMT is `SHA256(CborArray(2) || CborBytes(txh) || CborUint(tau))`, 32 raw bytes, where `tau` is the reference time of the round the request was validated in (`InputRecord.timestamp`, taken from the previous unicity seal). The batch a round declares to BFT Core carries the transaction hash instead, and the Core re-derives the stored value from the reference time it already enforces — see `rsmt-verify/src/leaf_value.rs`.
 

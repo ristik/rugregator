@@ -118,6 +118,23 @@ pub trait BftCommitter: Send + Sync {
     fn reference_time(&self) -> u64;
 }
 
+/// Split a collected batch into the requests still admissible in a round with
+/// this reference time and those whose deadline it has already reached.
+///
+/// The timeout is exclusive and this is the authoritative check: admission runs
+/// the same test earlier, against whatever reference time was current then, but
+/// only the round that materialises the leaf knows the time the leaf is built
+/// under. A request that fails here can never be inserted in a later round
+/// either, so it is dropped rather than requeued.
+fn partition_expired(
+    batch: Vec<ValidatedRequest>,
+    reference_time: u64,
+) -> (Vec<ValidatedRequest>, Vec<ValidatedRequest>) {
+    batch
+        .into_iter()
+        .partition(|req| reference_time < req.effective_timeout)
+}
+
 /// Canonical aggregation-tree relation: the batch a round declares maps
 /// `StateID -> TransactionHash`. The tree stores `H(transactionHash, tau)`;
 /// the batch keeps the transaction hash so BFT Core re-derives the stored
@@ -767,8 +784,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: r.predicate_cbor.clone(),
                     source_state_hash: r.source_state_hash.clone(),
                     transaction_hash: r.transaction_hash.clone(),
+                    timeout: r.timeout,
                     witness: r.witness.clone(),
                 },
+                effective_timeout: r.effective_timeout,
             })
             .collect();
 
@@ -892,8 +911,25 @@ impl<S: SmtStore> RoundManager<S> {
 
         let block_number = self.state.current_block_number().await;
         // Pin the reference time for the whole round: every leaf value binds
-        // it and the certification request reports it.
+        // it and the certification request reports it. Publishing it lets
+        // admission reject an already-expired request without waiting for a
+        // round, and assign a default deadline to one that omits its timeout.
         let reference_time = self.bft.reference_time();
+        self.state.set_reference_time(reference_time);
+        let (batch, expired) = partition_expired(batch, reference_time);
+        if !expired.is_empty() {
+            warn!(
+                block = block_number,
+                count = expired.len(),
+                reference_time,
+                "dropping expired certification requests"
+            );
+            self.state.resolve_requests(&expired);
+        }
+        if batch.is_empty() {
+            return;
+        }
+
         info!(
             block = block_number,
             count = batch.len(),
@@ -931,8 +967,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
+                    timeout: req.timeout,
                     witness: req.witness.clone(),
                 },
+                effective_timeout: req.effective_timeout,
             })
             .collect();
 
@@ -1045,6 +1083,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        timeout: r.cert_data.timeout,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1163,6 +1203,24 @@ impl<S: SmtStore> RoundManager<S> {
         // certificate arrives with a later seal timestamp the promoted round
         // pins that instead and the buffer is re-inserted.
         let reference_time = self.bft.reference_time();
+        let (buffer, expired) = partition_expired(buffer, reference_time);
+        if !expired.is_empty() {
+            warn!(
+                block = block_number,
+                count = expired.len(),
+                reference_time,
+                "dropping expired certification requests"
+            );
+            self.state.resolve_requests(&expired);
+        }
+        if buffer.is_empty() {
+            inf.spec = SpecState::Collecting {
+                snap,
+                buffer: Vec::new(),
+            };
+            self.inflight = Some(inf);
+            return;
+        }
 
         // Build StateID -> TransactionHash pairs, mirroring start_round.
         let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = buffer.par_iter().map(request_smt_pair).collect();
@@ -1199,8 +1257,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
+                    timeout: req.timeout,
                     witness: req.witness.clone(),
                 },
+                effective_timeout: req.effective_timeout,
             })
             .collect();
 
@@ -1345,6 +1405,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        timeout: r.cert_data.timeout,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1467,6 +1529,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        timeout: r.cert_data.timeout,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1826,6 +1890,9 @@ impl<S: SmtStore> RoundManager<S> {
 mod tests {
     use super::*;
 
+    /// Exclusive certification request timeout every fixture in this module uses.
+    const TEST_TIMEOUT: u64 = 1_755_003_600;
+
     #[test]
     fn the_declared_batch_carries_the_transaction_hash() {
         let request = ValidatedRequest {
@@ -1834,6 +1901,8 @@ mod tests {
             predicate_cbor: vec![0x22],
             source_state_hash: vec![0x33; 32],
             transaction_hash: vec![0x44; 32],
+            timeout: Some(TEST_TIMEOUT),
+            effective_timeout: TEST_TIMEOUT,
             witness: vec![0x55; 65],
             public_key: vec![0x66; 33],
         };
@@ -1848,6 +1917,37 @@ mod tests {
             rsmt::leaf_value(&value, 1_755_000_000).to_vec(),
             request.transaction_hash
         );
+    }
+
+    fn request_with_deadline(effective_timeout: u64) -> ValidatedRequest {
+        ValidatedRequest {
+            state_id_hex: hex::encode([0x11; 32]),
+            state_id: vec![0x11; 32],
+            predicate_cbor: vec![0x22],
+            source_state_hash: vec![0x33; 32],
+            transaction_hash: vec![0x44; 32],
+            timeout: None,
+            effective_timeout,
+            witness: vec![0x55; 65],
+            public_key: vec![0x66; 33],
+        }
+    }
+
+    /// The timeout is exclusive, and the check that decides is the one made
+    /// against the reference time the round actually builds its leaves under.
+    #[test]
+    fn expired_requests_are_dropped_at_materialisation() {
+        let batch = vec![
+            request_with_deadline(1_755_000_001),
+            request_with_deadline(1_755_000_000),
+            request_with_deadline(1_754_999_999),
+        ];
+
+        let (admitted, expired) = partition_expired(batch, 1_755_000_000);
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].effective_timeout, 1_755_000_001);
+        assert_eq!(expired.len(), 2);
     }
 
     #[test]

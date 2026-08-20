@@ -40,6 +40,20 @@ pub async fn handle_certification_request(
     let parsed = parse_certification_request(&hex_str)
         .map_err(|e| JsonRpcError::invalid_params(format!("failed to parse CBOR: {e}")))?;
 
+    // Assign the deadline before validating so the same value is enforced at
+    // admission and again when the leaf is materialised. Without a consensus
+    // reference time there is nothing to assign or check against.
+    let effective_timeout = match state.effective_timeout(parsed.timeout) {
+        Some(t) => t,
+        None => {
+            return Err(JsonRpcError {
+                code: JsonRpcError::INVALID_PARAMS,
+                message: "SERVICE_NOT_READY".into(),
+                data: Some("no consensus reference time available yet".into()),
+            })
+        }
+    };
+
     // Validate.
     let validated = crate::validation::validate_request(
         &parsed.state_id,
@@ -49,6 +63,8 @@ pub async fn handle_certification_request(
         &parsed.params,
         &parsed.source_state_hash,
         &parsed.transaction_hash,
+        parsed.timeout,
+        effective_timeout,
         &parsed.witness,
     )
     .map_err(|e| {
@@ -60,6 +76,24 @@ pub async fn handle_certification_request(
             data: Some(e.message),
         }
     })?;
+
+    // Fail fast on a request that is already expired against the reference time
+    // rounds are currently pinning. The authoritative check runs again where the
+    // leaf is materialised, against that round's pinned reference time.
+    let reference_time = state.reference_time();
+    if reference_time >= effective_timeout {
+        info!(
+            state_id = %validated.state_id_hex,
+            timeout = effective_timeout,
+            reference_time,
+            "certification_request expired"
+        );
+        return Err(JsonRpcError {
+            code: JsonRpcError::INVALID_PARAMS,
+            message: "REQUEST_EXPIRED".into(),
+            data: Some("round reference time has reached the request timeout".into()),
+        });
+    }
 
     // Submit to round manager.
     state.submit_request(validated).await.map_err(|e| {
@@ -167,6 +201,9 @@ pub async fn handle_get_block_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exclusive certification request timeout every fixture in this module uses.
+    const TEST_TIMEOUT: u64 = 1_755_003_600;
     use tokio::sync::mpsc;
 
     fn validated_request(state_id: [u8; 32]) -> crate::validation::ValidatedRequest {
@@ -176,6 +213,8 @@ mod tests {
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],
             transaction_hash: vec![3; crate::smt::AGGREGATION_TREE_VALUE_SIZE],
+            timeout: Some(TEST_TIMEOUT),
+            effective_timeout: TEST_TIMEOUT,
             witness: vec![4; 65],
             public_key: vec![5; 33],
         }
