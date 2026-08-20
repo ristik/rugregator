@@ -13,8 +13,8 @@ pub mod types;
 // external callers continue to use `rsmt::` paths unchanged.
 pub use rsmt_verify::{
     consistency_proof_to_bytes, decode_aggregator_envelope_v1, encode_aggregator_envelope_v1,
-    key_bit_at, prefix_region, verify_consistency, verify_consistency_with, ConsistencyProof,
-    EnvelopeError, ProofOp, Sha256Hasher, SmtHasher, SmtKey, KEY_BITS,
+    key_bit_at, leaf_value, prefix_region, verify_consistency, verify_consistency_with,
+    ConsistencyProof, EnvelopeError, ProofOp, Sha256Hasher, SmtHasher, SmtKey, KEY_BITS,
 };
 
 pub use consistency::{

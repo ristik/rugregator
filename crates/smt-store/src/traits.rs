@@ -2,7 +2,7 @@
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
-use rsmt::{InclusionProof, NonInclusionProofOutcome, SmtError, SmtHasher, SmtKey};
+use rsmt::{leaf_value, InclusionProof, NonInclusionProofOutcome, SmtError, SmtHasher, SmtKey};
 
 /// Maximum number of admitted proof lookups per certified snapshot.
 ///
@@ -145,14 +145,22 @@ pub trait SmtStoreSnapshot: Send + 'static {
     /// consistency proof. Returns `(inserted_flags, proof_cbor)` where
     /// `inserted_flags[i]` is true iff `batch[i]` was actually inserted
     /// (false = duplicate). `proof_cbor` is `Some` only when `with_proof = true`.
+    /// Insert a round's declared batch.
+    ///
+    /// `batch` carries transaction hashes; the tree stores
+    /// `leaf_value(transactionHash, reference_time)`, and the
+    /// `aggregator_rsmt_v1` envelope declares the transaction hashes so BFT
+    /// Core can re-derive the stored values from the reference time it already
+    /// enforces.
     fn insert_batch(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         _with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
         let mut flags = vec![false; batch.len()];
         for (i, (key, value)) in batch.iter().enumerate() {
-            match self.add_leaf(*key, value.clone()) {
+            match self.add_leaf(*key, leaf_value(value, reference_time).to_vec()) {
                 Ok(()) => flags[i] = true,
                 Err(SmtError::DuplicateLeaf) => {}
                 Err(e) => return Err(anyhow::anyhow!("add_leaf failed: {e}")),
@@ -168,8 +176,9 @@ pub trait SmtStoreSnapshot: Send + 'static {
     fn insert_batch_with<H: SmtHasher>(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
-        self.insert_batch(batch, with_proof)
+        self.insert_batch(batch, reference_time, with_proof)
     }
 }

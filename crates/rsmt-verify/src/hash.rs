@@ -54,9 +54,10 @@ impl SmtHasher for Sha256Hasher {
 
 // ─── Platform dispatch ────────────────────────────────────────────────────────
 
-/// Hash the concatenation of the given slices with SHA-256.
+/// Hash the concatenation of the given slices with SHA-256, using the SP1
+/// precompile where available.
 #[inline]
-fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+pub fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
     #[cfg(all(
         target_os = "zkvm",
         target_vendor = "succinct",

@@ -39,7 +39,9 @@ pub fn validate_pay_to_public_key(
         return Err(PredicateError::InvalidCode(code.to_vec()));
     }
     validate_public_key(params)?;
-    Ok(PayToPublicKeyPredicate { public_key: params.to_vec() })
+    Ok(PayToPublicKeyPredicate {
+        public_key: params.to_vec(),
+    })
 }
 
 /// Verify that `key_bytes` is a valid compressed secp256k1 public key.

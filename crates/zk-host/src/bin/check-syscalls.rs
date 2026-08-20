@@ -110,9 +110,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("done");
     }
 
-    let prev_root: [u8; 32] = tree
-        .root_hash()
-        .unwrap_or([0u8; 32]);
+    let prev_root: [u8; 32] = tree.root_hash().unwrap_or([0u8; 32]);
 
     eprint!("Inserting batch of {} leaves with proof… ", args.batch_size);
     let (sorted_batch, proof) =
@@ -147,16 +145,16 @@ fn main() -> anyhow::Result<()> {
     // ── Report ────────────────────────────────────────────────────────────────
 
     let compress = report.syscall_counts[SyscallCode::SHA_COMPRESS];
-    let extend   = report.syscall_counts[SyscallCode::SHA_EXTEND];
-    let instrs   = report.total_instruction_count();
+    let extend = report.syscall_counts[SyscallCode::SHA_EXTEND];
+    let instrs = report.total_instruction_count();
     let syscalls = report.total_syscall_count();
 
     println!();
     println!(
         "prefill={prefill}  batch={batch}  seed={seed}",
         prefill = args.prefill_size,
-        batch   = args.batch_size,
-        seed    = args.seed,
+        batch = args.batch_size,
+        seed = args.seed,
     );
     println!("instructions : {instrs}");
     println!("syscalls     : {syscalls}");

@@ -69,8 +69,15 @@ pub fn verify_consistency(
     old_root: Option<[u8; 32]>,
     new_root: Option<[u8; 32]>,
     batch: &[(SmtKey, Vec<u8>)],
+    reference_time: u64,
 ) -> bool {
-    verify_consistency_with::<crate::hash::Sha256Hasher>(proof, old_root, new_root, batch)
+    verify_consistency_with::<crate::hash::Sha256Hasher>(
+        proof,
+        old_root,
+        new_root,
+        batch,
+        reference_time,
+    )
 }
 
 /// Advice tuple carried by a stack entry: the depth and region of the
@@ -98,6 +105,7 @@ pub fn verify_consistency_with<H: SmtHasher>(
     old_root: Option<[u8; 32]>,
     new_root: Option<[u8; 32]>,
     batch: &[(SmtKey, Vec<u8>)],
+    reference_time: u64,
 ) -> bool {
     if batch.is_empty() {
         return old_root == new_root && proof.is_empty();
@@ -132,9 +140,18 @@ pub fn verify_consistency_with<H: SmtHasher>(
                 if bi >= batch.len() {
                     return false;
                 }
+                // The batch declares transaction hashes; the tree stores leaf
+                // values that bind the round's reference time. Deriving them
+                // here rather than accepting a supplied leaf value is what
+                // makes a wrong reference time unrepresentable.
                 let (k, v) = &batch[bi];
                 bi += 1;
-                stack.push((None, Some(H::hash_leaf(k, v)), Some((KEY_BITS as u16, *k))));
+                let leaf = crate::leaf_value::leaf_value(v, reference_time);
+                stack.push((
+                    None,
+                    Some(H::hash_leaf(k, &leaf)),
+                    Some((KEY_BITS as u16, *k)),
+                ));
             }
             ProofOp::N(depth) => {
                 let d = *depth;
@@ -432,6 +449,9 @@ pub fn decode_aggregator_envelope_v1(
 mod tests {
     use super::*;
 
+    /// Reference time every fixture in this module builds its leaves under.
+    const TEST_REFERENCE_TIME: u64 = 1_755_000_000;
+
     fn make_key(byte: u8) -> SmtKey {
         let mut k = [0u8; 32];
         k[0] = byte;
@@ -604,10 +624,16 @@ mod tests {
         use crate::hash::Sha256Hasher;
         let k = make_key(1);
         let v = vec![0xAB; 32];
-        let leaf_hash = Sha256Hasher::hash_leaf(&k, &v);
+        let leaf_hash = Sha256Hasher::hash_leaf(&k, &crate::leaf_value(&v, TEST_REFERENCE_TIME));
         let proof = alloc::vec![ProofOp::L];
         let batch = alloc::vec![(k, v)];
-        assert!(verify_consistency(&proof, None, Some(leaf_hash), &batch));
+        assert!(verify_consistency(
+            &proof,
+            None,
+            Some(leaf_hash),
+            &batch,
+            TEST_REFERENCE_TIME
+        ));
     }
 
     #[test]
@@ -617,9 +643,16 @@ mod tests {
             &alloc::vec![],
             Some(root),
             Some(root),
-            &[]
+            &[],
+            TEST_REFERENCE_TIME
         ));
-        assert!(!verify_consistency(&alloc::vec![], Some(root), None, &[]));
+        assert!(!verify_consistency(
+            &alloc::vec![],
+            Some(root),
+            None,
+            &[],
+            TEST_REFERENCE_TIME
+        ));
     }
 
     /// Two new leaves under an empty tree: root = N(bifurcation depth) over
@@ -632,14 +665,20 @@ mod tests {
         k1[0] = 0x80; // diverges from k0 at bit 0 (MSB-first)
         let v0 = vec![1u8; 4];
         let v1 = vec![2u8; 4];
-        let h0 = Sha256Hasher::hash_leaf(&k0, &v0);
-        let h1 = Sha256Hasher::hash_leaf(&k1, &v1);
+        let h0 = Sha256Hasher::hash_leaf(&k0, &crate::leaf_value(&v0, TEST_REFERENCE_TIME));
+        let h1 = Sha256Hasher::hash_leaf(&k1, &crate::leaf_value(&v1, TEST_REFERENCE_TIME));
         let region = prefix_region(&k0, 0);
         let root = Sha256Hasher::hash_node(&h0, &h1, 0, &region);
 
         let proof = alloc::vec![ProofOp::L, ProofOp::L, ProofOp::N(0)];
         let batch = alloc::vec![(k0, v0), (k1, v1)];
-        assert!(verify_consistency(&proof, None, Some(root), &batch));
+        assert!(verify_consistency(
+            &proof,
+            None,
+            Some(root),
+            &batch,
+            TEST_REFERENCE_TIME
+        ));
     }
 
     /// An edge split: a pre-existing leaf, opened via `OL`, becomes the
@@ -655,7 +694,10 @@ mod tests {
         let mut new_key = [0u8; 32];
         new_key[0] = 0x80; // bit 0 = 1: diverges from old_key at depth 0
         let new_value = vec![7u8; 4];
-        let new_leaf_hash = Sha256Hasher::hash_leaf(&new_key, &new_value);
+        let new_leaf_hash = Sha256Hasher::hash_leaf(
+            &new_key,
+            &crate::leaf_value(&new_value, TEST_REFERENCE_TIME),
+        );
 
         let region = prefix_region(&old_key, 0);
         let new_root = Sha256Hasher::hash_node(&old_root, &new_leaf_hash, 0, &region);
@@ -673,7 +715,8 @@ mod tests {
             &proof,
             Some(old_root),
             Some(new_root),
-            &batch
+            &batch,
+            TEST_REFERENCE_TIME
         ));
 
         // The same subtree presented opaquely (as S) instead of opened (as
@@ -683,7 +726,8 @@ mod tests {
             &bad_proof,
             Some(old_root),
             Some(new_root),
-            &batch
+            &batch,
+            TEST_REFERENCE_TIME
         ));
     }
 }

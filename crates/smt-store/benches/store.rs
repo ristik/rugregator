@@ -22,17 +22,21 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Options, DB};
 use tempfile::TempDir;
 
-use smt_store::mem::{CF_SMT_LEAVES, PersistMode};
-use smt_store::{DiskSmt, MemSmt, SmtStore, SmtStoreSnapshot};
 use smt_store::disk::materializer::CF_SMT_NODES;
 use smt_store::disk::store::CF_SMT_META;
+use smt_store::mem::{PersistMode, CF_SMT_LEAVES};
+use smt_store::{DiskSmt, MemSmt, SmtStore, SmtStoreSnapshot};
 
 use rsmt::path::SmtKey;
+
+/// Reference time the benchmark's rounds build their leaves under.
+const BENCH_REFERENCE_TIME: u64 = 1_755_000_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn lcg_next(seed: &mut u64) -> u64 {
-    *seed = seed.wrapping_mul(6_364_136_223_846_793_005)
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
     *seed
 }
@@ -64,8 +68,8 @@ fn open_db(dir: &TempDir) -> Arc<DB> {
 
     let cfs = [
         ColumnFamilyDescriptor::new(CF_SMT_LEAVES, Options::default()),
-        ColumnFamilyDescriptor::new(CF_SMT_NODES,  node_opts),
-        ColumnFamilyDescriptor::new(CF_SMT_META,   Options::default()),
+        ColumnFamilyDescriptor::new(CF_SMT_NODES, node_opts),
+        ColumnFamilyDescriptor::new(CF_SMT_META, Options::default()),
     ];
     Arc::new(DB::open_cf_descriptors(&opts, path, cfs).unwrap())
 }
@@ -77,7 +81,8 @@ fn build_store(prefill: usize, mode: PersistMode, dir: &TempDir) -> MemSmt {
     if prefill > 0 {
         let batch = gen_batch(prefill, 0xdead_beef_cafe_0000);
         let mut snap = store.create_snapshot();
-        snap.insert_batch(&batch, false).unwrap();
+        snap.insert_batch(&batch, BENCH_REFERENCE_TIME, false)
+            .unwrap();
         snap.commit(&mut store).unwrap();
     }
     store
@@ -90,7 +95,8 @@ fn build_disk_store(prefill: usize, dir: &TempDir) -> DiskSmt {
     if prefill > 0 {
         let batch = gen_batch(prefill, 0xdead_beef_cafe_0000);
         let mut snap = store.create_snapshot();
-        snap.insert_batch(&batch, false).unwrap();
+        snap.insert_batch(&batch, BENCH_REFERENCE_TIME, false)
+            .unwrap();
         snap.commit(&mut store).unwrap();
     }
     store
@@ -110,7 +116,8 @@ fn time_commits(store: &mut MemSmt, iters: u64, batch_size: usize, seed_base: u6
 
         // Setup outside the window.
         let mut snap = store.create_snapshot();
-        snap.insert_batch(&batch, false).unwrap();
+        snap.insert_batch(&batch, BENCH_REFERENCE_TIME, false)
+            .unwrap();
 
         // Measure only the commit.
         let t0 = Instant::now();
@@ -125,7 +132,12 @@ fn time_commits(store: &mut MemSmt, iters: u64, batch_size: usize, seed_base: u6
 /// Snapshot creation, insertion, and `root_hash()` (which triggers
 /// materialization from disk + in-memory tree build) are outside the timing
 /// window.  Only the RocksDB write (`commit_overlay`) is measured.
-fn time_disk_commits(store: &mut DiskSmt, iters: u64, batch_size: usize, seed_base: u64) -> Duration {
+fn time_disk_commits(
+    store: &mut DiskSmt,
+    iters: u64,
+    batch_size: usize,
+    seed_base: u64,
+) -> Duration {
     let mut total = Duration::ZERO;
     for i in 0..iters {
         let seed = seed_base.wrapping_add(i.wrapping_mul(999_983));
@@ -133,7 +145,8 @@ fn time_disk_commits(store: &mut DiskSmt, iters: u64, batch_size: usize, seed_ba
 
         // Setup outside the window: materialize + insert + build overlay.
         let mut snap = store.create_snapshot();
-        snap.insert_batch(&batch, false).unwrap();
+        snap.insert_batch(&batch, BENCH_REFERENCE_TIME, false)
+            .unwrap();
         let _ = snap.root_hash().unwrap(); // flushes pending → builds overlay in memory
 
         // Measure only the RocksDB write.
@@ -148,7 +161,7 @@ fn time_disk_commits(store: &mut DiskSmt, iters: u64, batch_size: usize, seed_ba
 
 fn bench_mem_full_commit(c: &mut Criterion) {
     let prefill_sizes = [0usize, 10_000, 100_000];
-    let batch_sizes   = [100usize, 1_000, 10_000];
+    let batch_sizes = [100usize, 1_000, 10_000];
 
     let mut group = c.benchmark_group("mem_full_commit");
 
@@ -180,7 +193,7 @@ fn bench_mem_full_commit(c: &mut Criterion) {
 
 fn bench_mem_leaves_commit(c: &mut Criterion) {
     let prefill_sizes = [0usize, 10_000, 100_000];
-    let batch_sizes   = [100usize, 1_000, 10_000];
+    let batch_sizes = [100usize, 1_000, 10_000];
 
     let mut group = c.benchmark_group("mem_leaves_commit");
 
@@ -209,7 +222,7 @@ fn bench_mem_leaves_commit(c: &mut Criterion) {
 
 fn bench_disk_commit(c: &mut Criterion) {
     let prefill_sizes = [0usize, 10_000, 100_000];
-    let batch_sizes   = [100usize, 1_000, 10_000];
+    let batch_sizes = [100usize, 1_000, 10_000];
 
     let mut group = c.benchmark_group("disk_commit");
 

@@ -410,11 +410,13 @@ fn decode_unicity_certificate_value(data: &[u8]) -> Result<Value, CborError> {
 ///   ])
 /// ]
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn encode_inclusion_proof_response(
     block_number: u64,
     cert_data: Option<&CertDataFields>,
-    merkle_path_cbor: &[u8], // raw InclusionCertificate bytes
-    uc_cbor: &[u8],          // raw CBOR bytes of the UnicityCertificate
+    reference_time: Option<u64>, // reference time the certified leaf was built from
+    merkle_path_cbor: &[u8],     // raw InclusionCertificate bytes
+    uc_cbor: &[u8],              // raw CBOR bytes of the UnicityCertificate
 ) -> Result<String, CborError> {
     let path_val = Value::Bytes(merkle_path_cbor.to_vec());
 
@@ -427,11 +429,21 @@ pub fn encode_inclusion_proof_response(
     // canonical profile shared by inclusion and non-inclusion responses.
     let uc_val = decode_unicity_certificate_value(uc_cbor)?;
 
+    // The reference time cannot be recovered from the embedded certificate:
+    // proofs are served against the current certified root, whose input record
+    // time is the latest round's rather than the one the leaf was created
+    // under. A verifier needs the carried value to reproduce the leaf.
+    let reference_time_val = match reference_time {
+        None => Value::Null,
+        Some(t) => Value::Integer(ciborium::value::Integer::from(t)),
+    };
+
     let proof_val = Value::Tag(
         INCLUSION_PROOF_TAG,
         Box::new(Value::Array(vec![
             Value::Integer(ciborium::value::Integer::from(VERSION)),
             cert_val,
+            reference_time_val,
             path_val,
             uc_val,
         ])),
@@ -642,20 +654,30 @@ mod tests {
             transaction_hash: vec![4; 32],
             witness: vec![5; 65],
         };
-        let encoded =
-            encode_inclusion_proof_response(8, Some(&cert_data), &[0xa6; 96], &uc_cbor).unwrap();
+        let encoded = encode_inclusion_proof_response(
+            8,
+            Some(&cert_data),
+            Some(1_755_000_000),
+            &[0xa6; 96],
+            &uc_cbor,
+        )
+        .unwrap();
         let response = decode_cbor_value(&hex::decode(encoded).unwrap()).unwrap();
         let response = val_as_exact_array(&response, 2, "response").unwrap();
         assert_eq!(val_as_u64(&response[0], "block").unwrap(), 8);
         let proof = val_as_tag(&response[1], INCLUSION_PROOF_TAG, "proof").unwrap();
-        let proof = val_as_exact_array(proof, 4, "proof").unwrap();
+        let proof = val_as_exact_array(proof, 5, "proof").unwrap();
         assert_eq!(val_as_u64(&proof[0], "version").unwrap(), VERSION);
         assert!(val_as_tag(&proof[1], CERTIFICATION_DATA_TAG, "certification data").is_ok());
         assert_eq!(
-            val_as_bytes(&proof[2], "certificate").unwrap(),
+            val_as_u64(&proof[2], "reference time").unwrap(),
+            1_755_000_000
+        );
+        assert_eq!(
+            val_as_bytes(&proof[3], "certificate").unwrap(),
             vec![0xa6; 96]
         );
-        assert_eq!(proof[3], uc);
+        assert_eq!(proof[4], uc);
     }
 
     #[test]
@@ -664,7 +686,7 @@ mod tests {
         let legacy_uc = encode_cbor_value(&legacy_uc).unwrap();
 
         assert!(encode_non_inclusion_proof_response(1, &[], &legacy_uc).is_err());
-        assert!(encode_inclusion_proof_response(1, None, &[], &legacy_uc).is_err());
+        assert!(encode_inclusion_proof_response(1, None, None, &[], &legacy_uc).is_err());
 
         let mut mixed_profile = canonical_uc();
         let Value::Tag(_, uc) = &mut mixed_profile else {
@@ -680,6 +702,6 @@ mod tests {
         let mixed_profile = encode_cbor_value(&mixed_profile).unwrap();
 
         assert!(encode_non_inclusion_proof_response(1, &[], &mixed_profile).is_err());
-        assert!(encode_inclusion_proof_response(1, None, &[], &mixed_profile).is_err());
+        assert!(encode_inclusion_proof_response(1, None, None, &[], &mixed_profile).is_err());
     }
 }

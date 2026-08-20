@@ -140,6 +140,7 @@ pub async fn handle_get_inclusion_proof_v2(
             let hex_cbor = encode_inclusion_proof_response(
                 p.block_number,
                 p.cert_data.as_ref(),
+                p.reference_time,
                 &p.merkle_path_cbor,
                 &p.uc_cbor,
             )

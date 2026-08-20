@@ -74,7 +74,7 @@ State is shared as `Arc<AggregatorState>` between HTTP handlers and the round ma
 2. **StateID**: must equal `SHA256(CborArray(2) || cbor(predicate) || CborBytes(sourceStateHash))` as a 32-byte raw hash
 3. **Signature**: secp256k1 over `SHA256(CborArray(2) || CborBytes(sourceStateHash) || CborBytes(transactionHash))`
 
-Leaf value stored in the SMT is `CertDataHash`: `SHA256(CborArray(4) || cbor(predicate) || CborBytes(ssh) || CborBytes(txh) || CborBytes(witness))` as a 34-byte imprint.
+Leaf value stored in the SMT is `SHA256(CborArray(2) || CborBytes(txh) || CborUint(tau))`, 32 raw bytes, where `tau` is the reference time of the round the request was validated in (`InputRecord.timestamp`, taken from the previous unicity seal). The batch a round declares to BFT Core carries the transaction hash instead, and the Core re-derives the stored value from the reference time it already enforces — see `rsmt-verify/src/leaf_value.rs`.
 
 ### Go compatibility
 

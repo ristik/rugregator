@@ -27,7 +27,11 @@ impl SmtSnapshot {
     }
 
     /// Add a single leaf using a configurable hasher.
-    pub fn add_leaf_with<H: SmtHasher>(&mut self, key: SmtKey, value: Vec<u8>) -> Result<(), SmtError> {
+    pub fn add_leaf_with<H: SmtHasher>(
+        &mut self,
+        key: SmtKey,
+        value: Vec<u8>,
+    ) -> Result<(), SmtError> {
         self.inner.add_leaf_with::<H>(key, value)
     }
 

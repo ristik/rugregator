@@ -66,11 +66,18 @@ impl Prover {
         Ok(Self { client, pk })
     }
 
-    /// Build the stdin buffer: `prev_root[32] || new_root[32] || envelope`.
-    fn make_stdin(envelope: &[u8], prev_root: [u8; 32], new_root: [u8; 32]) -> SP1Stdin {
-        let mut input_buf = Vec::with_capacity(64 + envelope.len());
+    /// Build the stdin buffer:
+    /// `prev_root[32] || new_root[32] || reference_time[8] || envelope`.
+    fn make_stdin(
+        envelope: &[u8],
+        prev_root: [u8; 32],
+        new_root: [u8; 32],
+        reference_time: u64,
+    ) -> SP1Stdin {
+        let mut input_buf = Vec::with_capacity(72 + envelope.len());
         input_buf.extend_from_slice(&prev_root);
         input_buf.extend_from_slice(&new_root);
+        input_buf.extend_from_slice(&reference_time.to_be_bytes());
         input_buf.extend_from_slice(envelope);
 
         let mut stdin = SP1Stdin::new();
@@ -90,8 +97,15 @@ impl Prover {
         envelope: &[u8],
         prev_root: [u8; 32],
         new_root: [u8; 32],
+        reference_time: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        self.prove_with_kind(envelope, prev_root, new_root, ZkProofKind::Core)
+        self.prove_with_kind(
+            envelope,
+            prev_root,
+            new_root,
+            reference_time,
+            ZkProofKind::Core,
+        )
     }
 
     /// Prove with an explicit proof kind.
@@ -100,9 +114,10 @@ impl Prover {
         envelope: &[u8],
         prev_root: [u8; 32],
         new_root: [u8; 32],
+        reference_time: u64,
         kind: ZkProofKind,
     ) -> anyhow::Result<Vec<u8>> {
-        let stdin = Self::make_stdin(envelope, prev_root, new_root);
+        let stdin = Self::make_stdin(envelope, prev_root, new_root, reference_time);
         let proof = match kind {
             ZkProofKind::Core => self.client.prove(&self.pk, stdin).run(),
             ZkProofKind::Compressed => self.client.prove(&self.pk, stdin).compressed().run(),
@@ -117,21 +132,22 @@ impl Prover {
     /// Execute the guest program without generating a proof.
     ///
     /// Fast (seconds); useful for testing.  Returns the public values bytes
-    /// (`prev_root || new_root`).
+    /// (`prev_root || new_root || reference_time`).
     pub fn execute(
         &self,
         envelope: &[u8],
         prev_root: [u8; 32],
         new_root: [u8; 32],
-    ) -> anyhow::Result<[u8; 64]> {
-        let stdin = Self::make_stdin(envelope, prev_root, new_root);
+        reference_time: u64,
+    ) -> anyhow::Result<[u8; 72]> {
+        let stdin = Self::make_stdin(envelope, prev_root, new_root, reference_time);
         let (mut public_values, _): (SP1PublicValues, _) = self
             .client
             .execute(GUEST_ELF, stdin)
             .run()
             .context("SP1 execution failed")?;
 
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 72];
         public_values.read_slice(&mut out);
         Ok(out)
     }
@@ -161,15 +177,20 @@ impl Prover {
         proof_bytes: &[u8],
         prev_root: [u8; 32],
         new_root: [u8; 32],
+        reference_time: u64,
     ) -> anyhow::Result<()> {
         let proof: sp1_sdk::SP1ProofWithPublicValues =
             bincode::deserialize(proof_bytes).context("proof deserialisation failed")?;
 
         // Check public values match.
         let pv = proof.public_values.as_slice();
-        anyhow::ensure!(pv.len() >= 64, "public values too short");
+        anyhow::ensure!(pv.len() >= 72, "public values too short");
         anyhow::ensure!(&pv[0..32] == prev_root, "prev_root mismatch");
         anyhow::ensure!(&pv[32..64] == new_root, "new_root mismatch");
+        anyhow::ensure!(
+            &pv[64..72] == reference_time.to_be_bytes(),
+            "reference_time mismatch"
+        );
 
         let vkey_hash = self.pk.verifying_key().bytes32(); // "0x<64 hex chars>"
         let pv_bytes = proof.public_values.to_vec();

@@ -78,11 +78,8 @@ fn scenario_two_leaves() -> Fixture {
     // bit 0, the MSB of byte 0, under RSMT v6a's big-endian bit order).
     let k0 = mk_key(0x00, 0x01);
     let k1 = mk_key(0x80, 0x02);
-    let (pairs, proof) = batch_insert_with_proof(
-        &mut tree,
-        &[(k0, b"v0".to_vec()), (k1, b"v1".to_vec())],
-    )
-    .unwrap();
+    let (pairs, proof) =
+        batch_insert_with_proof(&mut tree, &[(k0, b"v0".to_vec()), (k1, b"v1".to_vec())]).unwrap();
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "two_leaves_into_empty",
@@ -211,7 +208,11 @@ fn main() {
         s.push_str(&format!("      \"prev_root\": \"{}\",\n", f.prev_root));
         s.push_str(&format!("      \"new_root\": \"{}\",\n", f.new_root));
         s.push_str(&format!("      \"envelope\": \"{}\"\n", f.envelope));
-        s.push_str(if i + 1 == fixtures.len() { "    }\n" } else { "    },\n" });
+        s.push_str(if i + 1 == fixtures.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
     }
     s.push_str("  ]\n}\n");
 

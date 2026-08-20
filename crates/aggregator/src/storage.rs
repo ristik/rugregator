@@ -47,6 +47,10 @@ pub struct WalRecord {
 /// that was certified and apply it to the SMT on recovery.
 pub struct PendingRound {
     pub block_number: u64,
+    /// Reference time the round's leaf values were built from. Recovery must
+    /// rebuild the same leaves, so it is written with the round rather than
+    /// re-read from a certificate that has since moved on.
+    pub reference_time: u64,
     pub prev_root: Option<[u8; 32]>,
     pub new_root: Option<[u8; 32]>,
     /// Consistency proof bytes sent to BFT Core (stored so recovery can re-submit
@@ -84,6 +88,9 @@ pub struct RecoveredState {
 #[derive(Debug, Clone)]
 pub struct RecordInfo {
     pub block_number: u64,
+    /// Reference time of the round this record's leaf was created in; a
+    /// verifier needs it to reproduce the certified leaf value.
+    pub reference_time: u64,
     pub cert_data: CertDataFields,
     /// Pre-computed CBOR-encoded Merkle path.
     ///
@@ -108,6 +115,7 @@ pub struct BlockInfo {
 /// All data needed to build an inclusion proof response.
 pub struct InclusionProofData {
     pub block_number: u64,
+    pub reference_time: Option<u64>,
     pub cert_data: Option<CertDataFields>,
     pub merkle_path_cbor: Vec<u8>,
     pub uc_cbor: Vec<u8>,
@@ -269,6 +277,7 @@ impl AggregatorState {
                 r.state_id_hex,
                 RecordInfo {
                     block_number: r.block_number,
+                    reference_time: r.reference_time,
                     cert_data: r.cert_data,
                     merkle_path_cbor: r.merkle_path_cbor,
                 },
@@ -322,6 +331,7 @@ impl AggregatorState {
 
         Ok(InclusionProofLookup::Proof(InclusionProofData {
             block_number: record.block_number,
+            reference_time: Some(record.reference_time),
             cert_data: Some(record.cert_data),
             merkle_path_cbor,
             uc_cbor: block.uc_cbor,
@@ -431,6 +441,8 @@ impl AggregatorState {
 pub struct FinalizedRecord {
     pub state_id_hex: String,
     pub block_number: u64,
+    /// Reference time of the round this record's leaf was created in.
+    pub reference_time: u64,
     pub cert_data: CertDataFields,
     /// Pre-computed Merkle path CBOR.
     ///

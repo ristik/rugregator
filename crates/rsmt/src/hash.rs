@@ -8,9 +8,9 @@
 //! here and implement the same trait.
 
 use crate::path::SmtKey;
-use blake2::{Digest, digest::consts::U32, Blake2b, Blake2s256};
+use blake2::{digest::consts::U32, Blake2b, Blake2s256, Digest};
 
-pub use rsmt_verify::{SmtHasher, Sha256Hasher};
+pub use rsmt_verify::{Sha256Hasher, SmtHasher};
 
 type Blake2b256 = Blake2b<U32>;
 
