@@ -27,37 +27,42 @@ use crate::hash::sha256_parts;
 /// deterministic CBOR array: a byte string of the digest followed by the
 /// reference time as an unsigned integer.
 pub fn leaf_value(transaction_hash: &[u8], reference_time: u64) -> [u8; 32] {
-    let mut header = [0u8; 3];
-    header[0] = 0x82; // array(2)
-    header[1] = 0x58; // byte string, 1-byte length
-    header[2] = transaction_hash.len() as u8;
+    let mut length = [0u8; 9];
+    let length_len = encode_head(2, transaction_hash.len() as u64, &mut length);
 
     let mut time = [0u8; 9];
-    let time_len = encode_uint(reference_time, &mut time);
+    let time_len = encode_head(0, reference_time, &mut time);
 
-    sha256_parts(&[&header, transaction_hash, &time[..time_len]])
+    sha256_parts(&[
+        &[0x82], // array(2)
+        &length[..length_len],
+        transaction_hash,
+        &time[..time_len],
+    ])
 }
 
-/// Encode `value` as a deterministic (shortest-form) CBOR unsigned integer.
-fn encode_uint(value: u64, out: &mut [u8; 9]) -> usize {
-    if value <= 23 {
-        out[0] = value as u8;
+/// Encode a CBOR head for major type `t` and argument `n`, in the shortest
+/// form deterministic CBOR requires. Returns the number of bytes written.
+fn encode_head(t: u8, n: u64, out: &mut [u8; 9]) -> usize {
+    let major = t << 5;
+    if n <= 23 {
+        out[0] = major | n as u8;
         1
-    } else if value <= u8::MAX as u64 {
-        out[0] = 0x18;
-        out[1] = value as u8;
+    } else if n <= u8::MAX as u64 {
+        out[0] = major | 24;
+        out[1] = n as u8;
         2
-    } else if value <= u16::MAX as u64 {
-        out[0] = 0x19;
-        out[1..3].copy_from_slice(&(value as u16).to_be_bytes());
+    } else if n <= u16::MAX as u64 {
+        out[0] = major | 25;
+        out[1..3].copy_from_slice(&(n as u16).to_be_bytes());
         3
-    } else if value <= u32::MAX as u64 {
-        out[0] = 0x1a;
-        out[1..5].copy_from_slice(&(value as u32).to_be_bytes());
+    } else if n <= u32::MAX as u64 {
+        out[0] = major | 26;
+        out[1..5].copy_from_slice(&(n as u32).to_be_bytes());
         5
     } else {
-        out[0] = 0x1b;
-        out[1..9].copy_from_slice(&value.to_be_bytes());
+        out[0] = major | 27;
+        out[1..9].copy_from_slice(&n.to_be_bytes());
         9
     }
 }
@@ -94,8 +99,40 @@ mod tests {
 
     fn encoded(value: u64) -> alloc::vec::Vec<u8> {
         let mut out = [0u8; 9];
-        let len = encode_uint(value, &mut out);
+        let len = encode_head(0, value, &mut out);
         out[..len].to_vec()
+    }
+
+    fn byte_string_head(len: u64) -> alloc::vec::Vec<u8> {
+        let mut out = [0u8; 9];
+        let n = encode_head(2, len, &mut out);
+        out[..n].to_vec()
+    }
+
+    /// Short values must use the shortest byte-string head, not a padded one.
+    /// Production values are 32-byte digests, where both forms agree, so only
+    /// a test vector over a short value catches a divergence here.
+    #[test]
+    fn byte_string_heads_are_shortest_form() {
+        assert_eq!(byte_string_head(0), [0x40]);
+        assert_eq!(byte_string_head(5), [0x45]);
+        assert_eq!(byte_string_head(23), [0x57]);
+        assert_eq!(byte_string_head(24), [0x58, 0x18]);
+        assert_eq!(byte_string_head(32), [0x58, 0x20]);
+    }
+
+    /// Cross-checks the derivation over a short value against a hand-computed
+    /// digest, pinning the encoding the Go verifier also implements.
+    #[test]
+    fn derives_short_values_with_a_shortest_form_head() {
+        // SHA-256( 82 45 68656c6c6f 1a689b2cc0 )
+        let expected: [u8; 32] = [
+            0xda, 0x01, 0x75, 0xf8, 0x21, 0x6f, 0xd3, 0xf6, 0x06, 0xf5, 0xa7, 0x91, 0x6a, 0x52,
+            0xbc, 0x92, 0x0f, 0xd9, 0xd6, 0xc9, 0x7f, 0x20, 0x0d, 0xf3, 0x54, 0x76, 0x24, 0xf8,
+            0xfd, 0x5b, 0x8f, 0x25,
+        ];
+
+        assert_eq!(leaf_value(b"hello", 1_755_000_000), expected);
     }
 
     #[test]

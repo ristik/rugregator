@@ -632,6 +632,16 @@ mod tests {
         )
     }
 
+    /// The version 1 certification request the JS, Java, Rust and Go SDKs all
+    /// produce for the shared cross-implementation vector: no timeout, the
+    /// service assigns the deadline.
+    const V1_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778501d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c7791258419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000";
+
+    /// The same request in the version 2 profile: the explicit timeout sits
+    /// between the transaction hash and the witness, and the transaction hash
+    /// commits to it.
+    const V2_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820ed275ff0a0694d1b61ec22f13914a431569220ba7f2f043d7940aac78d02c2f91a689b2cc0584111f0f7929d70e0e32db9159b7e23b6e0043502bc36609728e9dc0353251c241a7b1adb047c9234cd77ed519c409048a6c8bc247f0262c1f161b03d6fee49426e0000";
+
     #[test]
     fn decode_simple_cbor_value() {
         // CBOR uint 42 = 0x182a
@@ -660,38 +670,60 @@ mod tests {
     /// field, never from an ambiguous field value.
     #[test]
     fn parses_explicit_timeout_certification_request() {
-        let request = hex::decode(
-            "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c779121a689b2cc058419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000",
-        )
-        .unwrap();
+        let request = hex::decode(V2_REQUEST).unwrap();
         let parsed = parse_certification_request_bytes(&request).unwrap();
 
         assert_eq!(parsed.timeout, Some(1_755_000_000));
         assert_eq!(parsed.witness.len(), 65);
     }
 
-    /// A five-element array declaring version 2, or a six-element array
-    /// declaring version 1, is not a recognised profile.
+    /// Re-encoding a parsed request reproduces the CertificationData bytes it
+    /// arrived as. An inclusion proof carrying anything else would present a
+    /// CertificationData the request's transaction hash does not commit to,
+    /// and every SDK would reject the proof.
+    #[test]
+    fn re_encoding_preserves_the_certification_data_bytes() {
+        for request in [V1_REQUEST, V2_REQUEST] {
+            let bytes = hex::decode(request).unwrap();
+            let parsed = parse_certification_request_bytes(&bytes).unwrap();
+
+            let cert_data = CertDataFields {
+                predicate_cbor: parsed.predicate_cbor.clone(),
+                source_state_hash: parsed.source_state_hash.clone(),
+                transaction_hash: parsed.transaction_hash.clone(),
+                timeout: parsed.timeout,
+                witness: parsed.witness.clone(),
+            };
+            let encoded = hex::encode(
+                encode_cbor_value(&build_cert_data_value(&cert_data).unwrap()).unwrap(),
+            );
+
+            assert!(
+                request.contains(&encoded),
+                "re-encoded {encoded} is not the CertificationData of {request}"
+            );
+        }
+    }
+
+    /// Each version pairs with exactly one field count. A five-element array
+    /// declaring version 2 promises a timeout it does not carry, and a
+    /// six-element array declaring version 1 carries bytes its transaction
+    /// hash does not commit to. Neither is a recognised profile.
     #[test]
     fn rejects_mismatched_certification_data_profiles() {
-        for (from, to) in [("d998778501", "d998778502"), ("d998778602", "d998778601")] {
-            let source = if from.ends_with("01") {
-                "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778501d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c7791258419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000"
-            } else {
-                "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c779121a689b2cc058419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000"
-            };
-            let mutated = source.replace(from, to);
+        for mutated in [
+            V1_REQUEST.replace("d998778501", "d998778502"),
+            V2_REQUEST.replace("d998778602", "d998778601"),
+        ] {
             let bytes = hex::decode(mutated).unwrap();
+
             assert!(parse_certification_request_bytes(&bytes).is_err());
         }
     }
 
     #[test]
     fn parses_versioned_sdk_certification_request_golden_vector() {
-        let request = hex::decode(
-            "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778501d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c7791258419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000",
-        )
-        .unwrap();
+        let request = hex::decode(V1_REQUEST).unwrap();
         let parsed = parse_certification_request_bytes(&request).unwrap();
 
         assert_eq!(

@@ -12,10 +12,47 @@
 //!   - `prev_root`: hex-encoded previous root, or empty string for nil.
 //!   - `new_root` : hex-encoded new root (empty string means nil tree).
 //!   - `envelope` : hex-encoded `aggregator_rsmt_v1` wire payload.
+//!
+//! The document also carries `reference_time`, the round reference time every
+//! fixture builds its new leaves under. The envelope declares transaction
+//! hashes and the verifier derives the stored leaf values from them and this
+//! value, so both sides must use it.
 
 use rsmt::consistency::{batch_insert_with_proof, encode_aggregator_envelope_v1};
 use rsmt::path::SmtKey;
 use rsmt::tree::SparseMerkleTree;
+use rsmt::ConsistencyProof;
+
+/// Reference time every fixture builds its new leaves under.
+const REFERENCE_TIME: u64 = 1_755_000_000;
+
+/// Insert a declared batch the way a round does: the tree stores values
+/// derived from the declared transaction hashes and the reference time, while
+/// the envelope keeps declaring the transaction hashes so BFT Core can
+/// re-derive them.
+fn insert_round(
+    tree: &mut SparseMerkleTree,
+    batch: &[(SmtKey, Vec<u8>)],
+) -> (Vec<(SmtKey, Vec<u8>)>, ConsistencyProof) {
+    let derived: Vec<(SmtKey, Vec<u8>)> = batch
+        .iter()
+        .map(|(k, v)| (*k, rsmt::leaf_value(v, REFERENCE_TIME).to_vec()))
+        .collect();
+    let (inserted, proof) = batch_insert_with_proof(tree, &derived).unwrap();
+    let declared = inserted
+        .iter()
+        .map(|(k, _)| {
+            let v = batch
+                .iter()
+                .find(|(bk, _)| bk == k)
+                .expect("declared")
+                .1
+                .clone();
+            (*k, v)
+        })
+        .collect();
+    (declared, proof)
+}
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -62,7 +99,7 @@ fn scenario_single_leaf() -> Fixture {
     let mut tree = SparseMerkleTree::new();
     let k = mk_key(0x05, 0x00);
     let v = b"hello".to_vec();
-    let (pairs, proof) = batch_insert_with_proof(&mut tree, &[(k, v)]).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &[(k, v)]);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "single_leaf_into_empty",
@@ -78,8 +115,7 @@ fn scenario_two_leaves() -> Fixture {
     // bit 0, the MSB of byte 0, under RSMT v6a's big-endian bit order).
     let k0 = mk_key(0x00, 0x01);
     let k1 = mk_key(0x80, 0x02);
-    let (pairs, proof) =
-        batch_insert_with_proof(&mut tree, &[(k0, b"v0".to_vec()), (k1, b"v1".to_vec())]).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &[(k0, b"v0".to_vec()), (k1, b"v1".to_vec())]);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "two_leaves_into_empty",
@@ -97,14 +133,14 @@ fn scenario_insert_into_existing() -> Fixture {
         (mk_key(0x20, 0x02), b"b".to_vec()),
         (mk_key(0x30, 0x03), b"c".to_vec()),
     ];
-    batch_insert_with_proof(&mut tree, &seed).unwrap();
+    insert_round(&mut tree, &seed);
     let prev = tree.root_hash();
 
     let new_batch = [
         (mk_key(0x40, 0x04), b"d".to_vec()),
         (mk_key(0x50, 0x05), b"e".to_vec()),
     ];
-    let (pairs, proof) = batch_insert_with_proof(&mut tree, &new_batch).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &new_batch);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "insert_into_existing",
@@ -121,11 +157,11 @@ fn scenario_edge_split_ol() -> Fixture {
     // of a junction created this round.
     let mut tree = SparseMerkleTree::new();
     let old = mk_key(0x00, 0x01);
-    batch_insert_with_proof(&mut tree, &[(old, b"old".to_vec())]).unwrap();
+    insert_round(&mut tree, &[(old, b"old".to_vec())]);
     let prev = tree.root_hash();
 
     let new_key = mk_key(0x03, 0x02); // diverges from `old` at bit 6
-    let (pairs, proof) = batch_insert_with_proof(&mut tree, &[(new_key, b"new".to_vec())]).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &[(new_key, b"new".to_vec())]);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "edge_split_emits_ol",
@@ -145,12 +181,12 @@ fn scenario_deep_split_o() -> Fixture {
     key_a[0] = 0b0000_0000; // bits 0..3 = 0000, bit 4 = 0
     let mut key_b = [0u8; 32];
     key_b[0] = 0b0000_1000; // bits 0..3 = 0000, bit 4 = 1
-    batch_insert_with_proof(&mut tree, &[(key_a, b"a".to_vec()), (key_b, b"b".to_vec())]).unwrap();
+    insert_round(&mut tree, &[(key_a, b"a".to_vec()), (key_b, b"b".to_vec())]);
     let prev = tree.root_hash();
 
     let mut key_c = [0u8; 32];
     key_c[0] = 0b0010_0000; // bits 0..1 = 00, bit 2 = 1: diverges before depth 4
-    let (pairs, proof) = batch_insert_with_proof(&mut tree, &[(key_c, b"c".to_vec())]).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &[(key_c, b"c".to_vec())]);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "deep_split_emits_o",
@@ -171,7 +207,7 @@ fn scenario_large_batch() -> Fixture {
         k[31] = 0xAA;
         batch.push((k, vec![i, i ^ 0x55, i.wrapping_add(1)]));
     }
-    let (pairs, proof) = batch_insert_with_proof(&mut tree, &batch).unwrap();
+    let (pairs, proof) = insert_round(&mut tree, &batch);
     let envelope = encode_aggregator_envelope_v1(&pairs, &proof);
     Fixture {
         name: "fifty_leaves_into_empty",
@@ -201,7 +237,9 @@ fn main() {
 
     // Hand-rolled JSON to avoid a serde_json dev-dep.
     let mut s = String::new();
-    s.push_str("{\n  \"fixtures\": [\n");
+    s.push_str("{\n");
+    s.push_str(&format!("  \"reference_time\": {},\n", REFERENCE_TIME));
+    s.push_str("  \"fixtures\": [\n");
     for (i, f) in fixtures.iter().enumerate() {
         s.push_str("    {\n");
         s.push_str(&format!("      \"name\": \"{}\",\n", f.name));
