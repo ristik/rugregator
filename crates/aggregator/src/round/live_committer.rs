@@ -2,10 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::prelude::*;
@@ -18,7 +17,7 @@ use libp2p::{
 };
 use secp256k1::{Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use super::{BftCommitter, CertRejection, CertStatus};
@@ -113,13 +112,12 @@ struct LastUc {
 type UcOutcome = Result<Vec<u8>, CertRejection>;
 
 struct Shared {
-    initialized: AtomicBool,
     /// block_number → oneshot receiver (set in commit_block, awaited in wait_for_uc)
     blk_receivers: Mutex<HashMap<u64, oneshot::Receiver<UcOutcome>>>,
-    init_notify: Notify,
     /// UnicitySeal.Timestamp of the last valid UC: the reference time the next
     /// round pins and echoes as `InputRecord.timestamp`.
     reference_time: AtomicU64,
+    reference_time_tx: watch::Sender<u64>,
 }
 
 // ─── Parsed UC event ─────────────────────────────────────────────────────────
@@ -131,6 +129,8 @@ struct UcEvent {
     next_round: u64,
     epoch: u64,
     prev_hash: Option<Vec<u8>>,
+    /// InputRecord.Timestamp, the reference time used to build this root.
+    input_record_timestamp: u64,
     /// UnicitySeal.Timestamp — must be echoed verbatim in our cert request.
     timestamp: u64,
     uc_cbor: Vec<u8>,
@@ -150,6 +150,8 @@ struct PendingCert {
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
+    /// Reference time used to derive every leaf in `new_hash`.
+    reference_time: u64,
     uc_tx: oneshot::Sender<UcOutcome>,
     /// Round used when this cert request was (last) sent.
     round_used: u64,
@@ -169,6 +171,8 @@ struct CertReqData {
     zk_proof: Option<Vec<u8>>,
     block_size: u64,
     state_size: u64,
+    /// Reference time used to derive every leaf in `new_hash`.
+    reference_time: u64,
     /// Deliver the UC outcome (accepted CBOR or typed rejection) once it arrives.
     uc_tx: oneshot::Sender<UcOutcome>,
 }
@@ -324,11 +328,11 @@ impl LiveBftCommitter {
         );
         swarm.listen_on(cfg.listen_addr.clone())?;
 
+        let (reference_time_tx, _) = watch::channel(0);
         let shared = Arc::new(Shared {
-            initialized: AtomicBool::new(false),
             blk_receivers: Mutex::new(HashMap::new()),
-            init_notify: Notify::new(),
             reference_time: AtomicU64::new(0),
+            reference_time_tx,
         });
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -363,11 +367,14 @@ impl LiveBftCommitter {
     }
 
     async fn wait_init(&self) {
+        let mut reference_time_rx = self.shared.reference_time_tx.subscribe();
         loop {
-            if self.shared.initialized.load(Ordering::Acquire) {
+            if *reference_time_rx.borrow_and_update() != 0 {
                 return;
             }
-            self.shared.init_notify.notified().await;
+            if reference_time_rx.changed().await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -415,6 +422,7 @@ impl BftCommitter for LiveBftCommitter {
             zk_proof,
             block_size,
             state_size,
+            reference_time,
             uc_tx: tx,
         };
 
@@ -432,6 +440,10 @@ impl BftCommitter for LiveBftCommitter {
 
     fn reference_time(&self) -> u64 {
         self.shared.reference_time.load(Ordering::Acquire)
+    }
+
+    fn subscribe_reference_time(&self) -> watch::Receiver<u64> {
+        self.shared.reference_time_tx.subscribe()
     }
 
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
@@ -547,20 +559,21 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
     };
     // UC structure: [version, input_record, tr_hash, ...]
     // InputRecord: [version, round_number, epoch, previous_hash, hash, ...]
-    let (uc_round, uc_hash) = if uc_arr.len() >= 2 {
+    let (uc_round, uc_hash, input_record_timestamp) = if uc_arr.len() >= 2 {
         match strip_tags(&uc_arr[1]) {
-            ciborium::value::Value::Array(ir) if ir.len() >= 5 => {
+            ciborium::value::Value::Array(ir) if ir.len() >= 7 => {
                 let rnd = cbor_u64(&ir[1]).unwrap_or(0);
                 let h = match &ir[4] {
                     ciborium::value::Value::Bytes(b) => Some(b.clone()),
                     _ => None,
                 };
-                (rnd, h)
+                let timestamp = cbor_u64(&ir[6]).unwrap_or(0);
+                (rnd, h, timestamp)
             }
-            _ => (0, None),
+            _ => (0, None, 0),
         }
     } else {
-        (0, None)
+        (0, None, 0)
     };
 
     // Extract UnicitySeal.Timestamp from UC.
@@ -598,6 +611,7 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
         next_round,
         epoch,
         prev_hash: uc_hash,
+        input_record_timestamp,
         timestamp,
         uc_cbor,
         status,
@@ -610,13 +624,11 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
 /// Build, sign and return the CBOR for a cert request using the given round/epoch/prev_hash.
 /// Build a signed cert request CBOR.
 /// `prev_hash_ir` = the last certified state hash from BFT Core (None = initial genesis state).
-/// `timestamp` = UnicitySeal.Timestamp from the latest UC (must be echoed verbatim).
 fn make_cert_cbor(
     pending: &PendingCert,
     round: u64,
     epoch: u64,
     prev_hash_ir: Option<Vec<u8>>,
-    timestamp: u64,
     partition_id: u32,
     node_id: &str,
     secp: &Secp256k1<secp256k1::All>,
@@ -632,14 +644,6 @@ fn make_cert_cbor(
     } else {
         None
     };
-    let ts = if timestamp > 0 {
-        timestamp
-    } else {
-        SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    };
     let ir = InputRecord {
         version: 1,
         round_number: round,
@@ -647,7 +651,7 @@ fn make_cert_cbor(
         previous_hash: prev_hash_ir,
         hash: Some(pending.new_hash.clone()),
         summary_value: Some(vec![]),
-        timestamp: ts,
+        timestamp: pending.reference_time,
         block_hash,
         sum_of_earned_fees: 0,
         et_hash: Some(vec![]),
@@ -669,6 +673,16 @@ fn make_cert_cbor(
     let sig = secp.sign_ecdsa(&Message::from_digest(hash), sig_key);
     req.signature = Some(sig.serialize_compact().to_vec());
     cbor_cert_req(&req)
+}
+
+fn reference_time_changed(pinned: u64, current: u64) -> CertRejection {
+    CertRejection {
+        status: CertStatus::Transient,
+        raw_status: CertStatus::Transient as u32,
+        message: format!(
+            "reference time changed from {pinned} to {current}; round must be rebuilt"
+        ),
+    }
 }
 
 async fn network_loop(
@@ -751,11 +765,7 @@ async fn network_loop(
                             timestamp: ev.timestamp,
                         });
                         shared.reference_time.store(ev.timestamp, Ordering::Release);
-
-                        // Signal initialization on first valid UC.
-                        if !shared.initialized.swap(true, Ordering::AcqRel) {
-                            shared.init_notify.notify_waiters();
-                        }
+                        shared.reference_time_tx.send_replace(ev.timestamp);
 
                         // Typed rejection from BFT Core: the wrapped UC is the last-good
                         // certificate, and `status`/`message` tell us why our request was
@@ -770,6 +780,17 @@ async fn network_loop(
                                 && pending.as_ref().map_or(false, |p| ev.next_round > p.round_used);
 
                             if is_stale_round {
+                                let current_reference_time = last_uc.as_ref().unwrap().timestamp;
+                                let pinned_reference_time =
+                                    pending.as_ref().unwrap().reference_time;
+                                if pinned_reference_time != current_reference_time {
+                                    let p = pending.take().unwrap();
+                                    let _ = p.uc_tx.send(Err(reference_time_changed(
+                                        pinned_reference_time,
+                                        current_reference_time,
+                                    )));
+                                    continue;
+                                }
                                 let p = pending.as_mut().unwrap();
                                 let old_round = p.round_used;
                                 let new_round = ev.next_round;
@@ -783,7 +804,7 @@ async fn network_loop(
                                     Some(p.prev_hash.clone())
                                 };
                                 match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
-                                                     lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
+                                                     partition_id, &node_id, &secp, &sig_key) {
                                     Ok(cbor) => {
                                         warn!(
                                             old_round, new_round,
@@ -819,6 +840,16 @@ async fn network_loop(
                         // Handle pending cert request.
                         if let Some(ref mut p) = pending {
                             if ev.uc_round > 0 && ev.uc_round == p.round_used {
+                                if ev.input_record_timestamp != p.reference_time {
+                                    let pinned_reference_time = p.reference_time;
+                                    let certified_reference_time = ev.input_record_timestamp;
+                                    let p = pending.take().unwrap();
+                                    let _ = p.uc_tx.send(Err(reference_time_changed(
+                                        pinned_reference_time,
+                                        certified_reference_time,
+                                    )));
+                                    continue;
+                                }
                                 // Our cert request was certified.
                                 info!(round = ev.uc_round, "UC matched — cert request certified");
                                 let p = pending.take().unwrap();
@@ -837,6 +868,16 @@ async fn network_loop(
                                 // Repeat UC with an advanced partition round —
                                 // BFT Core timed us out.
                                 // Re-send the same cert request with the new round number.
+                                if p.reference_time != ev.timestamp {
+                                    let pinned_reference_time = p.reference_time;
+                                    let current_reference_time = ev.timestamp;
+                                    let p = pending.take().unwrap();
+                                    let _ = p.uc_tx.send(Err(reference_time_changed(
+                                        pinned_reference_time,
+                                        current_reference_time,
+                                    )));
+                                    continue;
+                                }
                                 let old_round = p.round_used;
                                 let new_round = ev.next_round;
                                 p.round_used = new_round;
@@ -851,7 +892,7 @@ async fn network_loop(
                                 };
 
                                 match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
-                                                     lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
+                                                     partition_id, &node_id, &secp, &sig_key) {
                                     Ok(cbor) => {
                                         info!(
                                             old_round, new_round,
@@ -951,6 +992,19 @@ async fn network_loop(
                             }
                         };
 
+                        if data.reference_time != lu.timestamp {
+                            warn!(
+                                pinned_reference_time = data.reference_time,
+                                current_reference_time = lu.timestamp,
+                                "queued round reference time is stale; rebuilding required"
+                            );
+                            let _ = data.uc_tx.send(Err(reference_time_changed(
+                                data.reference_time,
+                                lu.timestamp,
+                            )));
+                            continue;
+                        }
+
                         let round = lu.next_round;
 
                         // Check whether our SMT root matches what BFT Core certified.
@@ -995,12 +1049,13 @@ async fn network_loop(
                             zk_proof: data.zk_proof,
                             block_size: data.block_size,
                             state_size: data.state_size,
+                            reference_time: data.reference_time,
                             uc_tx: data.uc_tx,
                             round_used: round,
                         };
 
                         match make_cert_cbor(&p, round, lu.epoch, prev_hash_ir,
-                                             lu.timestamp, partition_id, &node_id, &secp, &sig_key) {
+                                             partition_id, &node_id, &secp, &sig_key) {
                             Ok(cbor) => {
                                 info!(round, "sending cert request to BFT Core");
                                 pending = Some(p);
@@ -1054,5 +1109,45 @@ mod tests {
             fields.get(3),
             Some(ciborium::Value::Tag(INPUT_RECORD_TAG, _))
         ));
+    }
+
+    #[test]
+    fn certification_request_uses_the_pinned_reference_time() {
+        let (uc_tx, _uc_rx) = oneshot::channel();
+        let pending = PendingCert {
+            new_hash: vec![0x11; 32],
+            prev_hash: vec![0x22; 32],
+            zk_proof: None,
+            block_size: 1,
+            state_size: 1,
+            reference_time: 1_755_000_000,
+            uc_tx,
+            round_used: 2,
+        };
+        let secp = Secp256k1::new();
+        let signing_key = SecretKey::from_slice(&[7; 32]).unwrap();
+
+        let encoded = make_cert_cbor(
+            &pending,
+            2,
+            0,
+            Some(vec![0x22; 32]),
+            1,
+            "NODE",
+            &secp,
+            &signing_key,
+        )
+        .unwrap();
+        let request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
+
+        assert_eq!(request.input_record.timestamp, pending.reference_time);
+    }
+
+    #[test]
+    fn changed_reference_time_is_a_transient_rebuild() {
+        let rejection = reference_time_changed(10, 11);
+
+        assert_eq!(rejection.status, CertStatus::Transient);
+        assert!(rejection.message.contains("round must be rebuilt"));
     }
 }

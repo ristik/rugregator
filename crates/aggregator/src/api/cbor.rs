@@ -140,21 +140,20 @@ pub struct ParsedCertificationRequest {
 ///   1,
 ///   StateID: bytes(32),
 ///   #6.39031([
-///     1,
+///     2,
 ///     #6.39032([engine: uint, code: bytes, params: bytes]),
 ///     SourceStateHash: bytes(32),
 ///     TransactionHash: bytes(32),
+///     ExpiresAt: uint | null,
 ///     Witness: bytes(65),
 ///   ]),
 ///   0,
 /// ])
 /// ```
 ///
-/// The CertificationData version selects the profile: version 1 omits the
-/// request timeout, version 2 carries it as an unsigned integer between the
-/// transaction hash and the witness. The profile is not inferred from an
-/// ambiguous field value, and the transaction hash commits to the timeout only
-/// in version 2.
+/// CertificationData has one version and one element count. `ExpiresAt` keeps
+/// its position as CBOR null when the requester leaves the deadline to the
+/// service.
 pub fn parse_certification_request(
     hex_cbor: &str,
 ) -> Result<ParsedCertificationRequest, CborError> {
@@ -404,6 +403,22 @@ pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8
     Ok(state_root)
 }
 
+/// Return the timestamp in the certificate's input record. This is the
+/// reference time the newly certified leaves must have been built from.
+pub(crate) fn unicity_certificate_reference_time(value: &Value) -> Result<u64, CborError> {
+    let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
+    let input = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord")?;
+    val_as_u64(&input[6], "InputRecord.timestamp")
+}
+
+/// Return the seal timestamp that becomes the next round's reference time.
+#[cfg(test)]
+pub(crate) fn unicity_certificate_next_reference_time(value: &Value) -> Result<u64, CborError> {
+    let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
+    let seal = versioned_tagged_array(&uc[6], UNICITY_SEAL_TAG, 8, "UnicitySeal")?;
+    val_as_u64(&seal[4], "UnicitySeal.timestamp")
+}
+
 pub(crate) fn validate_unicity_certificate_value(value: &Value) -> Result<(), CborError> {
     unicity_certificate_state_root(value).map(|_| ())
 }
@@ -424,7 +439,8 @@ fn decode_unicity_certificate_value(data: &[u8]) -> Result<Value, CborError> {
 ///   blockNumber: uint,
 ///   #6.39033([               -- InclusionProof
 ///     1,
-///     certificationData: null | #6.39031([1, predicate, ssh, txh, witness]),
+///     certificationData: null | #6.39031([2, predicate, ssh, txh, expiresAt, witness]),
+///     referenceTime: null | uint,
 ///     inclusionCertificate: null | bytes,
 ///     unicityCertificate: #6.39001(...),
 ///   ])

@@ -15,15 +15,15 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time;
 use tracing::{error, info, warn};
 
 use super::state::ProcessedRecord;
 use crate::api::cbor::{
-    decode_cbor_value, unicity_certificate_state_root, CertDataFields, INPUT_RECORD_TAG,
-    SHARD_TREE_CERTIFICATE_TAG, UNICITY_CERTIFICATE_TAG, UNICITY_SEAL_TAG,
-    UNICITY_TREE_CERTIFICATE_TAG,
+    decode_cbor_value, unicity_certificate_reference_time, unicity_certificate_state_root,
+    CertDataFields, INPUT_RECORD_TAG, SHARD_TREE_CERTIFICATE_TAG, UNICITY_CERTIFICATE_TAG,
+    UNICITY_SEAL_TAG, UNICITY_TREE_CERTIFICATE_TAG,
 };
 use crate::config::{ConsistencyProofMode, RoundConfig};
 use crate::smt::state_id_to_smt_key;
@@ -116,6 +116,10 @@ pub trait BftCommitter: Send + Sync {
     /// round start, and carried through; re-reading it at commit time could
     /// disagree with the leaves already inserted.
     fn reference_time(&self) -> u64;
+
+    /// Subscribe to authoritative reference-time updates. The initial value is
+    /// zero until a live committer has received its first valid certificate.
+    fn subscribe_reference_time(&self) -> watch::Receiver<u64>;
 }
 
 /// Split a collected batch into the requests still admissible in a round with
@@ -149,11 +153,20 @@ fn request_smt_pair(request: &ValidatedRequest) -> (rsmt::SmtKey, Vec<u8>) {
 // ─── Stub implementation ──────────────────────────────────────────────────────
 
 pub struct BftCommitterStub {
-    pending_root: Mutex<Option<[u8; 32]>>,
+    pending: Mutex<Option<StubPending>>,
     /// Stands in for the seal timestamp a real BFT Core would return: it
     /// advances by one per round, so successive rounds pin distinct,
     /// increasing reference times as they do against a live core.
     reference_time: std::sync::atomic::AtomicU64,
+    reference_time_tx: watch::Sender<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct StubPending {
+    block_number: u64,
+    root: Option<[u8; 32]>,
+    reference_time: u64,
+    next_reference_time: u64,
 }
 
 impl BftCommitterStub {
@@ -161,14 +174,15 @@ impl BftCommitterStub {
     const NODE_ID: &'static str = "NODE";
 
     pub fn new() -> Self {
+        let reference_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (reference_time_tx, _) = watch::channel(reference_time);
         Self {
-            pending_root: Mutex::new(None),
-            reference_time: std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            ),
+            pending: Mutex::new(None),
+            reference_time: std::sync::atomic::AtomicU64::new(reference_time),
+            reference_time_tx,
         }
     }
 }
@@ -181,17 +195,31 @@ impl BftCommitter for BftCommitterStub {
         new_root: Option<[u8; 32]>,
         _prev_root: Option<[u8; 32]>,
         _zk_proof: Option<Vec<u8>>,
-        _reference_time: u64,
+        reference_time: u64,
         _block_size: u64,
         _state_size: u64,
     ) -> anyhow::Result<()> {
+        let current = self.reference_time();
+        anyhow::ensure!(
+            reference_time == current,
+            "round reference time {reference_time} does not match stub reference time {current}"
+        );
+        let next_reference_time = reference_time
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("stub reference time overflow"))?;
         let root_hex = new_root
             .map(|r| hex::encode(r))
             .unwrap_or_else(|| "empty".into());
         info!(block = block_number, root = %root_hex, "BftCommitterStub: commit_block");
-        *self.pending_root.lock().unwrap() = new_root;
+        *self.pending.lock().unwrap() = Some(StubPending {
+            block_number,
+            root: new_root,
+            reference_time,
+            next_reference_time,
+        });
         self.reference_time
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .store(next_reference_time, std::sync::atomic::Ordering::SeqCst);
+        self.reference_time_tx.send_replace(next_reference_time);
         Ok(())
     }
 
@@ -200,12 +228,28 @@ impl BftCommitter for BftCommitterStub {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn subscribe_reference_time(&self) -> watch::Receiver<u64> {
+        self.reference_time_tx.subscribe()
+    }
+
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
-        let root = *self.pending_root.lock().unwrap();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stub block pending certification"))?;
+        anyhow::ensure!(
+            pending.block_number == block_number,
+            "stub block {} is pending, requested {block_number}",
+            pending.block_number
+        );
         info!(block = block_number, "BftCommitterStub: generating stub UC");
         Ok(stub_generate_uc(
             block_number,
-            root.as_ref(),
+            pending.root.as_ref(),
+            pending.reference_time,
+            pending.next_reference_time,
             Self::PRIVATE_KEY,
             Self::NODE_ID,
         ))
@@ -315,6 +359,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 fn stub_generate_uc(
     block_number: u64,
     new_root: Option<&[u8; 32]>,
+    reference_time: u64,
+    seal_timestamp: u64,
     private_key: [u8; 32],
     node_id: &str,
 ) -> Vec<u8> {
@@ -332,7 +378,7 @@ fn stub_generate_uc(
         &cbor_null(),
         &cbor_bytes(root_bytes),
         &cbor_bytes(&[]),
-        &cbor_uint(0),
+        &cbor_uint(reference_time),
         &cbor_null(),
         &cbor_uint(0),
         &cbor_null(),
@@ -359,7 +405,7 @@ fn stub_generate_uc(
         &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
         &cbor_uint(block_number),
         &cbor_uint(0),
-        &cbor_uint(0),
+        &cbor_uint(seal_timestamp),
         &cbor_null(),
         &cbor_bytes(&seal_hash_value),
         &cbor_null(),
@@ -382,7 +428,7 @@ fn stub_generate_uc(
         &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
         &cbor_uint(block_number),
         &cbor_uint(0),
-        &cbor_uint(0),
+        &cbor_uint(seal_timestamp),
         &cbor_null(),
         &cbor_bytes(&seal_hash_value),
         &sig_map,
@@ -496,6 +542,7 @@ pub struct RoundManager<S: SmtStore> {
     leaf_count: u64,
     state: Arc<AggregatorState>,
     bft: Arc<dyn BftCommitter>,
+    reference_time_rx: watch::Receiver<u64>,
     inflight: Option<InFlightRound<S>>,
     uc_tx: mpsc::Sender<anyhow::Result<Vec<u8>>>,
     uc_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
@@ -550,6 +597,11 @@ impl<S: SmtStore> RoundManager<S> {
         let current_root = smt.root_hash();
         let (uc_tx, uc_rx) = mpsc::channel(4);
         let (proof_tx, proof_rx) = mpsc::channel(1);
+        let reference_time_rx = bft.subscribe_reference_time();
+        let reference_time = *reference_time_rx.borrow();
+        if reference_time != 0 {
+            state.set_reference_time(reference_time);
+        }
         Self {
             config,
             request_rx,
@@ -559,6 +611,7 @@ impl<S: SmtStore> RoundManager<S> {
             leaf_count: 0,
             state,
             bft,
+            reference_time_rx,
             inflight: None,
             uc_tx,
             uc_rx,
@@ -591,8 +644,10 @@ impl<S: SmtStore> RoundManager<S> {
 
     /// Run the round manager event loop.
     pub async fn run(mut self) {
+        self.publish_reference_time();
         // On startup, replay any round that was in-flight when the process last crashed.
         self.recover_pending_round().await;
+        self.publish_reference_time();
         self.publish_current_certified_snapshot().await;
 
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
@@ -611,6 +666,14 @@ impl<S: SmtStore> RoundManager<S> {
                 }
                 Some(proof_result) = self.proof_rx.recv() => {
                     self.on_proving_complete(proof_result).await;
+                }
+                changed = self.reference_time_rx.changed() => {
+                    if changed.is_ok() {
+                        let reference_time = *self.reference_time_rx.borrow_and_update();
+                        if reference_time != 0 {
+                            self.state.set_reference_time(reference_time);
+                        }
+                    }
                 }
                 _ = self.shutdown_notify.notified() => {
                     info!("shutdown signal received, stopping round manager");
@@ -643,6 +706,13 @@ impl<S: SmtStore> RoundManager<S> {
         match self.smt.shutdown_persist() {
             Ok(()) => info!("SMT shutdown persist completed"),
             Err(e) => error!(err = %e, "SMT shutdown persist failed"),
+        }
+    }
+
+    fn publish_reference_time(&self) {
+        let reference_time = self.bft.reference_time();
+        if reference_time != 0 {
+            self.state.set_reference_time(reference_time);
         }
     }
 
@@ -1318,6 +1388,23 @@ impl<S: SmtStore> RoundManager<S> {
         inserted: Vec<ProcessedRecord>,
         dropped: usize,
     ) {
+        let current_reference_time = self.bft.reference_time();
+        if reference_time != current_reference_time {
+            warn!(
+                block = block_number,
+                prepared_reference_time = reference_time,
+                current_reference_time,
+                "prepared speculative round has stale reference time; rebuilding"
+            );
+            snap.discard();
+            let mut pending = batch;
+            pending.extend(std::mem::take(&mut self.pending));
+            self.pending = pending;
+            self.publish_reference_time();
+            self.start_round().await;
+            return;
+        }
+
         let prev_root = self.current_root;
         let new_leaves = inserted.len() as u64;
         let state_size = self.leaf_count + new_leaves;
@@ -1601,6 +1688,7 @@ impl<S: SmtStore> RoundManager<S> {
     // ── UC arrival ────────────────────────────────────────────────────────────
 
     async fn on_uc_result(&mut self, uc_result: anyhow::Result<Vec<u8>>) {
+        self.publish_reference_time();
         let inf = match self.inflight.take() {
             Some(i) => i,
             None => {
@@ -1617,9 +1705,15 @@ impl<S: SmtStore> RoundManager<S> {
         let uc_result = uc_result.and_then(|uc_cbor| {
             let value = decode_cbor_value(&uc_cbor)?;
             let certified_root = unicity_certificate_state_root(&value)?;
+            let certified_reference_time = unicity_certificate_reference_time(&value)?;
             anyhow::ensure!(
                 certified_root == proposed_root,
                 "Unicity Certificate root does not match the proposed SMT root"
+            );
+            anyhow::ensure!(
+                certified_reference_time == inf.reference_time,
+                "Unicity Certificate reference time {certified_reference_time} does not match round reference time {}",
+                inf.reference_time
             );
             Ok(uc_cbor)
         });
@@ -1933,6 +2027,15 @@ mod tests {
         }
     }
 
+    fn round_config() -> RoundConfig {
+        RoundConfig {
+            round_duration_ms: 1_000,
+            batch_limit: 100,
+            proof_mode: ConsistencyProofMode::Off,
+            zk_proof_kind: "core".into(),
+        }
+    }
+
     /// The timeout is exclusive, and the check that decides is the one made
     /// against the reference time the round actually builds its leaves under.
     #[test]
@@ -1952,15 +2055,74 @@ mod tests {
 
     #[test]
     fn stub_certificate_uses_the_canonical_profile() {
-        let encoded = stub_generate_uc(7, Some(&[0x77; 32]), [7; 32], "NODE");
+        let encoded = stub_generate_uc(
+            7,
+            Some(&[0x77; 32]),
+            1_755_000_000,
+            1_755_000_001,
+            [7; 32],
+            "NODE",
+        );
         let value = decode_cbor_value(&encoded).unwrap();
         assert_eq!(
             unicity_certificate_state_root(&value).unwrap(),
             Some([0x77; 32])
         );
+        assert_eq!(
+            unicity_certificate_reference_time(&value).unwrap(),
+            1_755_000_000
+        );
+        assert_eq!(
+            crate::api::cbor::unicity_certificate_next_reference_time(&value).unwrap(),
+            1_755_000_001
+        );
         assert!(matches!(
             value,
             ciborium::Value::Tag(UNICITY_CERTIFICATE_TAG, _)
         ));
+    }
+
+    #[test]
+    fn constructing_round_manager_publishes_stub_reference_time() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let state = AggregatorState::new(request_tx, None);
+        let bft = Arc::new(BftCommitterStub::new());
+        let reference_time = bft.reference_time();
+
+        let _manager = RoundManager::new(round_config(), request_rx, Arc::clone(&state), bft);
+
+        assert_eq!(
+            state.effective_timeout(Some(reference_time + 1)),
+            Some(reference_time + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_prepared_round_is_rebuilt_under_current_reference_time() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let state = AggregatorState::new(request_tx, None);
+        let bft = Arc::new(BftCommitterStub::new());
+        let current_reference_time = bft.reference_time();
+        let mut manager = RoundManager::new(round_config(), request_rx, Arc::clone(&state), bft);
+        let stale_snap = manager.smt.create_snapshot();
+        let batch = vec![request_with_deadline(current_reference_time + 100)];
+
+        manager
+            .submit_prepared_spec(
+                1,
+                stale_snap,
+                None,
+                current_reference_time - 1,
+                None,
+                batch,
+                Vec::new(),
+                0,
+            )
+            .await;
+
+        let inflight = manager.inflight.as_ref().expect("rebuilt round submitted");
+        assert_eq!(inflight.reference_time, current_reference_time);
+        assert_eq!(inflight.submitted_batch.len(), 1);
+        assert!(manager.pending.is_empty());
     }
 }
