@@ -71,6 +71,11 @@ pub const INCLUSION_PROOF_TAG: u64 = 39033;
 /// CBOR tag for the relation-specific non-inclusion proof object.
 pub const NON_INCLUSION_PROOF_TAG: u64 = 39034;
 const VERSION: u64 = 1;
+/// The only accepted CertificationData wire version. One version, one element
+/// count: `expiresAt` holds its slot as CBOR null when the requester left the
+/// deadline to the service.
+const CERT_DATA_VERSION: u64 = 2;
+const CERT_DATA_FIELD_COUNT: usize = 6;
 
 pub fn val_as_bool(v: &Value, path: &str) -> Result<bool, CborError> {
     match v {
@@ -117,8 +122,12 @@ pub struct ParsedCertificationRequest {
     pub params: Vec<u8>,
     /// 32-byte source-state hash.
     pub source_state_hash: Vec<u8>,
-    /// 32-byte transaction hash.
+    /// 32-byte transaction hash. It commits to `timeout`, so the witness signs
+    /// the timeout along with the rest of the transaction.
     pub transaction_hash: Vec<u8>,
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the requester leaves the deadline to the service.
+    pub expires_at: Option<u64>,
     /// 65-byte witness.
     pub witness: Vec<u8>,
 }
@@ -140,6 +149,12 @@ pub struct ParsedCertificationRequest {
 ///   0,
 /// ])
 /// ```
+///
+/// The CertificationData version selects the profile: version 1 omits the
+/// request timeout, version 2 carries it as an unsigned integer between the
+/// transaction hash and the witness. The profile is not inferred from an
+/// ambiguous field value, and the transaction hash commits to the timeout only
+/// in version 2.
 pub fn parse_certification_request(
     hex_cbor: &str,
 ) -> Result<ParsedCertificationRequest, CborError> {
@@ -168,8 +183,8 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
 
     let state_id = val_as_bytes(&arr[1], "StateID")?;
     let cert = val_as_tag(&arr[2], CERTIFICATION_DATA_TAG, "CertificationData")?;
-    let cert_arr = val_as_exact_array(cert, 5, "CertificationData")?;
-    require_version(&cert_arr[0], VERSION, "CertificationData.version")?;
+    let cert_arr = val_as_exact_array(cert, CERT_DATA_FIELD_COUNT, "CertificationData")?;
+    require_version(&cert_arr[0], CERT_DATA_VERSION, "CertificationData.version")?;
 
     let predicate = &cert_arr[1];
     let predicate_inner = val_as_tag(predicate, PREDICATE_TAG, "Predicate")?;
@@ -181,7 +196,11 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
 
     let source_state_hash = val_as_bytes(&cert_arr[2], "SourceStateHash")?;
     let transaction_hash = val_as_bytes(&cert_arr[3], "TransactionHash")?;
-    let witness = val_as_bytes(&cert_arr[4], "Witness")?;
+    let expires_at = match &cert_arr[4] {
+        Value::Null => None,
+        v => Some(val_as_u64(v, "ExpiresAt")?),
+    };
+    let witness = val_as_bytes(&cert_arr[5], "Witness")?;
     if val_as_u64(&arr[3], "CertificationRequest.reserved")? != 0 {
         return Err(CborError::TypeMismatch {
             path: "CertificationRequest.reserved".into(),
@@ -197,6 +216,7 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
         params,
         source_state_hash,
         transaction_hash,
+        expires_at,
         witness,
     })
 }
@@ -410,11 +430,13 @@ fn decode_unicity_certificate_value(data: &[u8]) -> Result<Value, CborError> {
 ///   ])
 /// ]
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn encode_inclusion_proof_response(
     block_number: u64,
     cert_data: Option<&CertDataFields>,
-    merkle_path_cbor: &[u8], // raw InclusionCertificate bytes
-    uc_cbor: &[u8],          // raw CBOR bytes of the UnicityCertificate
+    reference_time: Option<u64>, // reference time the certified leaf was built from
+    merkle_path_cbor: &[u8],     // raw InclusionCertificate bytes
+    uc_cbor: &[u8],              // raw CBOR bytes of the UnicityCertificate
 ) -> Result<String, CborError> {
     let path_val = Value::Bytes(merkle_path_cbor.to_vec());
 
@@ -427,11 +449,21 @@ pub fn encode_inclusion_proof_response(
     // canonical profile shared by inclusion and non-inclusion responses.
     let uc_val = decode_unicity_certificate_value(uc_cbor)?;
 
+    // The reference time cannot be recovered from the embedded certificate:
+    // proofs are served against the current certified root, whose input record
+    // time is the latest round's rather than the one the leaf was created
+    // under. A verifier needs the carried value to reproduce the leaf.
+    let reference_time_val = match reference_time {
+        None => Value::Null,
+        Some(t) => Value::Integer(ciborium::value::Integer::from(t)),
+    };
+
     let proof_val = Value::Tag(
         INCLUSION_PROOF_TAG,
         Box::new(Value::Array(vec![
             Value::Integer(ciborium::value::Integer::from(VERSION)),
             cert_val,
+            reference_time_val,
             path_val,
             uc_val,
         ])),
@@ -480,6 +512,9 @@ pub struct CertDataFields {
     pub predicate_cbor: Vec<u8>, // raw predicate CBOR (decoded, for embedding)
     pub source_state_hash: Vec<u8>,
     pub transaction_hash: Vec<u8>,
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the requester leaves the deadline to the service.
+    pub expires_at: Option<u64>,
     pub witness: Vec<u8>,
 }
 
@@ -488,21 +523,32 @@ fn build_cert_data_value(cd: &CertDataFields) -> Result<Value, CborError> {
     let pred_val = decode_cbor_value(&cd.predicate_cbor)?;
     let predicate = val_as_tag(&pred_val, PREDICATE_TAG, "Predicate")?;
     val_as_exact_array(predicate, 3, "Predicate")?;
+    // One shape: the deadline holds its slot either way, so re-encoding cannot
+    // change the element count and the transaction hash stays reproducible.
+    let fields = vec![
+        Value::Integer(ciborium::value::Integer::from(CERT_DATA_VERSION)),
+        pred_val,
+        Value::Bytes(cd.source_state_hash.clone()),
+        Value::Bytes(cd.transaction_hash.clone()),
+        match cd.expires_at {
+            None => Value::Null,
+            Some(expires_at) => Value::Integer(ciborium::value::Integer::from(expires_at)),
+        },
+        Value::Bytes(cd.witness.clone()),
+    ];
+
     Ok(Value::Tag(
         CERTIFICATION_DATA_TAG,
-        Box::new(Value::Array(vec![
-            Value::Integer(ciborium::value::Integer::from(VERSION)),
-            pred_val,
-            Value::Bytes(cd.source_state_hash.clone()),
-            Value::Bytes(cd.transaction_hash.clone()),
-            Value::Bytes(cd.witness.clone()),
-        ])),
+        Box::new(Value::Array(fields)),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
 
     fn uint(value: u64) -> Value {
         Value::Integer(ciborium::value::Integer::from(value))
@@ -563,6 +609,16 @@ mod tests {
         )
     }
 
+    /// The certification request the JS, Java, Rust and Go SDKs all produce for
+    /// the shared cross-implementation vector when the requester leaves the
+    /// deadline to the service: `expiresAt` holds its slot as CBOR null.
+    const ABSENT_DEADLINE_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820c034e096d7bdf71ba759558663b5cafb7279ecb7e284443e5e6cbce0461aceeef6584154ca6b19a7dbcae7a6adc38af5c8672f81943ecaf51345436684299b4b7ac81a57db2653f32048981e37913db4749ca08d998d1fac4a52ab5579988bc2c50de90000";
+
+    /// The same request with a sender-chosen deadline in that slot. Same
+    /// version, same element count; the transaction hash commits to whichever
+    /// value the slot holds.
+    const V2_REQUEST: &str = "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778602d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820ed275ff0a0694d1b61ec22f13914a431569220ba7f2f043d7940aac78d02c2f91a689b2cc0584111f0f7929d70e0e32db9159b7e23b6e0043502bc36609728e9dc0353251c241a7b1adb047c9234cd77ed519c409048a6c8bc247f0262c1f161b03d6fee49426e0000";
+
     #[test]
     fn decode_simple_cbor_value() {
         // CBOR uint 42 = 0x182a
@@ -586,12 +642,63 @@ mod tests {
         assert!(val_as_u64(&negative, "unsigned").is_err());
     }
 
+    /// The deadline sits between the transaction hash and the witness, and is
+    /// read from that fixed position rather than inferred from the shape.
+    #[test]
+    fn parses_explicit_timeout_certification_request() {
+        let request = hex::decode(V2_REQUEST).unwrap();
+        let parsed = parse_certification_request_bytes(&request).unwrap();
+
+        assert_eq!(parsed.expires_at, Some(1_755_000_000));
+        assert_eq!(parsed.witness.len(), 65);
+    }
+
+    /// Re-encoding a parsed request reproduces the CertificationData bytes it
+    /// arrived as. An inclusion proof carrying anything else would present a
+    /// CertificationData the request's transaction hash does not commit to,
+    /// and every SDK would reject the proof.
+    #[test]
+    fn re_encoding_preserves_the_certification_data_bytes() {
+        for request in [ABSENT_DEADLINE_REQUEST, V2_REQUEST] {
+            let bytes = hex::decode(request).unwrap();
+            let parsed = parse_certification_request_bytes(&bytes).unwrap();
+
+            let cert_data = CertDataFields {
+                predicate_cbor: parsed.predicate_cbor.clone(),
+                source_state_hash: parsed.source_state_hash.clone(),
+                transaction_hash: parsed.transaction_hash.clone(),
+                expires_at: parsed.expires_at,
+                witness: parsed.witness.clone(),
+            };
+            let encoded = hex::encode(
+                encode_cbor_value(&build_cert_data_value(&cert_data).unwrap()).unwrap(),
+            );
+
+            assert!(
+                request.contains(&encoded),
+                "re-encoded {encoded} is not the CertificationData of {request}"
+            );
+        }
+    }
+
+    /// There is one version and one element count. Anything else is rejected,
+    /// including the retired encodings that omitted the deadline slot.
+    #[test]
+    fn rejects_any_other_certification_data_version() {
+        for mutated in [
+            ABSENT_DEADLINE_REQUEST.replace("d998778602", "d998778601"),
+            ABSENT_DEADLINE_REQUEST.replace("d998778602", "d998778603"),
+            V2_REQUEST.replace("d998778602", "d998778601"),
+        ] {
+            let bytes = hex::decode(mutated).unwrap();
+
+            assert!(parse_certification_request_bytes(&bytes).is_err());
+        }
+    }
+
     #[test]
     fn parses_versioned_sdk_certification_request_golden_vector() {
-        let request = hex::decode(
-            "d9987684015820ffb36b55de9bfaf48b766d1f4e041a6c5d35ba23b402ea2a56a6c7692cb8f81ad998778501d9987883014101582103a19eef04b8856f50bf2d688b0d8804575115e53d2a7780da363628343f9635075820e4b183ff6b7a399983cee26e4feea85d517dede0142def5c838e593a9e6152415820df524cffc08a1dc30579a8a51f440a97b30630988084f8d12a4d8bd741c7791258419efb637f14dbdaada6e293e2182932d82265b04b1abf4f28bc4c285b32b5e2325140fe7f94bc9b705c568b4fcb7f9ea90cf0fadcacc1b4504275f81558aad1e70000",
-        )
-        .unwrap();
+        let request = hex::decode(ABSENT_DEADLINE_REQUEST).unwrap();
         let parsed = parse_certification_request_bytes(&request).unwrap();
 
         assert_eq!(
@@ -603,6 +710,7 @@ mod tests {
         assert_eq!(parsed.params.len(), 33);
         assert_eq!(parsed.source_state_hash.len(), 32);
         assert_eq!(parsed.transaction_hash.len(), 32);
+        assert_eq!(parsed.expires_at, None);
         assert_eq!(parsed.witness.len(), 65);
 
         let mut trailing = request;
@@ -640,22 +748,33 @@ mod tests {
             predicate_cbor: encode_cbor_value(&predicate).unwrap(),
             source_state_hash: vec![3; 32],
             transaction_hash: vec![4; 32],
+            expires_at: Some(TEST_EXPIRES_AT),
             witness: vec![5; 65],
         };
-        let encoded =
-            encode_inclusion_proof_response(8, Some(&cert_data), &[0xa6; 96], &uc_cbor).unwrap();
+        let encoded = encode_inclusion_proof_response(
+            8,
+            Some(&cert_data),
+            Some(1_755_000_000),
+            &[0xa6; 96],
+            &uc_cbor,
+        )
+        .unwrap();
         let response = decode_cbor_value(&hex::decode(encoded).unwrap()).unwrap();
         let response = val_as_exact_array(&response, 2, "response").unwrap();
         assert_eq!(val_as_u64(&response[0], "block").unwrap(), 8);
         let proof = val_as_tag(&response[1], INCLUSION_PROOF_TAG, "proof").unwrap();
-        let proof = val_as_exact_array(proof, 4, "proof").unwrap();
+        let proof = val_as_exact_array(proof, 5, "proof").unwrap();
         assert_eq!(val_as_u64(&proof[0], "version").unwrap(), VERSION);
         assert!(val_as_tag(&proof[1], CERTIFICATION_DATA_TAG, "certification data").is_ok());
         assert_eq!(
-            val_as_bytes(&proof[2], "certificate").unwrap(),
+            val_as_u64(&proof[2], "reference time").unwrap(),
+            1_755_000_000
+        );
+        assert_eq!(
+            val_as_bytes(&proof[3], "certificate").unwrap(),
             vec![0xa6; 96]
         );
-        assert_eq!(proof[3], uc);
+        assert_eq!(proof[4], uc);
     }
 
     #[test]
@@ -664,7 +783,7 @@ mod tests {
         let legacy_uc = encode_cbor_value(&legacy_uc).unwrap();
 
         assert!(encode_non_inclusion_proof_response(1, &[], &legacy_uc).is_err());
-        assert!(encode_inclusion_proof_response(1, None, &[], &legacy_uc).is_err());
+        assert!(encode_inclusion_proof_response(1, None, None, &[], &legacy_uc).is_err());
 
         let mut mixed_profile = canonical_uc();
         let Value::Tag(_, uc) = &mut mixed_profile else {
@@ -680,6 +799,6 @@ mod tests {
         let mixed_profile = encode_cbor_value(&mixed_profile).unwrap();
 
         assert!(encode_non_inclusion_proof_response(1, &[], &mixed_profile).is_err());
-        assert!(encode_inclusion_proof_response(1, None, &[], &mixed_profile).is_err());
+        assert!(encode_inclusion_proof_response(1, None, None, &[], &mixed_profile).is_err());
     }
 }

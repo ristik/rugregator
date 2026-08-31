@@ -34,6 +34,10 @@ use rsmt::{Blake2bHasher, Blake2sHasher, Sha256Hasher, SmtHasher};
 use smt_store::{SmtStore, SmtStoreSnapshot};
 use uni_aggregator::smt::{state_id_to_smt_key, SmtKey};
 
+/// Reference time the benchmark's rounds pin; the value is arbitrary but must
+/// be fixed so leaf values stay comparable across runs.
+const PERF_REFERENCE_TIME: u64 = 1_755_000_000;
+
 // ─── Ctrl+C ──────────────────────────────────────────────────────────────────
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -213,7 +217,7 @@ fn measure_round<S: SmtStore, H: SmtHasher>(
     let batch_size = batch.len();
     let mut snap = store.create_snapshot();
     let t_ins = Instant::now();
-    let (flags, _proof) = snap.insert_batch_with::<H>(batch, false)?;
+    let (flags, _proof) = snap.insert_batch_with::<H>(batch, PERF_REFERENCE_TIME, false)?;
     let inserted = flags.iter().filter(|&&f| f).count();
     let _ = snap.root_hash()?;
     let insert_dur = t_ins.elapsed();

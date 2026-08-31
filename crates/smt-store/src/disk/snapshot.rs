@@ -10,6 +10,8 @@ use rsmt::SmtHasher;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::declared_batch;
+
 use super::materializer::materialize_for_batch;
 use super::overlay::Overlay;
 use super::persister::persist_modified;
@@ -47,15 +49,12 @@ impl DiskSmtSnapshot {
         // Verify leaf does not exist in the DB / overlays to accurately drop duplicates
         // before deferring to the pending batch.
         let parent = self.parent_overlay.as_deref();
-        let smt = super::materializer::materialize_for_proof(
-            &self.db,
-            &self.own_overlay,
-            parent,
-            &key,
-        ).map_err(|e| {
-            tracing::error!("materialize_for_proof failed in add_leaf: {e}");
-            rsmt::tree::SmtError::LeafNotFound
-        })?;
+        let smt =
+            super::materializer::materialize_for_proof(&self.db, &self.own_overlay, parent, &key)
+                .map_err(|e| {
+                tracing::error!("materialize_for_proof failed in add_leaf: {e}");
+                rsmt::tree::SmtError::LeafNotFound
+            })?;
 
         if smt.find_leaf(&key).is_some() {
             return Err(SmtError::DuplicateLeaf);
@@ -170,18 +169,20 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
     fn insert_batch(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
         // Delegate to the hasher-generic path so the aggregator envelope is
         // produced for the disk backend too. Without this override, the
         // trait default would silently fall back to an add_leaf loop that
         // returns None for the proof and breaks BFT Core verification.
-        self.insert_batch_with::<rsmt::Sha256Hasher>(batch, with_proof)
+        self.insert_batch_with::<rsmt::Sha256Hasher>(batch, reference_time, with_proof)
     }
 
     fn insert_batch_with<H: SmtHasher>(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
         // Flush any previously deferred leaves so that own_overlay is up to date.
@@ -189,13 +190,15 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
 
         let mut flags = vec![false; batch.len()];
         let mut unique_pending = Vec::new();
+        let mut unique_declared = Vec::new();
         let mut batch_idx_map = Vec::new();
 
         for (i, (key, value)) in batch.iter().enumerate() {
             // Prevent intra-batch and intra-round duplicates
             if !self.pending_set.contains(key) {
                 self.pending_set.insert(*key);
-                unique_pending.push((*key, value.clone()));
+                unique_pending.push((*key, rsmt::leaf_value(value, reference_time).to_vec()));
+                unique_declared.push((*key, value.clone()));
                 batch_idx_map.push(i);
             }
         }
@@ -211,7 +214,8 @@ impl crate::traits::SmtStoreSnapshot for DiskSmtSnapshot {
             let (pairs, p) = batch_insert_with_proof_with::<H>(&mut smt, &unique_pending)?;
             // Bundle the sorted batch with the opcode stream into the
             // aggregator_rsmt_v1 envelope expected by BFT Core.
-            let envelope = encode_aggregator_envelope_v1(&pairs, &p);
+            let envelope =
+                encode_aggregator_envelope_v1(&declared_batch(&pairs, &unique_declared), &p);
             (pairs, Some(envelope))
         } else {
             let pairs = batch_insert_with::<H>(&mut smt, &unique_pending)?;

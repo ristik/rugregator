@@ -93,21 +93,52 @@ impl std::error::Error for CertRejection {}
 #[async_trait]
 pub trait BftCommitter: Send + Sync {
     /// Submit a block for certification.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_block(
         &self,
         block_number: u64,
         new_root: Option<[u8; 32]>,
         prev_root: Option<[u8; 32]>,
         zk_proof: Option<Vec<u8>>,
+        reference_time: u64,
         block_size: u64,
         state_size: u64,
     ) -> anyhow::Result<()>;
 
     /// Wait for the UnicityCertificate for `block_number`.
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>>;
+
+    /// The reference time a round starting now must pin: the seal timestamp of
+    /// the certificate that ended the previous round, which is also what the
+    /// next certification request reports as `InputRecord.timestamp`.
+    ///
+    /// A round builds every leaf value from this value, so it is read once, at
+    /// round start, and carried through; re-reading it at commit time could
+    /// disagree with the leaves already inserted.
+    fn reference_time(&self) -> u64;
 }
 
-/// Canonical aggregation-tree relation: `StateID -> TransactionHash`.
+/// Split a collected batch into the requests still admissible in a round with
+/// this reference time and those whose deadline it has already reached.
+///
+/// The timeout is exclusive and this is the authoritative check: admission runs
+/// the same test earlier, against whatever reference time was current then, but
+/// only the round that materialises the leaf knows the time the leaf is built
+/// under. A request that fails here can never be inserted in a later round
+/// either, so it is dropped rather than requeued.
+fn partition_expired(
+    batch: Vec<ValidatedRequest>,
+    reference_time: u64,
+) -> (Vec<ValidatedRequest>, Vec<ValidatedRequest>) {
+    batch
+        .into_iter()
+        .partition(|req| reference_time < req.effective_timeout)
+}
+
+/// Canonical aggregation-tree relation: the batch a round declares maps
+/// `StateID -> TransactionHash`. The tree stores `H(transactionHash, tau)`;
+/// the batch keeps the transaction hash so BFT Core re-derives the stored
+/// value from the reference time it already enforces.
 fn request_smt_pair(request: &ValidatedRequest) -> (rsmt::SmtKey, Vec<u8>) {
     (
         state_id_to_smt_key(&request.state_id),
@@ -119,6 +150,10 @@ fn request_smt_pair(request: &ValidatedRequest) -> (rsmt::SmtKey, Vec<u8>) {
 
 pub struct BftCommitterStub {
     pending_root: Mutex<Option<[u8; 32]>>,
+    /// Stands in for the seal timestamp a real BFT Core would return: it
+    /// advances by one per round, so successive rounds pin distinct,
+    /// increasing reference times as they do against a live core.
+    reference_time: std::sync::atomic::AtomicU64,
 }
 
 impl BftCommitterStub {
@@ -128,6 +163,12 @@ impl BftCommitterStub {
     pub fn new() -> Self {
         Self {
             pending_root: Mutex::new(None),
+            reference_time: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ),
         }
     }
 }
@@ -140,6 +181,7 @@ impl BftCommitter for BftCommitterStub {
         new_root: Option<[u8; 32]>,
         _prev_root: Option<[u8; 32]>,
         _zk_proof: Option<Vec<u8>>,
+        _reference_time: u64,
         _block_size: u64,
         _state_size: u64,
     ) -> anyhow::Result<()> {
@@ -148,7 +190,14 @@ impl BftCommitter for BftCommitterStub {
             .unwrap_or_else(|| "empty".into());
         info!(block = block_number, root = %root_hex, "BftCommitterStub: commit_block");
         *self.pending_root.lock().unwrap() = new_root;
+        self.reference_time
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    fn reference_time(&self) -> u64 {
+        self.reference_time
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
@@ -368,6 +417,8 @@ fn stub_generate_uc(
 /// When the proof arrives we use this to write the WAL and call `commit_block`.
 struct ProvingRoundData<S: SmtStore> {
     block_number: u64,
+    /// Reference time the round's leaf values were built from.
+    reference_time: u64,
     new_root: Option<[u8; 32]>,
     prev_root: Option<[u8; 32]>,
     new_leaves: u64,
@@ -401,6 +452,8 @@ enum SpecState<S: SmtStore> {
     Prepared {
         snap: S::Snapshot,
         new_root: Option<[u8; 32]>,
+        /// Reference time this speculative round's leaf values were built from.
+        reference_time: u64,
         zk_proof: Option<Vec<u8>>,
         batch: Vec<ValidatedRequest>,
         inserted: Vec<ProcessedRecord>,
@@ -420,6 +473,9 @@ impl<S: SmtStore> SpecState<S> {
 /// State of a round that has been proposed to BFT Core and is awaiting its UC.
 struct InFlightRound<S: SmtStore> {
     block_number: u64,
+    /// Reference time the round's leaf values were built from; reported as the
+    /// certification request's `InputRecord.timestamp`.
+    reference_time: u64,
     new_root: Option<[u8; 32]>,
     proposed_snap: S::Snapshot,
     spec: SpecState<S>,
@@ -694,7 +750,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         let mut proposed_snap = self.smt.create_snapshot();
         // We don't need a new consistency proof here; use the one stored in the WAL.
-        if let Err(e) = proposed_snap.insert_batch(&pairs, false) {
+        if let Err(e) = proposed_snap.insert_batch(&pairs, pending.reference_time, false) {
             error!(block = pending.block_number, err = %e, "WAL recovery: insert_batch failed");
             proposed_snap.discard();
             return;
@@ -728,8 +784,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: r.predicate_cbor.clone(),
                     source_state_hash: r.source_state_hash.clone(),
                     transaction_hash: r.transaction_hash.clone(),
+                    expires_at: r.expires_at,
                     witness: r.witness.clone(),
                 },
+                effective_timeout: r.effective_timeout,
             })
             .collect();
 
@@ -743,6 +801,7 @@ impl<S: SmtStore> RoundManager<S> {
                 pending.new_root, // use the stored root, not the recomputed one
                 pending.prev_root,
                 pending.zk_proof.clone(),
+                pending.reference_time,
                 pending.new_leaves,
                 pending.state_size,
             )
@@ -777,6 +836,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         self.inflight = Some(InFlightRound {
             block_number: pending.block_number,
+            reference_time: pending.reference_time,
             new_root: pending.new_root,
             proposed_snap,
             spec: SpecState::Collecting {
@@ -850,7 +910,32 @@ impl<S: SmtStore> RoundManager<S> {
         }
 
         let block_number = self.state.current_block_number().await;
-        info!(block = block_number, count = batch.len(), "starting round");
+        // Pin the reference time for the whole round: every leaf value binds
+        // it and the certification request reports it. Publishing it lets
+        // admission reject an already-expired request without waiting for a
+        // round, and assign a default deadline to one that omits its timeout.
+        let reference_time = self.bft.reference_time();
+        self.state.set_reference_time(reference_time);
+        let (batch, expired) = partition_expired(batch, reference_time);
+        if !expired.is_empty() {
+            warn!(
+                block = block_number,
+                count = expired.len(),
+                reference_time,
+                "dropping expired certification requests"
+            );
+            self.state.resolve_requests(&expired);
+        }
+        if batch.is_empty() {
+            return;
+        }
+
+        info!(
+            block = block_number,
+            count = batch.len(),
+            reference_time,
+            "starting round"
+        );
 
         // The authenticated SMT relation is StateID -> TransactionHash. The
         // remaining certification fields are verified by request validation
@@ -861,7 +946,8 @@ impl<S: SmtStore> RoundManager<S> {
 
         // Request the consistency-proof envelope for Rsmt and Zk modes.
         let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
-        let (flags, envelope) = match proposed_snap.insert_batch(&pairs, with_proof) {
+        let (flags, envelope) = match proposed_snap.insert_batch(&pairs, reference_time, with_proof)
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(block = block_number, err = %e, "insert_batch failed — discarding round");
@@ -881,8 +967,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
+                    expires_at: req.expires_at,
                     witness: req.witness.clone(),
                 },
+                effective_timeout: req.effective_timeout,
             })
             .collect();
 
@@ -941,7 +1029,7 @@ impl<S: SmtStore> RoundManager<S> {
                         let kind = kind_str
                             .parse::<zk_host::ZkProofKind>()
                             .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
-                        prover.prove_with_kind(&envelope, prev, new, kind)
+                        prover.prove_with_kind(&envelope, prev, new, reference_time, kind)
                     })();
                     let _ = proof_tx.blocking_send(result);
                 });
@@ -952,6 +1040,7 @@ impl<S: SmtStore> RoundManager<S> {
                 );
                 self.proving_data = Some(ProvingRoundData {
                     block_number,
+                    reference_time,
                     new_root,
                     prev_root,
                     new_leaves,
@@ -981,6 +1070,7 @@ impl<S: SmtStore> RoundManager<S> {
         if let Some(wal) = &self.wal {
             let wal_entry = PendingRound {
                 block_number,
+                reference_time,
                 prev_root,
                 new_root,
                 zk_proof: zk_proof.clone(),
@@ -993,6 +1083,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        expires_at: r.cert_data.expires_at,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1013,6 +1105,7 @@ impl<S: SmtStore> RoundManager<S> {
                 new_root,
                 prev_root,
                 zk_proof,
+                reference_time,
                 new_leaves,
                 state_size,
             )
@@ -1041,6 +1134,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         self.inflight = Some(InFlightRound {
             block_number,
+            reference_time,
             new_root,
             proposed_snap,
             spec: SpecState::Collecting {
@@ -1105,12 +1199,34 @@ impl<S: SmtStore> RoundManager<S> {
 
         let block_number = inf.block_number.saturating_add(1);
         let count = buffer.len();
+        // The speculative round runs under the reference time known now; if a
+        // certificate arrives with a later seal timestamp the promoted round
+        // pins that instead and the buffer is re-inserted.
+        let reference_time = self.bft.reference_time();
+        let (buffer, expired) = partition_expired(buffer, reference_time);
+        if !expired.is_empty() {
+            warn!(
+                block = block_number,
+                count = expired.len(),
+                reference_time,
+                "dropping expired certification requests"
+            );
+            self.state.resolve_requests(&expired);
+        }
+        if buffer.is_empty() {
+            inf.spec = SpecState::Collecting {
+                snap,
+                buffer: Vec::new(),
+            };
+            self.inflight = Some(inf);
+            return;
+        }
 
         // Build StateID -> TransactionHash pairs, mirroring start_round.
         let pairs: Vec<(rsmt::SmtKey, Vec<u8>)> = buffer.par_iter().map(request_smt_pair).collect();
 
         let with_proof = !matches!(self.config.proof_mode, ConsistencyProofMode::Off);
-        let (flags, zk_proof) = match snap.insert_batch(&pairs, with_proof) {
+        let (flags, zk_proof) = match snap.insert_batch(&pairs, reference_time, with_proof) {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -1141,8 +1257,10 @@ impl<S: SmtStore> RoundManager<S> {
                     predicate_cbor: req.predicate_cbor.clone(),
                     source_state_hash: req.source_state_hash.clone(),
                     transaction_hash: req.transaction_hash.clone(),
+                    expires_at: req.expires_at,
                     witness: req.witness.clone(),
                 },
+                effective_timeout: req.effective_timeout,
             })
             .collect();
 
@@ -1170,6 +1288,7 @@ impl<S: SmtStore> RoundManager<S> {
         );
 
         inf.spec = SpecState::Prepared {
+            reference_time,
             snap,
             new_root,
             zk_proof,
@@ -1187,11 +1306,13 @@ impl<S: SmtStore> RoundManager<S> {
     /// In Zk mode, `zk_proof` contains the consistency-proof envelope (not yet
     /// an SP1 proof). A background proving thread is spawned and WAL/commit
     /// happen only after the proof arrives via `on_proving_complete`.
+    #[allow(clippy::too_many_arguments)]
     async fn submit_prepared_spec(
         &mut self,
         block_number: u64,
         snap: S::Snapshot,
         new_root: Option<[u8; 32]>,
+        reference_time: u64,
         zk_proof: Option<Vec<u8>>,
         batch: Vec<ValidatedRequest>,
         inserted: Vec<ProcessedRecord>,
@@ -1238,7 +1359,7 @@ impl<S: SmtStore> RoundManager<S> {
                     let kind = kind_str
                         .parse::<zk_host::ZkProofKind>()
                         .map_err(|e| anyhow::anyhow!("invalid zk_proof_kind: {e}"))?;
-                    prover.prove_with_kind(&envelope, prev, new, kind)
+                    prover.prove_with_kind(&envelope, prev, new, reference_time, kind)
                 })();
                 let _ = proof_tx.blocking_send(result);
             });
@@ -1249,6 +1370,7 @@ impl<S: SmtStore> RoundManager<S> {
             );
             self.proving_data = Some(ProvingRoundData {
                 block_number,
+                reference_time,
                 new_root,
                 prev_root,
                 new_leaves,
@@ -1270,6 +1392,7 @@ impl<S: SmtStore> RoundManager<S> {
         if let Some(wal) = &self.wal {
             let wal_entry = PendingRound {
                 block_number,
+                reference_time,
                 prev_root,
                 new_root,
                 zk_proof: zk_proof.clone(),
@@ -1282,6 +1405,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        expires_at: r.cert_data.expires_at,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1302,6 +1427,7 @@ impl<S: SmtStore> RoundManager<S> {
                 new_root,
                 prev_root,
                 zk_proof,
+                reference_time,
                 new_leaves,
                 state_size,
             )
@@ -1331,6 +1457,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         self.inflight = Some(InFlightRound {
             block_number,
+            reference_time,
             new_root,
             proposed_snap: snap,
             spec: SpecState::Collecting {
@@ -1388,6 +1515,7 @@ impl<S: SmtStore> RoundManager<S> {
         if let Some(wal) = &self.wal {
             let wal_entry = PendingRound {
                 block_number: data.block_number,
+                reference_time: data.reference_time,
                 prev_root: data.prev_root,
                 new_root: data.new_root,
                 zk_proof: Some(proof_bytes.clone()),
@@ -1401,6 +1529,8 @@ impl<S: SmtStore> RoundManager<S> {
                         predicate_cbor: r.cert_data.predicate_cbor.clone(),
                         source_state_hash: r.cert_data.source_state_hash.clone(),
                         transaction_hash: r.cert_data.transaction_hash.clone(),
+                        expires_at: r.cert_data.expires_at,
+                        effective_timeout: r.effective_timeout,
                         witness: r.cert_data.witness.clone(),
                     })
                     .collect(),
@@ -1421,6 +1551,7 @@ impl<S: SmtStore> RoundManager<S> {
                 data.new_root,
                 data.prev_root,
                 Some(proof_bytes),
+                data.reference_time,
                 data.new_leaves,
                 data.state_size,
             )
@@ -1452,6 +1583,7 @@ impl<S: SmtStore> RoundManager<S> {
 
         self.inflight = Some(InFlightRound {
             block_number: data.block_number,
+            reference_time: data.reference_time,
             new_root: data.new_root,
             proposed_snap: data.proposed_snap,
             spec: SpecState::Collecting {
@@ -1539,7 +1671,8 @@ impl<S: SmtStore> RoundManager<S> {
                 };
 
                 // Generate proofs from committed store.
-                let finalized = self.generate_proofs(inf.inserted, inf.block_number);
+                let finalized =
+                    self.generate_proofs(inf.inserted, inf.block_number, inf.reference_time);
 
                 let unique_count = finalized.len();
                 let dropped_count = inf.dropped;
@@ -1582,6 +1715,7 @@ impl<S: SmtStore> RoundManager<S> {
                     SpecState::Prepared {
                         snap,
                         new_root,
+                        reference_time,
                         zk_proof,
                         batch,
                         inserted,
@@ -1589,7 +1723,14 @@ impl<S: SmtStore> RoundManager<S> {
                     } => {
                         let next_block = self.state.current_block_number().await;
                         self.submit_prepared_spec(
-                            next_block, snap, new_root, zk_proof, batch, inserted, dropped,
+                            next_block,
+                            snap,
+                            new_root,
+                            reference_time,
+                            zk_proof,
+                            batch,
+                            inserted,
+                            dropped,
                         )
                         .await;
                     }
@@ -1702,6 +1843,7 @@ impl<S: SmtStore> RoundManager<S> {
         &mut self,
         processed: Vec<ProcessedRecord>,
         block_number: u64,
+        reference_time: u64,
     ) -> Vec<FinalizedRecord> {
         // Decode state_ids → SmtKeys; track which indices are valid.
         let mut valid: Vec<(usize, rsmt::SmtKey)> = Vec::with_capacity(processed.len());
@@ -1735,6 +1877,7 @@ impl<S: SmtStore> RoundManager<S> {
             out.push(FinalizedRecord {
                 state_id_hex: processed_vec[orig_idx].state_id_hex.clone(),
                 block_number,
+                reference_time,
                 cert_data: processed_vec[orig_idx].cert_data.clone(),
                 merkle_path_cbor: Some(proof_bytes),
             });
@@ -1747,21 +1890,64 @@ impl<S: SmtStore> RoundManager<S> {
 mod tests {
     use super::*;
 
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
+
     #[test]
-    fn aggregation_tree_leaf_value_is_the_transaction_hash() {
+    fn the_declared_batch_carries_the_transaction_hash() {
         let request = ValidatedRequest {
             state_id_hex: hex::encode([0x11; 32]),
             state_id: vec![0x11; 32],
             predicate_cbor: vec![0x22],
             source_state_hash: vec![0x33; 32],
             transaction_hash: vec![0x44; 32],
+            expires_at: Some(TEST_EXPIRES_AT),
+            effective_timeout: TEST_EXPIRES_AT,
             witness: vec![0x55; 65],
             public_key: vec![0x66; 33],
         };
 
+        // The batch a round declares carries the transaction hash; the value
+        // the tree stores is derived from it and the round's reference time,
+        // so BFT Core can re-derive it from the reference time it enforces.
         let (key, value) = request_smt_pair(&request);
         assert_eq!(key, [0x11; 32]);
         assert_eq!(value, request.transaction_hash);
+        assert_ne!(
+            rsmt::leaf_value(&value, 1_755_000_000).to_vec(),
+            request.transaction_hash
+        );
+    }
+
+    fn request_with_deadline(effective_timeout: u64) -> ValidatedRequest {
+        ValidatedRequest {
+            state_id_hex: hex::encode([0x11; 32]),
+            state_id: vec![0x11; 32],
+            predicate_cbor: vec![0x22],
+            source_state_hash: vec![0x33; 32],
+            transaction_hash: vec![0x44; 32],
+            expires_at: None,
+            effective_timeout,
+            witness: vec![0x55; 65],
+            public_key: vec![0x66; 33],
+        }
+    }
+
+    /// The timeout is exclusive, and the check that decides is the one made
+    /// against the reference time the round actually builds its leaves under.
+    #[test]
+    fn expired_requests_are_dropped_at_materialisation() {
+        let batch = vec![
+            request_with_deadline(1_755_000_001),
+            request_with_deadline(1_755_000_000),
+            request_with_deadline(1_754_999_999),
+        ];
+
+        let (admitted, expired) = partition_expired(batch, 1_755_000_000);
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].effective_timeout, 1_755_000_001);
+        assert_eq!(expired.len(), 2);
     }
 
     #[test]

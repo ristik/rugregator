@@ -32,7 +32,10 @@ impl CompressedPath {
     /// An empty path (zero common-prefix bits).
     #[inline]
     pub const fn empty() -> Self {
-        Self { len: 0, bits: [0u8; 32] }
+        Self {
+            len: 0,
+            bits: [0u8; 32],
+        }
     }
 
     /// Number of common-prefix data bits.
@@ -54,7 +57,10 @@ impl CompressedPath {
     pub fn from_key_range(key: &SmtKey, start_bit: usize, n_bits: usize) -> Self {
         debug_assert!(n_bits <= 255);
         debug_assert!(start_bit + n_bits <= KEY_BITS);
-        let mut cp = Self { len: n_bits as u8, bits: [0u8; 32] };
+        let mut cp = Self {
+            len: n_bits as u8,
+            bits: [0u8; 32],
+        };
         for i in 0..n_bits {
             let b = key_bit_at(key, start_bit + i);
             if b != 0 {
@@ -150,11 +156,19 @@ fn extract_key_byte(key: &SmtKey, start_bit: usize) -> u8 {
     let bit_off = start_bit % 8;
     if bit_off == 0 {
         // Aligned: just return the byte.
-        if byte_idx < 32 { key[byte_idx] } else { 0 }
+        if byte_idx < 32 {
+            key[byte_idx]
+        } else {
+            0
+        }
     } else {
         // Straddles two bytes.
         let lo = if byte_idx < 32 { key[byte_idx] } else { 0 };
-        let hi = if byte_idx + 1 < 32 { key[byte_idx + 1] } else { 0 };
+        let hi = if byte_idx + 1 < 32 {
+            key[byte_idx + 1]
+        } else {
+            0
+        };
         (lo << bit_off) | (hi >> (8 - bit_off))
     }
 }

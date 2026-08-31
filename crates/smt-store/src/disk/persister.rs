@@ -1,19 +1,16 @@
 //! After-mutation persistence: walk the modified tree and write to overlay.
 
-use std::sync::Arc;
-use rsmt::{Branch, SparseMerkleTree};
 use rsmt::node_serde::{serialize_leaf, serialize_node};
+use rsmt::{Branch, SparseMerkleTree};
+use std::sync::Arc;
 
-use super::node_key::{NodeKey, PrefixBits, prefix_set_bit, prefix_copy_path};
+use super::node_key::{prefix_copy_path, prefix_set_bit, NodeKey, PrefixBits};
 use super::overlay::Overlay;
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Walk the post-insertion tree and serialize every non-Stub node into `overlay`.
-pub fn persist_modified(
-    smt:     &SparseMerkleTree,
-    overlay: &mut Overlay,
-) {
+pub fn persist_modified(smt: &SparseMerkleTree, overlay: &mut Overlay) {
     let Some(root_arc) = &smt.root else { return };
 
     let root_nk = NodeKey::root();
@@ -39,11 +36,11 @@ pub fn persist_modified(
 // ─── Recursive helper ────────────────────────────────────────────────────────
 
 fn persist_branch_modified(
-    branch:   &Arc<Branch>,
+    branch: &Arc<Branch>,
     is_right: bool,
-    split:    usize,
-    acc:      &PrefixBits,
-    overlay:  &mut Overlay,
+    split: usize,
+    acc: &PrefixBits,
+    overlay: &mut Overlay,
 ) {
     match branch.as_ref() {
         Branch::Stub(_) => {

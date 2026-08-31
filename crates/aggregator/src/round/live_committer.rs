@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::SystemTime;
@@ -117,6 +117,9 @@ struct Shared {
     /// block_number → oneshot receiver (set in commit_block, awaited in wait_for_uc)
     blk_receivers: Mutex<HashMap<u64, oneshot::Receiver<UcOutcome>>>,
     init_notify: Notify,
+    /// UnicitySeal.Timestamp of the last valid UC: the reference time the next
+    /// round pins and echoes as `InputRecord.timestamp`.
+    reference_time: AtomicU64,
 }
 
 // ─── Parsed UC event ─────────────────────────────────────────────────────────
@@ -325,6 +328,7 @@ impl LiveBftCommitter {
             initialized: AtomicBool::new(false),
             blk_receivers: Mutex::new(HashMap::new()),
             init_notify: Notify::new(),
+            reference_time: AtomicU64::new(0),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -376,10 +380,22 @@ impl BftCommitter for LiveBftCommitter {
         new_root: Option<[u8; 32]>,
         prev_root: Option<[u8; 32]>,
         zk_proof: Option<Vec<u8>>,
+        reference_time: u64,
         block_size: u64,
         state_size: u64,
     ) -> anyhow::Result<()> {
         self.wait_init().await;
+
+        // The round built every leaf value from `reference_time`. If a newer
+        // certificate has arrived since, the request would report a timestamp
+        // the leaves do not match, so refuse rather than propose a root BFT
+        // Core cannot reproduce.
+        let current = self.shared.reference_time.load(Ordering::Acquire);
+        if reference_time != current {
+            anyhow::bail!(
+                "round reference time {reference_time} does not match latest seal timestamp {current}"
+            );
+        }
 
         let new_hash = new_root.map(|r| r.to_vec()).unwrap_or_default();
         let prev_hash = prev_root.map(|r| r.to_vec()).unwrap_or_default();
@@ -412,6 +428,10 @@ impl BftCommitter for LiveBftCommitter {
             "cert request queued (round resolved at send time)"
         );
         Ok(())
+    }
+
+    fn reference_time(&self) -> u64 {
+        self.shared.reference_time.load(Ordering::Acquire)
     }
 
     async fn wait_for_uc(&self, block_number: u64) -> anyhow::Result<Vec<u8>> {
@@ -730,6 +750,7 @@ async fn network_loop(
                             prev_hash: ev.prev_hash.clone(),
                             timestamp: ev.timestamp,
                         });
+                        shared.reference_time.store(ev.timestamp, Ordering::Release);
 
                         // Signal initialization on first valid UC.
                         if !shared.initialized.swap(true, Ordering::AcqRel) {

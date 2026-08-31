@@ -10,6 +10,10 @@
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use smt_store::{CertifiedSmtSnapshot, CERTIFIED_PROOF_MAX_IN_FLIGHT};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Default request lifetime in seconds when the deployment sets none.
+pub const DEFAULT_REQUEST_TTL_SECS: u64 = 3600;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::debug;
@@ -38,6 +42,12 @@ pub struct WalRecord {
     pub predicate_cbor: Vec<u8>,
     pub source_state_hash: Vec<u8>,
     pub transaction_hash: Vec<u8>,
+    /// Exclusive certification request deadline in Unix seconds, or
+    /// `None` when the service assigned one.
+    pub expires_at: Option<u64>,
+    /// Absolute deadline the request is held to, so recovery re-applies the
+    /// same admission decision the original round made.
+    pub effective_timeout: u64,
     pub witness: Vec<u8>,
 }
 
@@ -47,6 +57,10 @@ pub struct WalRecord {
 /// that was certified and apply it to the SMT on recovery.
 pub struct PendingRound {
     pub block_number: u64,
+    /// Reference time the round's leaf values were built from. Recovery must
+    /// rebuild the same leaves, so it is written with the round rather than
+    /// re-read from a certificate that has since moved on.
+    pub reference_time: u64,
     pub prev_root: Option<[u8; 32]>,
     pub new_root: Option<[u8; 32]>,
     /// Consistency proof bytes sent to BFT Core (stored so recovery can re-submit
@@ -84,6 +98,9 @@ pub struct RecoveredState {
 #[derive(Debug, Clone)]
 pub struct RecordInfo {
     pub block_number: u64,
+    /// Reference time of the round this record's leaf was created in; a
+    /// verifier needs it to reproduce the certified leaf value.
+    pub reference_time: u64,
     pub cert_data: CertDataFields,
     /// Pre-computed CBOR-encoded Merkle path.
     ///
@@ -108,6 +125,7 @@ pub struct BlockInfo {
 /// All data needed to build an inclusion proof response.
 pub struct InclusionProofData {
     pub block_number: u64,
+    pub reference_time: Option<u64>,
     pub cert_data: Option<CertDataFields>,
     pub merkle_path_cbor: Vec<u8>,
     pub uc_cbor: Vec<u8>,
@@ -169,6 +187,12 @@ pub struct AggregatorState {
     certified_proof_state: StdRwLock<Option<Arc<CertifiedProofState>>>,
     /// Admission control in front of the bounded proof worker queue.
     proof_permits: Arc<Semaphore>,
+    /// Reference time a round starting now would pin, published by the round
+    /// manager so admission can fail an already-expired request immediately.
+    reference_time: AtomicU64,
+    /// Default request lifetime in seconds, added to the reference time at
+    /// admission when a request carries no explicit deadline.
+    default_request_ttl: AtomicU64,
 }
 
 impl AggregatorState {
@@ -177,6 +201,8 @@ impl AggregatorState {
         store: Option<Arc<dyn Store>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            reference_time: AtomicU64::new(0),
+            default_request_ttl: AtomicU64::new(DEFAULT_REQUEST_TTL_SECS),
             block_number: RwLock::new(1),
             records: DashMap::new(),
             pending_state_ids: DashMap::new(),
@@ -192,6 +218,59 @@ impl AggregatorState {
 
     pub async fn current_block_number(&self) -> u64 {
         *self.block_number.read().await
+    }
+
+    /// The reference time a round starting now would pin.
+    pub fn reference_time(&self) -> u64 {
+        self.reference_time.load(Ordering::Acquire)
+    }
+
+    /// Set the default request lifetime, in seconds.
+    pub fn set_default_request_ttl(&self, seconds: u64) {
+        self.default_request_ttl.store(
+            if seconds == 0 {
+                DEFAULT_REQUEST_TTL_SECS
+            } else {
+                seconds
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// The absolute deadline a request admitted now is held to.
+    ///
+    /// An explicit deadline is used verbatim; otherwise the service's default
+    /// lifetime is added to the current reference time. The assigned value is
+    /// service metadata and does not enter the transaction hash, so a requester
+    /// that omits it needs no clock of its own. `None` means no
+    /// consensus reference time is available yet.
+    pub fn effective_timeout(&self, explicit: Option<u64>) -> Option<u64> {
+        let reference_time = self.reference_time();
+        if reference_time == 0 {
+            return None;
+        }
+        match explicit {
+            Some(timeout) => Some(timeout),
+            None => reference_time.checked_add(self.default_request_ttl.load(Ordering::Acquire)),
+        }
+    }
+
+    /// Publish the reference time rounds are currently pinning. It never moves
+    /// backwards: a stale certificate arriving out of order must not undo a
+    /// newer one.
+    pub fn set_reference_time(&self, reference_time: u64) {
+        let mut current = self.reference_time.load(Ordering::Acquire);
+        while reference_time > current {
+            match self.reference_time.compare_exchange_weak(
+                current,
+                reference_time,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub async fn increment_block_number(&self) -> u64 {
@@ -269,6 +348,7 @@ impl AggregatorState {
                 r.state_id_hex,
                 RecordInfo {
                     block_number: r.block_number,
+                    reference_time: r.reference_time,
                     cert_data: r.cert_data,
                     merkle_path_cbor: r.merkle_path_cbor,
                 },
@@ -322,6 +402,7 @@ impl AggregatorState {
 
         Ok(InclusionProofLookup::Proof(InclusionProofData {
             block_number: record.block_number,
+            reference_time: Some(record.reference_time),
             cert_data: Some(record.cert_data),
             merkle_path_cbor,
             uc_cbor: block.uc_cbor,
@@ -431,6 +512,8 @@ impl AggregatorState {
 pub struct FinalizedRecord {
     pub state_id_hex: String,
     pub block_number: u64,
+    /// Reference time of the round this record's leaf was created in.
+    pub reference_time: u64,
     pub cert_data: CertDataFields,
     /// Pre-computed Merkle path CBOR.
     ///
@@ -441,6 +524,41 @@ pub struct FinalizedRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Omitting the deadline delegates assignment to the service: the deadline
+    /// is the default lifetime added to the consensus reference time, so the
+    /// requester needs no clock of its own. An explicit deadline is used
+    /// verbatim, and neither value enters the transaction hash.
+    #[test]
+    fn effective_timeout_is_assigned_only_when_omitted() {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = AggregatorState::new(tx, None);
+        state.set_default_request_ttl(600);
+
+        assert_eq!(state.effective_timeout(None), None, "no reference time yet");
+
+        state.set_reference_time(1_755_000_000);
+        assert_eq!(state.effective_timeout(None), Some(1_755_000_600));
+        assert_eq!(
+            state.effective_timeout(Some(1_755_000_005)),
+            Some(1_755_000_005)
+        );
+    }
+
+    /// A stale certificate arriving out of order must not undo a newer one.
+    #[test]
+    fn reference_time_never_moves_backwards() {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = AggregatorState::new(tx, None);
+
+        state.set_reference_time(1_755_000_000);
+        state.set_reference_time(1_754_000_000);
+
+        assert_eq!(state.reference_time(), 1_755_000_000);
+    }
+
+    /// Exclusive certification request deadline every fixture in this module uses.
+    const TEST_EXPIRES_AT: u64 = 1_755_003_600;
     use smt_store::{MemSmt, SmtStore, SmtStoreSnapshot};
 
     fn request(state_id: [u8; 32]) -> ValidatedRequest {
@@ -450,6 +568,8 @@ mod tests {
             predicate_cbor: vec![1],
             source_state_hash: vec![2; 32],
             transaction_hash: vec![3; AGGREGATION_TREE_VALUE_SIZE],
+            expires_at: Some(TEST_EXPIRES_AT),
+            effective_timeout: TEST_EXPIRES_AT,
             witness: vec![4; 65],
             public_key: vec![5; 33],
         }

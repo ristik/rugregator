@@ -31,11 +31,7 @@ pub enum SignatureError {
 /// `pubkey` is the 33-byte compressed public key from the predicate.
 ///
 /// Matches Go `VerifyHashWithPublicKey`.
-pub fn verify_signature(
-    hash: &[u8; 32],
-    sig: &[u8],
-    pubkey: &[u8],
-) -> Result<(), SignatureError> {
+pub fn verify_signature(hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<(), SignatureError> {
     if sig.len() != 65 {
         return Err(SignatureError::InvalidLength(sig.len()));
     }
@@ -46,8 +42,8 @@ pub fn verify_signature(
     let rs = &sig[..64];
     let v = sig[64];
 
-    let recovery_id = RecoveryId::from_i32(v as i32)
-        .map_err(|_| SignatureError::InvalidRecoveryId(v))?;
+    let recovery_id =
+        RecoveryId::from_i32(v as i32).map_err(|_| SignatureError::InvalidRecoveryId(v))?;
 
     let recoverable = RecoverableSignature::from_compact(rs, recovery_id)?;
 
@@ -72,9 +68,7 @@ mod tests {
     fn sign_unicity(hash: &[u8; 32], sk: &SecretKey) -> Vec<u8> {
         let secp = Secp256k1::new();
         let msg = Message::from_digest(*hash);
-        let (recovery_id, compact) = secp
-            .sign_ecdsa_recoverable(&msg, sk)
-            .serialize_compact();
+        let (recovery_id, compact) = secp.sign_ecdsa_recoverable(&msg, sk).serialize_compact();
         // Convert [R||S] + recovery_id → [R||S||V] (Unicity format)
         let mut sig = vec![0u8; 65];
         sig[..64].copy_from_slice(&compact);

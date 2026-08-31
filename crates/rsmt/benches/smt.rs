@@ -21,11 +21,15 @@ use rsmt::consistency::{batch_insert, batch_insert_with_proof, verify_consistenc
 use rsmt::path::SmtKey;
 use rsmt::SparseMerkleTree;
 
+/// Reference time the benchmark's rounds build their leaves under.
+const BENCH_REFERENCE_TIME: u64 = 1_755_000_000;
+
 // ─── Key generation ──────────────────────────────────────────────────────────
 
 /// LCG-based key generator: no external deps, reproducible across runs.
 fn lcg_next(seed: &mut u64) -> u64 {
-    *seed = seed.wrapping_mul(6_364_136_223_846_793_005)
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
     *seed
 }
@@ -63,7 +67,7 @@ fn build_prefilled_tree(n: usize) -> SparseMerkleTree {
 
 fn bench_batch_insert(c: &mut Criterion) {
     let prefill_sizes = [0usize, 10_000, 100_000];
-    let batch_sizes   = [100usize, 1_000, 10_000];
+    let batch_sizes = [100usize, 1_000, 10_000];
 
     let mut group = c.benchmark_group("batch_insert");
 
@@ -99,7 +103,7 @@ fn bench_batch_insert(c: &mut Criterion) {
 
 fn bench_verify_consistency(c: &mut Criterion) {
     let prefill_sizes = [0usize, 10_000, 100_000];
-    let batch_sizes   = [100usize, 1_000, 10_000];
+    let batch_sizes = [100usize, 1_000, 10_000];
 
     let mut group = c.benchmark_group("verify_consistency");
 
@@ -109,8 +113,24 @@ fn bench_verify_consistency(c: &mut Criterion) {
             let mut tree = build_prefilled_tree(prefill);
             let batch = gen_batch(batch_size, 0xfeed_face_dead_beef);
             let old_root = tree.root_hash();
+            let derived: Vec<_> = batch
+                .iter()
+                .map(|(k, v)| (*k, rsmt::leaf_value(v, BENCH_REFERENCE_TIME).to_vec()))
+                .collect();
             let (inserted, proof) =
-                batch_insert_with_proof(&mut tree, &batch).expect("insert failed");
+                batch_insert_with_proof(&mut tree, &derived).expect("insert failed");
+            let declared: Vec<_> = inserted
+                .iter()
+                .map(|(k, _)| {
+                    let v = batch
+                        .iter()
+                        .find(|(bk, _)| bk == k)
+                        .expect("declared")
+                        .1
+                        .clone();
+                    (*k, v)
+                })
+                .collect();
             let new_root = tree.root_hash();
 
             group.throughput(Throughput::Elements(batch_size as u64));
@@ -123,7 +143,8 @@ fn bench_verify_consistency(c: &mut Criterion) {
                             black_box(&proof),
                             black_box(old_root),
                             black_box(new_root),
-                            black_box(&inserted),
+                            black_box(&declared),
+                            black_box(BENCH_REFERENCE_TIME),
                         )
                     });
                 },

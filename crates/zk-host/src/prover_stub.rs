@@ -58,6 +58,7 @@ impl Prover {
         _envelope: &[u8],
         _prev_root: [u8; 32],
         _new_root: [u8; 32],
+        _reference_time: u64,
     ) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("zk-host compiled without prove feature")
     }
@@ -68,6 +69,7 @@ impl Prover {
         _envelope: &[u8],
         _prev_root: [u8; 32],
         _new_root: [u8; 32],
+        _reference_time: u64,
         _kind: ZkProofKind,
     ) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("zk-host compiled without prove feature")
@@ -84,6 +86,7 @@ impl Prover {
         _proof_bytes: &[u8],
         _prev_root: [u8; 32],
         _new_root: [u8; 32],
+        _reference_time: u64,
     ) -> anyhow::Result<()> {
         anyhow::bail!("zk-host compiled without prove feature")
     }

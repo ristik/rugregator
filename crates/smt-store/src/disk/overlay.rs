@@ -4,8 +4,8 @@
 //! On BFT success: `commit` flushes via `WriteBatch`.
 //! On BFT failure: `drop` discards everything.
 
-use std::collections::HashMap;
 use super::node_key::NodeKey;
+use std::collections::HashMap;
 
 /// Speculative write buffer for one round's SMT mutations.
 #[derive(Debug, Default, Clone)]

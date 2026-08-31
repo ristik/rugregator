@@ -16,6 +16,7 @@ use rsmt::{
 use crate::disk::materializer::CF_SMT_NODES;
 use crate::disk::node_key::{prefix_copy_path, prefix_set_bit, NodeKey, PrefixBits};
 use crate::traits::{CertifiedSmtSnapshot, SmtStore, SmtStoreSnapshot};
+use crate::{declared_batch, derive_batch};
 use rsmt::path::key_bit_at;
 
 const CF_SMT_META: &str = "smt_meta";
@@ -283,10 +284,12 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
     fn insert_batch(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        let derived = derive_batch(batch, reference_time);
         if with_proof {
-            match self.inner.batch_insert_with_proof(batch) {
+            match self.inner.batch_insert_with_proof(&derived) {
                 Ok((inserted_pairs, proof)) => {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
@@ -297,15 +300,20 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                         .collect();
                     // Build the aggregator_rsmt_v1 envelope while we still
                     // hold the sorted inserted pairs; this is the wire form
-                    // the BFT Core verifier expects.
-                    let envelope = encode_aggregator_envelope_v1(&inserted_pairs, &proof);
+                    // the BFT Core verifier expects. It declares transaction
+                    // hashes, which the Core re-derives the stored leaf values
+                    // from using the reference time it already enforces.
+                    let envelope = encode_aggregator_envelope_v1(
+                        &declared_batch(&inserted_pairs, batch),
+                        &proof,
+                    );
                     self.pending.extend(inserted_pairs);
                     Ok((flags, Some(envelope)))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof failed: {e}")),
             }
         } else {
-            match self.inner.batch_insert(batch) {
+            match self.inner.batch_insert(&derived) {
                 Ok(inserted_pairs) => {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
@@ -325,10 +333,12 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
     fn insert_batch_with<H: rsmt::SmtHasher>(
         &mut self,
         batch: &[(SmtKey, Vec<u8>)],
+        reference_time: u64,
         with_proof: bool,
     ) -> anyhow::Result<(Vec<bool>, Option<Vec<u8>>)> {
+        let derived = derive_batch(batch, reference_time);
         if with_proof {
-            match self.inner.batch_insert_with_proof_with::<H>(batch) {
+            match self.inner.batch_insert_with_proof_with::<H>(&derived) {
                 Ok((inserted_pairs, proof)) => {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
@@ -337,14 +347,17 @@ impl SmtStoreSnapshot for MemSmtSnapshot {
                         .iter()
                         .map(|(k, _)| inserted_set.contains(k) && seen.insert(*k))
                         .collect();
-                    let envelope = encode_aggregator_envelope_v1(&inserted_pairs, &proof);
+                    let envelope = encode_aggregator_envelope_v1(
+                        &declared_batch(&inserted_pairs, batch),
+                        &proof,
+                    );
                     self.pending.extend(inserted_pairs);
                     Ok((flags, Some(envelope)))
                 }
                 Err(e) => Err(anyhow::anyhow!("batch_insert_with_proof_with failed: {e}")),
             }
         } else {
-            match self.inner.batch_insert_with::<H>(batch) {
+            match self.inner.batch_insert_with::<H>(&derived) {
                 Ok(inserted_pairs) => {
                     let inserted_set: std::collections::HashSet<SmtKey> =
                         inserted_pairs.iter().map(|(k, _)| *k).collect();
