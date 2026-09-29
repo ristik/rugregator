@@ -311,20 +311,33 @@ fn require_u32(value: &Value, path: &str) -> Result<(), CborError> {
 pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8; 32]>, CborError> {
     let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
     let input = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord")?;
-    val_as_u64(&input[1], "InputRecord.roundNumber")?;
+    let round = val_as_u64(&input[1], "InputRecord.roundNumber")?;
     val_as_u64(&input[2], "InputRecord.epoch")?;
     optional_bytes(&input[3], "InputRecord.previousHash")?;
-    let state_root = match val_as_bytes(&input[4], "InputRecord.hash")?.as_slice() {
-        [] => None,
-        bytes if bytes.len() == 32 => Some(bytes.try_into().expect("length checked")),
-        bytes => {
+    let state_root = match &input[4] {
+        Value::Null if round == 0 => None,
+        Value::Bytes(bytes) if bytes.is_empty() => None,
+        Value::Bytes(bytes) if bytes.len() == 32 => {
+            Some(bytes.as_slice().try_into().expect("length checked"))
+        }
+        Value::Bytes(bytes) => {
             return Err(CborError::TypeMismatch {
                 path: "InputRecord.hash".into(),
                 msg: format!("expected zero or 32 bytes, got {}", bytes.len()),
             })
         }
+        value => {
+            return Err(CborError::TypeMismatch {
+                path: "InputRecord.hash".into(),
+                msg: format!("expected bytes or a null genesis value, got {value:?}"),
+            })
+        }
     };
-    val_as_bytes(&input[5], "InputRecord.summaryValue")?;
+    if round == 0 && matches!(input[5], Value::Null) {
+        // Core's initial, uncommitted input record encodes the absent summary as null.
+    } else {
+        val_as_bytes(&input[5], "InputRecord.summaryValue")?;
+    }
     val_as_u64(&input[6], "InputRecord.timestamp")?;
     optional_bytes(&input[7], "InputRecord.blockHash")?;
     val_as_u64(&input[8], "InputRecord.sumOfEarnedFees")?;
@@ -623,6 +636,66 @@ mod tests {
                 ),
             ])),
         )
+    }
+
+    #[test]
+    fn accepts_core_genesis_input_record_with_null_state_hash_and_summary() {
+        let mut uc = canonical_uc();
+        let fields = match &mut uc {
+            Value::Tag(_, inner) => match inner.as_mut() {
+                Value::Array(uc) => match &mut uc[1] {
+                    Value::Tag(_, input) => match input.as_mut() {
+                        Value::Array(input) => input,
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        fields[1] = uint(0);
+        fields[4] = Value::Null;
+        fields[5] = Value::Null;
+        assert_eq!(unicity_certificate_state_root(&uc).unwrap(), None);
+        validate_unicity_certificate_value(&uc).unwrap();
+    }
+
+    #[test]
+    fn rejects_null_input_record_values_after_genesis() {
+        let mut uc = canonical_uc();
+        let fields = match &mut uc {
+            Value::Tag(_, inner) => match inner.as_mut() {
+                Value::Array(uc) => match &mut uc[1] {
+                    Value::Tag(_, input) => match input.as_mut() {
+                        Value::Array(input) => input,
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        fields[4] = Value::Null;
+        assert!(unicity_certificate_state_root(&uc).is_err());
+
+        let mut uc = canonical_uc();
+        let fields = match &mut uc {
+            Value::Tag(_, inner) => match inner.as_mut() {
+                Value::Array(uc) => match &mut uc[1] {
+                    Value::Tag(_, input) => match input.as_mut() {
+                        Value::Array(input) => input,
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        fields[5] = Value::Null;
+        assert!(unicity_certificate_state_root(&uc).is_err());
     }
 
     /// The certification request the JS, Java, Rust and Go SDKs all produce for
