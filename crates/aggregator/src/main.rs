@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
             let live_cfg = LiveBftConfig {
                 partition_id: cfg.partition_id,
+                shard_id: cfg.shard_id.as_bytes().to_vec(),
                 bft_peer_id: peer_id,
                 bft_addr,
                 listen_addr: p2p_addr,

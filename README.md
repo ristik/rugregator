@@ -164,6 +164,7 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, or `disk` |
 | `--cache-mb` | `AGGREGATOR_CACHE_MB` | `0` | RocksDB block cache size in MB (0 = RocksDB default ~8 MB) |
 | `--partition-id` | `AGGREGATOR_PARTITION_ID` | `1` | BFT Core partition ID |
+| `--shard-id` | `AGGREGATOR_SHARD_ID` | `0x80` | Canonical BFT Core shard ID (end-marker hex) |
 | `--bft-peer-id` | `AGGREGATOR_BFT_PEER_ID` | | BFT Core root node peer ID |
 | `--bft-addr` | `AGGREGATOR_BFT_ADDR` | `/ip4/127.0.0.1/tcp/26652` | BFT Core multiaddr |
 | `--p2p-addr` | `AGGREGATOR_P2P_ADDR` | `/ip4/0.0.0.0/tcp/0` | Our libp2p listen multiaddr |

@@ -1,6 +1,33 @@
 //! Configuration for the aggregator (CLI + env + defaults).
 
 use clap::{Parser, ValueEnum};
+use std::str::FromStr;
+
+/// Canonical BFT Core shard bitstring, including its end marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardId(Vec<u8>);
+
+impl ShardId {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl FromStr for ShardId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let hex = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        let bytes = hex::decode(hex).map_err(|e| format!("invalid shard ID hex: {e}"))?;
+        if bytes.last().copied().unwrap_or(0) == 0 {
+            return Err("shard ID must contain a final end-marker bit".into());
+        }
+        Ok(Self(bytes))
+    }
+}
 
 /// Consistency proof mode attached to each BFT Core certification request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -50,6 +77,10 @@ pub struct Config {
     /// BFT Core partition ID (u32).
     #[arg(long, env = "AGGREGATOR_PARTITION_ID", default_value_t = 1)]
     pub partition_id: u32,
+
+    /// BFT Core shard ID in canonical end-marker encoding (e.g. 0x80 for the default shard).
+    #[arg(long, env = "AGGREGATOR_SHARD_ID", default_value = "0x80")]
+    pub shard_id: ShardId,
 
     /// BFT Core root node peer ID (libp2p multihash string).
     #[arg(long, env = "AGGREGATOR_BFT_PEER_ID", default_value = "")]
@@ -151,6 +182,31 @@ pub struct Config {
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_id_defaults_and_accepts_distinct_bitstrings() {
+        let default = Config::try_parse_from(["aggregator"]).unwrap();
+        assert_eq!(default.shard_id.as_bytes(), &[0x80]);
+        let left = Config::try_parse_from(["aggregator", "--shard-id", "0x40"]).unwrap();
+        let right = Config::try_parse_from(["aggregator", "--shard-id", "0xc0"]).unwrap();
+        assert_eq!(left.shard_id.as_bytes(), &[0x40]);
+        assert_eq!(right.shard_id.as_bytes(), &[0xc0]);
+    }
+
+    #[test]
+    fn shard_id_rejects_missing_or_invalid_end_marker() {
+        for value in ["", "0x", "0x00", "0x8000", "0xgg", "0x8"] {
+            assert!(
+                Config::try_parse_from(["aggregator", "--shard-id", value]).is_err(),
+                "{value}"
+            );
+        }
+    }
 }
 
 /// Round-manager-specific config derived from `Config`.
