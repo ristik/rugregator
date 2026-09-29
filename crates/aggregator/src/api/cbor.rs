@@ -661,6 +661,43 @@ mod tests {
         validate_unicity_certificate_value(&uc).unwrap();
     }
 
+    #[test]
+    fn rejects_null_input_record_values_after_genesis() {
+        let mut uc = canonical_uc();
+        let fields = match &mut uc {
+            Value::Tag(_, inner) => match inner.as_mut() {
+                Value::Array(uc) => match &mut uc[1] {
+                    Value::Tag(_, input) => match input.as_mut() {
+                        Value::Array(input) => input,
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        fields[4] = Value::Null;
+        assert!(unicity_certificate_state_root(&uc).is_err());
+
+        let mut uc = canonical_uc();
+        let fields = match &mut uc {
+            Value::Tag(_, inner) => match inner.as_mut() {
+                Value::Array(uc) => match &mut uc[1] {
+                    Value::Tag(_, input) => match input.as_mut() {
+                        Value::Array(input) => input,
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        fields[5] = Value::Null;
+        assert!(unicity_certificate_state_root(&uc).is_err());
+    }
+
     /// The certification request the JS, Java, Rust and Go SDKs all produce for
     /// the shared cross-implementation vector when the requester leaves the
     /// deadline to the service: `expiresAt` holds its slot as CBOR null.
