@@ -261,6 +261,8 @@ struct Behaviour {
 #[derive(Debug, Clone)]
 pub struct LiveBftConfig {
     pub partition_id: u32,
+    /// Canonical shard bitstring, including the end marker.
+    pub shard_id: Vec<u8>,
     pub bft_peer_id: PeerId,
     pub bft_addr: Multiaddr,
     pub listen_addr: Multiaddr,
@@ -341,6 +343,7 @@ impl LiveBftCommitter {
         let bft_peer = cfg.bft_peer_id;
         let bft_addr = cfg.bft_addr.clone();
         let partition_id = cfg.partition_id;
+        let shard_id = cfg.shard_id;
         let node_id2 = node_id.clone();
         let sig_key2 = SecretKey::from_slice(&cfg.sig_key_bytes)
             .map_err(|e| anyhow::anyhow!("sig key (net): {e}"))?;
@@ -355,6 +358,7 @@ impl LiveBftCommitter {
                 bft_peer,
                 bft_addr,
                 partition_id,
+                shard_id,
                 node_id2,
                 sig_key2,
                 fake_st,
@@ -497,6 +501,18 @@ fn cbor_handshake(h: &Handshake) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn make_handshake_cbor(
+    partition_id: u32,
+    shard_id: &[u8],
+    node_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    cbor_handshake(&Handshake {
+        partition_id,
+        shard_id: shard_id.to_vec(),
+        node_id: node_id.to_string(),
+    })
+}
+
 fn strip_tags(val: &ciborium::value::Value) -> ciborium::value::Value {
     match val {
         ciborium::value::Value::Tag(_, inner) => strip_tags(inner),
@@ -630,6 +646,7 @@ fn make_cert_cbor(
     epoch: u64,
     prev_hash_ir: Option<Vec<u8>>,
     partition_id: u32,
+    shard_id: &[u8],
     node_id: &str,
     secp: &Secp256k1<secp256k1::All>,
     sig_key: &SecretKey,
@@ -658,7 +675,7 @@ fn make_cert_cbor(
     };
     let mut req = BlockCertReq {
         partition_id,
-        shard_id: vec![0x80],
+        shard_id: shard_id.to_vec(),
         node_id: node_id.to_string(),
         input_record: ir,
         zk_proof: pending.zk_proof.clone(),
@@ -692,6 +709,7 @@ async fn network_loop(
     bft_peer: PeerId,
     bft_addr: Multiaddr,
     partition_id: u32,
+    shard_id: Vec<u8>,
     node_id: String,
     sig_key: SecretKey,
     fake_state_transitions: bool,
@@ -736,8 +754,7 @@ async fn network_loop(
                         reconnect_delay = None;
                         info!("Connected to BFT Core {}", peer_id);
                         if !hs_sent {
-                            let h = Handshake { partition_id, shard_id: vec![0x80], node_id: node_id.clone() };
-                            if let Ok(cbor) = cbor_handshake(&h) {
+                            if let Ok(cbor) = make_handshake_cbor(partition_id, &shard_id, &node_id) {
                                 swarm.behaviour_mut().hs.send_request(&peer_id, cbor);
                                 hs_sent = true;
                                 info!("Handshake sent, subscribed to UC feed");
@@ -804,7 +821,7 @@ async fn network_loop(
                                     Some(p.prev_hash.clone())
                                 };
                                 match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
-                                                     partition_id, &node_id, &secp, &sig_key) {
+                                                     partition_id, &shard_id, &node_id, &secp, &sig_key) {
                                     Ok(cbor) => {
                                         warn!(
                                             old_round, new_round,
@@ -892,7 +909,7 @@ async fn network_loop(
                                 };
 
                                 match make_cert_cbor(p, new_round, lu.epoch, prev_hash_ir,
-                                                     partition_id, &node_id, &secp, &sig_key) {
+                                                     partition_id, &shard_id, &node_id, &secp, &sig_key) {
                                     Ok(cbor) => {
                                         info!(
                                             old_round, new_round,
@@ -971,8 +988,7 @@ async fn network_loop(
                         idle_secs = last_uc_time.elapsed().as_secs(),
                         "UC inactivity timeout — re-sending handshake"
                     );
-                    let h = Handshake { partition_id, shard_id: vec![0x80], node_id: node_id.clone() };
-                    if let Ok(cbor) = cbor_handshake(&h) {
+                    if let Ok(cbor) = make_handshake_cbor(partition_id, &shard_id, &node_id) {
                         swarm.behaviour_mut().hs.send_request(&bft_peer, cbor);
                         last_uc_time = std::time::Instant::now();
                     }
@@ -1055,7 +1071,7 @@ async fn network_loop(
                         };
 
                         match make_cert_cbor(&p, round, lu.epoch, prev_hash_ir,
-                                             partition_id, &node_id, &secp, &sig_key) {
+                                             partition_id, &shard_id, &node_id, &secp, &sig_key) {
                             Ok(cbor) => {
                                 info!(round, "sending cert request to BFT Core");
                                 pending = Some(p);
@@ -1133,6 +1149,7 @@ mod tests {
             0,
             Some(vec![0x22; 32]),
             1,
+            &[0x80],
             "NODE",
             &secp,
             &signing_key,
@@ -1141,6 +1158,63 @@ mod tests {
         let request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
 
         assert_eq!(request.input_record.timestamp, pending.reference_time);
+    }
+
+    #[test]
+    fn configured_shard_is_signed_in_certification_request() {
+        let secp = Secp256k1::new();
+        let signing_key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let (uc_tx, _uc_rx) = oneshot::channel();
+        let pending = PendingCert {
+            new_hash: vec![0x11; 32],
+            prev_hash: vec![0x22; 32],
+            zk_proof: None,
+            block_size: 1,
+            state_size: 1,
+            reference_time: 1_755_000_000,
+            uc_tx,
+            round_used: 2,
+        };
+        for shard_id in [[0x80], [0x40], [0xc0]] {
+            let encoded = make_cert_cbor(
+                &pending,
+                2,
+                0,
+                Some(vec![0x22; 32]),
+                1,
+                &shard_id,
+                "NODE",
+                &secp,
+                &signing_key,
+            )
+            .unwrap();
+            let mut request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
+            assert_eq!(request.shard_id, shard_id);
+            let signature =
+                secp256k1::ecdsa::Signature::from_compact(request.signature.as_ref().unwrap())
+                    .unwrap();
+            request.signature = None;
+            let digest: [u8; 32] = Sha256::digest(cbor_cert_req(&request).unwrap()).into();
+            secp.verify_ecdsa(
+                &Message::from_digest(digest),
+                &signature,
+                &secp256k1::PublicKey::from_secret_key(&secp, &signing_key),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_shard_is_used_for_initial_reconnect_and_refresh_handshakes() {
+        for shard_id in [[0x80], [0x40], [0xc0]] {
+            let initial = make_handshake_cbor(1, &shard_id, "NODE").unwrap();
+            let reconnect = make_handshake_cbor(1, &shard_id, "NODE").unwrap();
+            let refresh = make_handshake_cbor(1, &shard_id, "NODE").unwrap();
+            assert_eq!(initial, reconnect);
+            assert_eq!(initial, refresh);
+            let handshake: Handshake = ciborium::from_reader(initial.as_slice()).unwrap();
+            assert_eq!(handshake.shard_id, shard_id);
+        }
     }
 
     #[test]
