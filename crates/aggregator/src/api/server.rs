@@ -331,6 +331,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn valid_latest_wait_is_ignored_with_byte_identical_result_and_no_echo() {
+        let (state, _) = serving_state(&[0x11, 0x22]);
+        let ids = [hex::encode([0x22; 32]), hex::encode([0x11; 32])];
+        let body = |extra: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"get_inclusion_proofs.v1","params":{{"stateIds":["{}","{}"]{extra}}}}}"#,
+                ids[0], ids[1]
+            )
+        };
+        let (s0, plain) = dispatch(Arc::clone(&state), body("").as_bytes()).await;
+        for extra in [r#","waitMs":0"#, r#","waitMs":20000"#, r#","waitMs":9007199254740991"#, r#","waitMs":5,"stateRoot":"latest""#] {
+            let (s1, with) = dispatch(Arc::clone(&state), body(extra).as_bytes()).await;
+            assert_eq!((s1, &with), (s0, &plain), "{extra}");
+            assert!(!with.contains("waitedMs"));
+        }
+        // An absent id is the same pending/unknown error with no echo either.
+        let miss = hex::encode([0x99; 32]);
+        let req = |extra: &str| json!({"jsonrpc":"2.0","id":1,"method":"get_inclusion_proofs.v1",
+            "params": serde_json::from_str::<Value>(&format!(r#"{{"stateIds":["{miss}"]{extra}}}"#)).unwrap()}).to_string();
+        let (_, e0) = dispatch(Arc::clone(&state), req("").as_bytes()).await;
+        let (_, e1) = dispatch(Arc::clone(&state), req(r#","waitMs":3000"#).as_bytes()).await;
+        assert_eq!(e0, e1);
+        assert!(!e1.contains("waitedMs"));
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_waits_are_malformed_params_without_echo() {
+        let (state, root) = serving_state(&[0x11]);
+        let present = hex::encode([0x11; 32]);
+        for params in [
+            format!(r#"{{"stateIds":["{present}"],"waitMs":-1}}"#),
+            format!(r#"{{"stateIds":["{present}"],"waitMs":"5"}}"#),
+            format!(r#"{{"stateIds":["{present}"],"waitMs":1,"waitMs":1}}"#),
+            format!(r#"{{"stateIds":["{present}"],"stateRoot":"{}","waitMs":0}}"#, hex::encode(root)),
+        ] {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"get_inclusion_proofs.v1","params":{params}}}"#);
+            let (_, text) = dispatch(Arc::clone(&state), body.as_bytes()).await;
+            let resp: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(resp["error"]["code"], json!(-32602), "{params}");
+            assert_eq!(resp["error"]["data"]["reason"], json!("invalid_request"));
+            assert_eq!(resp["error"]["data"]["detail"], json!("malformed_params"));
+            assert!(resp["error"]["data"].get("waitedMs").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn batch_errors_use_the_go_codes_and_structured_data() {
         let (state, root) = serving_state(&[0x11]);
         let present = hex::encode([0x11; 32]);
