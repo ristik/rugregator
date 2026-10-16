@@ -31,6 +31,13 @@ start_s1() {
     curl -fsS -m 2 -X POST "http://127.0.0.1:$port/" -d '{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{}}' >/dev/null 2>&1 && break
     sleep 0.2
   done
+  # rugregator only certifies rounds with requests, so until the first one there is no finalized block
+  # whose certificate an empty-proof v2 answer could carry (the first lookup of a fresh server gets the
+  # poll-on `-32021`, or the typed `no_finalized_view` for an unknown id). Warm the server with one
+  # certification so every client below starts against a normal one. Needs `go` and AGG_GO_DIR.
+  if [ -n "${AGG_GO_DIR:-}" ]; then
+    (cd "$AGG_GO_DIR" && go run ./cmd/commitment -url "http://127.0.0.1:$port" -timeout 30s -v=false -long-poll=false) >/dev/null 2>&1 || true
+  fi
   export IX_URL="http://127.0.0.1:$port" IX_TRUSTBASE="$S1_DIR/trust-base.json" IX_PARTITION=1 IX_RETAINED=32 IX_ROUND_MS=1000
 }
 stop_s1() { [ -n "${S1_PID:-}" ] && kill "$S1_PID" 2>/dev/null; wait "$S1_PID" 2>/dev/null; cp "$S1_DIR/server.log" "$OUT/$server-$1-server.log" 2>/dev/null; S1_PID=; }

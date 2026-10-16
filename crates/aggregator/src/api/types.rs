@@ -73,9 +73,11 @@ impl JsonRpcError {
     /// The aggregator has no record of this state id: neither certified nor
     /// pending. Maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32020;
-    /// Historical: `get_inclusion_proof.v2` used to answer a pending state with this
-    /// error. It now answers like aggregator-go (the empty-proof result), so no method
-    /// emits this code any more; old servers still do and clients keep handling it.
+    /// A known certification request has not reached a certified block yet, and there is
+    /// no finalized block whose certificate an empty-proof result could carry (the
+    /// window between startup and the first certified round). After that
+    /// `get_inclusion_proof.v2` answers pending states with aggregator-go's empty-proof
+    /// result instead. The client should keep polling.
     pub const INCLUSION_PENDING: i32 = -32021;
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
@@ -173,6 +175,13 @@ impl JsonRpcError {
         Self {
             code: Self::STATE_INCLUDED,
             message: "state is already included".into(),
+            data: None,
+        }
+    }
+    pub fn inclusion_pending() -> Self {
+        Self {
+            code: Self::INCLUSION_PENDING,
+            message: "certification is pending".into(),
             data: None,
         }
     }
