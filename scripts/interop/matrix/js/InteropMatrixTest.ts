@@ -122,30 +122,13 @@ describe('interop matrix', () => {
         throw new Error(`certification_request status ${r.status}`);
       }
     };
-    // The SDK's own wait ends with the JSON-RPC error when the server answers "pending" as -32021 (HTTP 200), which only
-    // rugregator does; the driver retries on that code so the remaining scenarios can run, and reports the finding.
-    let nativeWaitBroken: string | null = null;
-    const wait = async (m: IMinted): Promise<InclusionProof> => {
-      const deadline = Date.now() + waitMs;
-      for (;;) {
-        try {
-          return await waitInclusionProof(client, trustBase, predicateVerifier, ucVerifier, m.transaction, {
-            intervalMs: 200,
-            signal: AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
-            statusHints: true,
-            unknownGraceMs: 5000,
-          });
-        } catch (e) {
-          const code = (e as { code?: number }).code;
-          if (code === -32021 && Date.now() < deadline) {
-            nativeWaitBroken ??= `waitInclusionProof threw ${(e as Error).name} code=${code} "${(e as Error).message}"`;
-            await sleep(200);
-            continue;
-          }
-          throw e;
-        }
-      }
-    };
+    const wait = (m: IMinted): Promise<InclusionProof> =>
+      waitInclusionProof(client, trustBase, predicateVerifier, ucVerifier, m.transaction, {
+        intervalMs: 200,
+        signal: AbortSignal.timeout(waitMs),
+        statusHints: true,
+        unknownGraceMs: 5000,
+      });
 
     // ---- scenario 1: submit N, wait with status hints, verify each (waitInclusionProof verifies)
     const minted: IMinted[] = [];
@@ -167,10 +150,8 @@ describe('interop matrix', () => {
       emit(
         '1',
         'submit and wait',
-        nativeWaitBroken ? 'FAIL' : 'PASS',
-        nativeWaitBroken
-          ? `${nativeWaitBroken}; the SDK wait does not treat a -32021 pending answer as "not yet"; with a driver-side retry on that code all ${n} requests were included and verified`
-          : `${n} requests included (waitInclusionProof with statusHints), proofs verified`,
+        'PASS',
+        `${n} requests included (waitInclusionProof with statusHints), proofs verified`,
       );
     } catch (e) {
       emit('1', 'submit and wait', 'FAIL', describeBatchError(e));
@@ -410,15 +391,15 @@ describe('interop matrix', () => {
       } else if (accepted.length === 0) {
         ev.push(`tamper: all ${total} single-bit flips rejected`);
       } else {
-        // block number (unauthenticated metadata, right after the array header) and the final byte are non-binding
+        // only the block number (unauthenticated metadata, right after the array header) is non-binding; the final byte (recovery id) must be rejected
         const head = ({ 0x18: 2, 0x19: 3, 0x1a: 5, 0x1b: 9 } as Record<number, number>)[encoded[1]] ?? 1;
-        const nonBinding = new Set<number>([encoded.length - 1]);
+        const nonBinding = new Set<number>();
         for (let k = 1; k < 1 + head; k++) {
           nonBinding.add(k);
         }
         const binding = accepted.filter((o) => !nonBinding.has(o));
         ev.push(
-          `tamper: ${accepted.length} of ${total} single-bit flips still verified at offsets ${JSON.stringify(accepted)} (non-binding: block number, final byte; binding offsets accepted: ${JSON.stringify(binding)})`,
+          `tamper: ${accepted.length} of ${total} single-bit flips still verified at offsets ${JSON.stringify(accepted)} (non-binding: block number only; binding offsets accepted: ${JSON.stringify(binding)})`,
         );
         failed ||= binding.length > 0;
       }

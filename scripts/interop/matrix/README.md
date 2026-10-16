@@ -34,4 +34,4 @@ python3 scripts/interop/matrix/report.py scripts/interop/matrix/results
 committing workstation paths. Remove those files afterwards (`git status` in the checkout).
 `s2.sh up` takes the shared Docker lock (`/tmp/uc-docker.lock`) and holds it until `down`; its data directory must be
 under `$HOME` (the colima VM mounts only the home directory) and the stack avoids the RocksDB image build.
-The Go client needs the G4 direct unsharded path (aggregator-go #217): use a checkout that contains it.
+The Go client needs the G4 direct unsharded path (aggregator-go #217; contained in `non-inclusion`).

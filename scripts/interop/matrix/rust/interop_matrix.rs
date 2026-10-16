@@ -581,11 +581,12 @@ fn interop_matrix() {
         } else if accepted.is_empty() {
             ev.push(format!("tamper: all {total} single-bit flips rejected"));
         } else {
-            // the final byte is the known non-binding byte; report it, do not fail on it
-            let last = encoded.len() - 1;
-            let binding: Vec<usize> = accepted.iter().copied().filter(|o| *o != last).collect();
+            // strict single-pass recovery: the final byte (recovery id) must be rejected too. The block number
+            // (unauthenticated metadata, after the array header) is the only non-binding field.
+            let head = match encoded.get(1) { Some(0x18) => 2, Some(0x19) => 3, Some(0x1a) => 5, Some(0x1b) => 9, _ => 1 };
+            let binding: Vec<usize> = accepted.iter().copied().filter(|o| !(1..1 + head).contains(o)).collect();
             ev.push(format!(
-                "tamper: {} of {total} single-bit flips still verified at offsets {accepted:?} (non-binding: final byte; binding offsets accepted: {binding:?})",
+                "tamper: {} of {total} single-bit flips still verified at offsets {accepted:?} (non-binding: block number only; binding offsets accepted: {binding:?})",
                 accepted.len()
             ));
             failed = failed || !binding.is_empty();

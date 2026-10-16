@@ -653,9 +653,9 @@ func main() {
 			}
 		}
 		// tampering: flip one bit of every byte in turn; an accepted variant is reported
-		// block number bytes (explicitly unauthenticated metadata) and the final byte are the known
-		// non-binding bytes: report them but do not fail on them
-		nonBinding := map[int]bool{len(enc) - 1: true}
+		// only the block number bytes (explicitly unauthenticated metadata) are non-binding; the final
+		// byte (recovery id of a quorum-essential signature) must be rejected too (strict single-pass recovery)
+		nonBinding := map[int]bool{}
 		if len(enc) > 2 {
 			head := map[byte]int{0x18: 2, 0x19: 3, 0x1a: 5, 0x1b: 9}[enc[1]]
 			if head == 0 {
@@ -694,7 +694,7 @@ func main() {
 					binding = append(binding, o)
 				}
 			}
-			evid = append(evid, fmt.Sprintf("tamper: %d of %d single-bit flips still verified at offsets %v (non-binding: block number, final byte; binding offsets accepted: %v)", len(accepted), total, accepted, binding))
+			evid = append(evid, fmt.Sprintf("tamper: %d of %d single-bit flips still verified at offsets %v (non-binding: block number only; binding offsets accepted: %v)", len(accepted), total, accepted, binding))
 			failed = failed || len(binding) > 0
 		} else {
 			evid = append(evid, fmt.Sprintf("tamper: all %d single-bit flips rejected", total))
