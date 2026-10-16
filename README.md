@@ -88,7 +88,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --batch-limit 50000
 ```
 
-The stub BFT committer signs its own UCs with a hardcoded test key — no BFT Core process needed. With no `--db-path` the aggregator runs fully in-memory; state is lost on restart.
+The stub BFT committer signs its own native-valid UCs (partition `--partition-id`, default 1) with a published test key — no BFT Core process needed. The matching test-only trust anchor is printed by `stub-anchor trust-base`; see [docs/stub-uc-migration.md](docs/stub-uc-migration.md), which also covers resetting data written by earlier stub builds. With no `--db-path` the aggregator runs fully in-memory; state is lost on restart.
 
 ### SMT backend selection
 
