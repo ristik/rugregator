@@ -1,0 +1,110 @@
+# S2 for the interop matrix: aggregator-go with a real single-partition, single-shard (unsharded) BFT root
+# (bft-core root node + signed trust base), as in aggregator-go's docker-compose.yml, but
+#  - aggregator built by Dockerfile.aggregator (no RocksDB), HA off, no Redis;
+#  - everything under one compose project and a bind-mounted data directory (S2_DATA);
+#  - the aggregator published on S2_PORT (default 13000).
+# Run through run.sh (it holds the shared Docker lock). Build context: AGG_GO_DIR.
+services:
+  bft-root:
+    platform: linux/amd64
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    image: ghcr.io/unicitynetwork/bft-core:ceceacd11b7a735de74ce17884a3a45e0db1748d
+    volumes:
+      - ${S2_DATA}/genesis-root:/genesis/root
+      - ${S2_DATA}/genesis:/genesis
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "bft-root", "8002"]
+      interval: 5s
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/root/node-info.json ] && [ -f /genesis/trust-base.json ] && [ -f /genesis/root/trust-base-signed.json ]; then
+          echo "Genesis files already exist, skipping initialization."
+        else
+          ubft root-node init --home /genesis/root -g &&
+          ubft trust-base generate --home /genesis --network-id 3 --node-info /genesis/root/node-info.json &&
+          ubft trust-base sign --home /genesis/root --trust-base /genesis/trust-base.json
+        fi
+        exec ubft root-node run --home /genesis/root --address "/ip4/$$(hostname -i)/tcp/8000" --trust-base /genesis/trust-base.json --rpc-server-address "$$(hostname -i):8002" --block-rate "$${ROOT_BLOCK_RATE:-900}"
+
+  genesis-gen:
+    platform: linux/amd64
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    image: ghcr.io/unicitynetwork/bft-core:ceceacd11b7a735de74ce17884a3a45e0db1748d
+    volumes:
+      - ${S2_DATA}/genesis-root:/genesis/root
+      - ${S2_DATA}/genesis:/genesis
+    depends_on:
+      bft-root:
+        condition: service_healthy
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/aggregator/node-info.json ] && [ -f /genesis/shard-conf-7_0.json ]; then
+          echo "Aggregator genesis and config already exist, skipping initialization."
+        else
+          ubft shard-node init --home /genesis/aggregator --generate &&
+          ubft shard-conf generate --home /genesis --t2-timeout 5000 --network-id 3 --partition-id 7 --partition-type-id 7 --epoch-start 10 --node-info=/genesis/aggregator/node-info.json
+        fi
+        chmod -R 755 /genesis/aggregator
+        chmod 644 /genesis/shard-conf-7_0.json /genesis/trust-base.json
+
+  upload-configurations:
+    image: curlimages/curl:8.13.0
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    depends_on:
+      bft-root:
+        condition: service_healthy
+      genesis-gen:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - ${S2_DATA}/genesis:/genesis
+    command: |
+      /bin/sh -c "curl -fsS -X PUT -H 'Content-Type: application/json' -d @/genesis/shard-conf-7_0.json http://bft-root:8002/api/v1/configurations"
+
+  mongodb:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all", "--noauth"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "try { rs.status().ok } catch(e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}) }"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  aggregator:
+    build:
+      context: ${AGG_GO_DIR}
+      dockerfile: ${S2_DIR}/Dockerfile.aggregator
+    ports:
+      - "${S2_PORT:-13000}:3000"
+    volumes:
+      - ${S2_DATA}/genesis:/app/bft-config
+    environment:
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      MONGODB_URI: "mongodb://mongodb:27017/aggregator?replicaSet=rs0&directConnection=true"
+      MONGODB_DATABASE: "aggregator"
+      DISABLE_HIGH_AVAILABILITY: "true"
+      USE_REDIS_FOR_COMMITMENTS: "false"
+      SMT_BACKEND: "memory"
+      LOG_LEVEL: "info"
+      BATCH_LIMIT: "1000"
+      SIGNING_KEY_FILE: "/app/bft-config/aggregator/keys.json"
+      BFT_ENABLED: "true"
+      BFT_SHARD_CONF_FILE: "/app/bft-config/shard-conf-7_0.json"
+      BFT_TRUST_BASE_FILES: "/app/bft-config/trust-base.json"
+      BFT_RPC_ADDRESS: "http://bft-root:8002"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ROOT_NODE_ID=$$(grep -o '"nodeId": "[^"]*"' /app/bft-config/trust-base.json | head -1 | cut -d'"' -f4)
+        [ -n "$$ROOT_NODE_ID" ] || { echo "no root node id"; exit 1; }
+        export BFT_BOOTSTRAP_ADDRESSES="/dns4/bft-root/tcp/8000/p2p/$$ROOT_NODE_ID"
+        exec /app/aggregator
+    depends_on:
+      upload-configurations:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy

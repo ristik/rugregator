@@ -1,0 +1,15 @@
+# aggregator-go without RocksDB (memory SMT): the interop matrix only needs the batch/NI RPCs, and the
+# repository Dockerfile always compiles RocksDB, which the 2-CPU colima VM cannot afford.
+ARG GO_IMAGE=golang:1.25.0-alpine3.22
+FROM ${GO_IMAGE} AS builder
+RUN apk add --no-cache build-base git linux-headers
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 go build -o /out/aggregator ./cmd/aggregator
+
+FROM alpine:3.22
+RUN apk add --no-cache netcat-openbsd
+COPY --from=builder /out/aggregator /app/aggregator
+WORKDIR /app
