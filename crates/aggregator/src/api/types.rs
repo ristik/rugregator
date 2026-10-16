@@ -48,8 +48,10 @@ impl JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    /// A plain string for the legacy errors, a structured object for the
+    /// Go-compatible batch errors (`reason`, `detail`, `retryable`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
+    pub data: Option<serde_json::Value>,
 }
 
 impl JsonRpcError {
@@ -79,6 +81,48 @@ impl JsonRpcError {
     pub const STATE_INCLUDED: i32 = -32022;
     /// The bounded proof service has no free admission slot.
     pub const SERVER_BUSY: i32 = -32023;
+
+    // Go-compatible codes of `get_inclusion_proofs.v1`. They fall in the
+    // implementation-private range on purpose: the batch method is specified by
+    // aggregator-go's wire contract, and its structured `data` carries the
+    // reason and detail a client branches on.
+    pub const DATABASE_ERROR: i32 = -32004;
+    pub const CONCURRENCY_LIMIT: i32 = -32006;
+    pub const LIMIT_EXCEEDED: i32 = -32007;
+    pub const PROOF_UNAVAILABLE: i32 = -32008;
+
+    /// A Go-compatible error with structured `data`.
+    pub fn detailed(
+        code: i32,
+        message: &str,
+        reason: &str,
+        detail: &str,
+        retryable: bool,
+        limit: Option<usize>,
+        indexes: Option<&std::collections::BTreeMap<&'static str, Vec<usize>>>,
+    ) -> Self {
+        let mut data = serde_json::Map::new();
+        data.insert("reason".into(), reason.into());
+        data.insert("detail".into(), detail.into());
+        data.insert("retryable".into(), retryable.into());
+        if let Some(limit) = limit {
+            data.insert("limit".into(), limit.into());
+        }
+        if let Some(indexes) = indexes.filter(|i| !i.is_empty()) {
+            data.insert("indexes".into(), serde_json::json!(indexes));
+        }
+        Self {
+            code,
+            message: message.into(),
+            data: Some(serde_json::Value::Object(data)),
+        }
+    }
+    pub fn invalid_request_detail(detail: &str) -> Self {
+        Self::detailed(Self::INVALID_PARAMS, "Invalid params", "invalid_request", detail, false, None, None)
+    }
+    pub fn limit_exceeded(detail: &str, limit: usize) -> Self {
+        Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
+    }
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
@@ -163,6 +207,18 @@ impl CertificationResponse {
 pub struct GetInclusionProofParams {
     #[serde(rename = "stateId")]
     pub state_id: String, // hex-encoded state ID
+}
+
+// ─── get_inclusion_proofs.v1 limits ───────────────────────────────────────────
+
+/// Admission limits of `get_inclusion_proofs.v1`, identical to aggregator-go's
+/// `pkg/api/inclusion_proofs.go`.
+pub mod batch_limits {
+    pub const MAX_STATE_IDS: usize = 256;
+    pub const MAX_PARAMS_BYTES: usize = 32 << 10;
+    pub const MAX_REQUEST_BYTES: usize = 64 << 10;
+    pub const MAX_ID_BYTES: usize = 128;
+    pub const MAX_RESPONSE_BYTES: usize = 8 << 20;
 }
 
 // ─── get_non_inclusion_proof.v1 ─────────────────────────────────────────────

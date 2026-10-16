@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_retention_limits(cfg.retention_limits());
         let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
         spawn_rm!(rm, state)
     } else {
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
             Some(store as Arc<dyn uni_aggregator::storage::Store>),
         );
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_retention_limits(cfg.retention_limits());
         state.apply_recovered(recovered).await;
 
         match smt_backend {
