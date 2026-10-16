@@ -69,6 +69,23 @@ pub struct Config {
     )]
     pub default_request_ttl_secs: u64,
 
+    /// Retained certified views for `get_inclusion_proofs.v1` exact-root
+    /// selection (the latest included). One proof worker thread each.
+    #[arg(long, env = "AGGREGATOR_BATCH_RETAINED_VIEWS", default_value_t = 32)]
+    pub batch_retained_views: usize,
+
+    /// Seconds a superseded certified view stays selectable by exact root.
+    #[arg(long, env = "AGGREGATOR_BATCH_RETENTION_SECS", default_value_t = 300)]
+    pub batch_retention_secs: u64,
+
+    /// Concurrent `get_inclusion_proofs.v1` requests (each pins one view).
+    #[arg(long, env = "AGGREGATOR_BATCH_MAX_ACTIVE", default_value_t = 8)]
+    pub batch_max_active: usize,
+
+    /// Execution budget of one `get_inclusion_proofs.v1` request, in seconds.
+    #[arg(long, env = "AGGREGATOR_BATCH_TIMEOUT_SECS", default_value_t = 5)]
+    pub batch_timeout_secs: u64,
+
     /// BFT Core mode: "stub" (no real BFT Core) or "live".
     #[arg(long, env = "AGGREGATOR_BFT_MODE", default_value = "stub")]
     pub bft_mode: String,
@@ -182,6 +199,18 @@ pub struct Config {
     /// Log level filter (e.g. "info", "debug", "warn").
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
+}
+
+impl Config {
+    /// Retention and admission bounds of the batch proof plane.
+    pub fn retention_limits(&self) -> crate::storage::RetentionLimits {
+        crate::storage::RetentionLimits {
+            max_views: self.batch_retained_views.max(1),
+            max_age: std::time::Duration::from_secs(self.batch_retention_secs),
+            max_active_batches: self.batch_max_active.max(1),
+            batch_timeout: std::time::Duration::from_secs(self.batch_timeout_secs.max(1)),
+        }
+    }
 }
 
 #[cfg(test)]

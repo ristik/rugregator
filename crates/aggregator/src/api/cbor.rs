@@ -301,6 +301,34 @@ fn require_u32(value: &Value, path: &str) -> Result<(), CborError> {
     Ok(())
 }
 
+/// Whether the certificate is the ordinary UC of an unsharded partition: the
+/// canonical empty shard ID (end marker only) and no shard-tree siblings.
+///
+/// Only such a UC authenticates a complete one-leaf shard tree by itself, which
+/// is what lets a batch response omit any partition-view sidecar. Anything
+/// unparsable is not unsharded.
+pub(crate) fn unicity_certificate_is_unsharded(value: &Value) -> bool {
+    let Ok(uc) = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")
+    else {
+        return false;
+    };
+    let Ok(shard) = versioned_tagged_array(
+        &uc[4],
+        SHARD_TREE_CERTIFICATE_TAG,
+        3,
+        "ShardTreeCertificate",
+    ) else {
+        return false;
+    };
+    let Ok(shard_id) = val_as_bytes(&shard[1], "ShardTreeCertificate.shard") else {
+        return false;
+    };
+    let Ok(siblings) = val_as_array(&shard[2], "ShardTreeCertificate.siblingHashList") else {
+        return false;
+    };
+    shard_id == [0x80] && siblings.is_empty()
+}
+
 /// Validate the one current, SDK-owned Unicity Certificate wire profile and
 /// return its certified aggregation-tree root.
 ///
@@ -570,6 +598,67 @@ fn build_cert_data_value(cd: &CertDataFields) -> Result<Value, CborError> {
         CERTIFICATION_DATA_TAG,
         Box::new(Value::Array(fields)),
     ))
+}
+
+/// Structurally valid UC fixture for tests of the proof-serving plane: the
+/// given state root, an arbitrary shard ID and `siblings` shard-tree siblings.
+/// Not signed; only the profile checks of this module apply to it.
+#[cfg(test)]
+pub(crate) fn test_uc_cbor(root: Option<[u8; 32]>, shard_id: &[u8], siblings: usize) -> Vec<u8> {
+    let uint = |v: u64| Value::Integer(ciborium::value::Integer::from(v));
+    let uc = Value::Tag(
+        UNICITY_CERTIFICATE_TAG,
+        Box::new(Value::Array(vec![
+            uint(VERSION),
+            Value::Tag(
+                INPUT_RECORD_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(7),
+                    uint(0),
+                    Value::Null,
+                    Value::Bytes(root.map(|r| r.to_vec()).unwrap_or_default()),
+                    Value::Bytes(vec![]),
+                    uint(0),
+                    Value::Null,
+                    uint(0),
+                    Value::Null,
+                ])),
+            ),
+            Value::Null,
+            Value::Bytes(vec![0x22; 32]),
+            Value::Tag(
+                SHARD_TREE_CERTIFICATE_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    Value::Bytes(shard_id.to_vec()),
+                    Value::Array(vec![Value::Bytes(vec![0x44; 32]); siblings]),
+                ])),
+            ),
+            Value::Tag(
+                UNICITY_TREE_CERTIFICATE_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(0),
+                    Value::Array(vec![]),
+                ])),
+            ),
+            Value::Tag(
+                UNICITY_SEAL_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(3),
+                    uint(7),
+                    uint(0),
+                    uint(0),
+                    Value::Null,
+                    Value::Bytes(vec![0x33; 32]),
+                    Value::Null,
+                ])),
+            ),
+        ])),
+    );
+    encode_cbor_value(&uc).expect("fixture encodes")
 }
 
 #[cfg(test)]

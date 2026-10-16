@@ -994,7 +994,7 @@ impl<S: SmtStore> RoundManager<S> {
                 reference_time,
                 "dropping expired certification requests"
             );
-            self.state.resolve_requests(&expired);
+            self.state.drop_expired_requests(&expired);
         }
         if batch.is_empty() {
             return;
@@ -1281,7 +1281,7 @@ impl<S: SmtStore> RoundManager<S> {
                 reference_time,
                 "dropping expired certification requests"
             );
-            self.state.resolve_requests(&expired);
+            self.state.drop_expired_requests(&expired);
         }
         if buffer.is_empty() {
             inf.spec = SpecState::Collecting {

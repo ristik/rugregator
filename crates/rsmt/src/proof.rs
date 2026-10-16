@@ -229,6 +229,30 @@ impl SparseMerkleTree {
         })
     }
 
+    /// Generate the inclusion proof for `key` together with the value its leaf
+    /// stores, or `None` when the key is absent from this tree.
+    ///
+    /// This is the batch building block: unlike [`get_inclusion_proof`] it
+    /// does not treat absence as an error, so one walk answers both questions.
+    pub fn get_inclusion_proof_with_value(
+        &self,
+        key: &SmtKey,
+    ) -> Result<Option<(InclusionProof, Vec<u8>)>, SmtError> {
+        let Some(path) = self.generate_path(key)? else {
+            return Ok(None);
+        };
+        if path.terminal_key != *key {
+            return Ok(None);
+        }
+        Ok(Some((
+            InclusionProof {
+                bitmap: path.bitmap,
+                siblings: path.siblings,
+            },
+            path.terminal_value,
+        )))
+    }
+
     /// Generate a non-inclusion proof for `key`.
     ///
     /// The empty tree returns the distinguished empty proof.  Presence is an

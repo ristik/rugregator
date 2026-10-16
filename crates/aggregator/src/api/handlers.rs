@@ -73,7 +73,7 @@ pub async fn handle_certification_request(
         JsonRpcError {
             code: JsonRpcError::INVALID_PARAMS,
             message: e.status.to_string(),
-            data: Some(e.message),
+            data: Some(e.message.into()),
         }
     })?;
 

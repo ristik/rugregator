@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
 use rsmt::{leaf_value, InclusionProof, NonInclusionProofOutcome, SmtError, SmtHasher, SmtKey};
+use std::time::Instant;
 
 /// Maximum number of admitted proof lookups per certified snapshot.
 ///
@@ -10,6 +11,50 @@ use rsmt::{leaf_value, InclusionProof, NonInclusionProofOutcome, SmtError, SmtHa
 /// adversary cannot build an unbounded queue in front of a proof worker.
 pub const CERTIFIED_PROOF_MAX_IN_FLIGHT: usize = 16;
 const CERTIFIED_SNAPSHOT_PIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of keys in one [`CertifiedSmtSnapshot::get_inclusion_batch`].
+pub const CERTIFIED_BATCH_MAX_KEYS: usize = 256;
+
+/// One key's outcome in an inclusion batch against a pinned view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InclusionBatchEntry {
+    /// The key is a leaf of the pinned root: its path and the stored value.
+    Present {
+        proof: InclusionProof,
+        value: Vec<u8>,
+    },
+    /// The key is not a leaf of the pinned root.
+    Absent,
+}
+
+/// Typed failure of a request to a certified snapshot worker.
+#[derive(Debug)]
+pub enum SnapshotError {
+    /// The worker queue of this view is full.
+    QueueFull,
+    /// The worker stopped or dropped the request.
+    Stopped,
+    /// The deadline passed before the answer was available.
+    Deadline,
+    /// The request is malformed for this API (e.g. too many keys).
+    Invalid(&'static str),
+    /// Storage or tree failure.
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => f.write_str("certified SMT proof worker queue is full"),
+            Self::Stopped => f.write_str("certified SMT proof worker stopped"),
+            Self::Deadline => f.write_str("certified SMT proof deadline exceeded"),
+            Self::Invalid(m) => write!(f, "invalid snapshot request: {m}"),
+            Self::Internal(e) => write!(f, "certified SMT proof failure: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 /// Handle to an immutable SMT view pinned at a certified root.
 ///
@@ -33,7 +78,10 @@ impl CertifiedSmtSnapshot {
     /// it on a blocking executor after applying an admission limit.
     pub fn get_non_inclusion_proof(&self, key: SmtKey) -> anyhow::Result<NonInclusionProofOutcome> {
         let (respond_to, response) = mpsc::sync_channel(1);
-        match self.request_tx.try_send(ProofRequest { key, respond_to }) {
+        match self
+            .request_tx
+            .try_send(ProofRequest::NonInclusion { key, respond_to })
+        {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 return Err(anyhow::anyhow!("certified SMT proof worker queue is full"))
@@ -45,6 +93,44 @@ impl CertifiedSmtSnapshot {
         response
             .recv()
             .map_err(|_| anyhow::anyhow!("certified SMT proof worker dropped the response"))?
+    }
+
+    /// Look up many keys in this immutable view, in request order.
+    ///
+    /// One worker request answers the whole batch from the pinned root: a
+    /// present key yields its inclusion path and stored leaf value, an absent
+    /// key yields [`InclusionBatchEntry::Absent`]. The worker is single
+    /// threaded, so the batch costs one queue slot. `deadline` bounds both the
+    /// wait and the start of the work: a request that reaches the worker after
+    /// its deadline is not executed, and the worker stops between keys once it
+    /// has passed.
+    ///
+    /// Blocks the calling thread; asynchronous callers run it on a blocking
+    /// executor after applying admission limits.
+    pub fn get_inclusion_batch(
+        &self,
+        keys: Vec<SmtKey>,
+        deadline: Instant,
+    ) -> Result<Vec<InclusionBatchEntry>, SnapshotError> {
+        if keys.is_empty() || keys.len() > CERTIFIED_BATCH_MAX_KEYS {
+            return Err(SnapshotError::Invalid("batch must hold 1..=256 keys"));
+        }
+        let (respond_to, response) = mpsc::sync_channel(1);
+        match self.request_tx.try_send(ProofRequest::InclusionBatch {
+            keys,
+            deadline,
+            respond_to,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(SnapshotError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(SnapshotError::Stopped),
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match response.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(SnapshotError::Deadline),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SnapshotError::Stopped),
+        }
     }
 
     pub(crate) fn spawn_worker<F>(
@@ -77,9 +163,41 @@ impl CertifiedSmtSnapshot {
     }
 }
 
-pub(crate) struct ProofRequest {
-    pub key: SmtKey,
-    pub respond_to: SyncSender<anyhow::Result<NonInclusionProofOutcome>>,
+pub(crate) enum ProofRequest {
+    NonInclusion {
+        key: SmtKey,
+        respond_to: SyncSender<anyhow::Result<NonInclusionProofOutcome>>,
+    },
+    InclusionBatch {
+        keys: Vec<SmtKey>,
+        deadline: Instant,
+        respond_to: SyncSender<Result<Vec<InclusionBatchEntry>, SnapshotError>>,
+    },
+}
+
+/// Answer an inclusion batch key by key with `lookup`, honouring the deadline
+/// before the first key and between keys. Shared by both backends so the
+/// deadline and ordering semantics cannot diverge.
+pub(crate) fn answer_inclusion_batch<F>(
+    keys: &[SmtKey],
+    deadline: Instant,
+    mut lookup: F,
+) -> Result<Vec<InclusionBatchEntry>, SnapshotError>
+where
+    F: FnMut(&SmtKey) -> Result<Option<(InclusionProof, Vec<u8>)>, SmtError>,
+{
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        if Instant::now() >= deadline {
+            return Err(SnapshotError::Deadline);
+        }
+        out.push(match lookup(key) {
+            Ok(Some((proof, value))) => InclusionBatchEntry::Present { proof, value },
+            Ok(None) => InclusionBatchEntry::Absent,
+            Err(e) => return Err(SnapshotError::Internal(anyhow::anyhow!(e))),
+        });
+    }
+    Ok(out)
 }
 
 /// A Sparse Merkle Tree store supporting snapshot-based speculative execution.

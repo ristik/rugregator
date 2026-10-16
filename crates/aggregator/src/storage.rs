@@ -9,12 +9,16 @@
 //!   - Publishes an immutable certified SMT snapshot to a bounded proof service.
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use smt_store::{CertifiedSmtSnapshot, CERTIFIED_PROOF_MAX_IN_FLIGHT};
+use smt_store::{
+    CertifiedSmtSnapshot, InclusionBatchEntry, SnapshotError, CERTIFIED_PROOF_MAX_IN_FLIGHT,
+};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Default request lifetime in seconds when the deployment sets none.
 pub const DEFAULT_REQUEST_TTL_SECS: u64 = 3600;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::debug;
 
@@ -165,6 +169,218 @@ pub enum NonInclusionProofLookup {
 struct CertifiedProofState {
     block: BlockInfo,
     smt: CertifiedSmtSnapshot,
+    /// The UC is the ordinary one of an unsharded partition (empty shard ID, no
+    /// shard-tree siblings), so batch responses need no partition view.
+    unsharded: bool,
+    retained_at: Instant,
+}
+
+// ─── Retained certified-view catalog ──────────────────────────────────────────
+
+/// Explicit bounds of the retained certified-view catalog and batch serving.
+///
+/// Defaults follow the batch-inclusion design (§5). The memory backend shares
+/// structure between roots and RocksDB pins versions, so neither has a cheap
+/// honest *byte* measure; the count and age caps are the enforced retention
+/// bounds and `max_active_batches` bounds concurrent pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionLimits {
+    /// Retained certified views, the latest included. One worker thread each.
+    pub max_views: usize,
+    /// Age after which a superseded view is dropped. The latest is never aged out.
+    pub max_age: Duration,
+    /// Concurrent batch requests, each holding one pinned view.
+    pub max_active_batches: usize,
+    /// Execution budget of one batch request.
+    pub batch_timeout: Duration,
+}
+
+impl Default for RetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_views: 32,
+            max_age: Duration::from_secs(300),
+            max_active_batches: 8,
+            batch_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Pressure counters of the catalog, for operators and tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogStats {
+    pub retained_views: usize,
+    pub evicted_by_count: u64,
+    pub evicted_by_age: u64,
+    pub replaced_same_root: u64,
+    pub rejected_busy: u64,
+}
+
+struct Catalog {
+    limits: RetentionLimits,
+    /// Oldest first; contains the latest view while it is published.
+    retained: VecDeque<Arc<CertifiedProofState>>,
+    /// `None` while a newly certified root is being pinned or if publication
+    /// failed: latest is then unavailable, never an older view.
+    latest: Option<Arc<CertifiedProofState>>,
+    stats: CatalogStats,
+}
+
+impl Catalog {
+    fn new(limits: RetentionLimits) -> Self {
+        Self {
+            limits,
+            retained: VecDeque::new(),
+            latest: None,
+            stats: CatalogStats::default(),
+        }
+    }
+
+    fn insert(&mut self, view: Arc<CertifiedProofState>) {
+        // The newer certification of an equal root replaces the older attachment
+        // wholesale: exact-root selection must return one coherent
+        // block/UC/snapshot, never a mix.
+        if let Some(root) = view.block.root_hash {
+            let before = self.retained.len();
+            self.retained.retain(|v| v.block.root_hash != Some(root));
+            self.stats.replaced_same_root += (before - self.retained.len()) as u64;
+        }
+        self.retained.push_back(Arc::clone(&view));
+        self.latest = Some(view);
+        self.evict(Instant::now());
+    }
+
+    fn evict(&mut self, now: Instant) {
+        let latest = self.latest.clone();
+        let is_latest = |v: &Arc<CertifiedProofState>| {
+            latest.as_ref().is_some_and(|l| Arc::ptr_eq(l, v))
+        };
+        let max_age = self.limits.max_age;
+        let before = self.retained.len();
+        self.retained
+            .retain(|v| is_latest(v) || now.duration_since(v.retained_at) <= max_age);
+        self.stats.evicted_by_age += (before - self.retained.len()) as u64;
+        while self.retained.len() > self.limits.max_views.max(1) {
+            let Some(pos) = self.retained.iter().position(|v| !is_latest(v)) else {
+                break;
+            };
+            self.retained.remove(pos);
+            self.stats.evicted_by_count += 1;
+        }
+    }
+}
+
+/// Which retained view a batch request selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSelector {
+    /// The latest certified view.
+    Latest,
+    /// The retained view with exactly this state root. Never falls back.
+    Root([u8; 32]),
+}
+
+/// Why a pinned view could not serve a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyKind {
+    /// The concurrent batch limit is reached.
+    ActiveRequests,
+    /// The selected view's worker queue is full.
+    PinnedViews,
+    /// The execution budget elapsed.
+    Deadline,
+}
+
+/// Typed failure of a batch inclusion lookup.
+#[derive(Debug)]
+pub enum BatchProofError {
+    /// No certified view is published as latest.
+    NoFinalizedView,
+    /// The requested exact root is not retained.
+    ViewNotRetained,
+    /// The selected view's UC is not an unsharded one; this unsharded-only
+    /// capability does not serve it (and never invents a partition view).
+    UnsupportedConfiguration,
+    Busy(BusyKind),
+    /// State IDs absent from the pinned view, classified per class with the
+    /// offending request indexes (ascending).
+    Absent(AbsentStates),
+    /// Storage or consistency failure; the text is for logs only.
+    Internal(anyhow::Error),
+}
+
+/// Absent-state classification of a batch (#209).
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbsentStates {
+    /// `state_pending`, `state_expired`, `state_unknown` (latest) or
+    /// `state_not_in_root` (exact root).
+    pub detail: &'static str,
+    pub retryable: bool,
+    /// Class name → ascending request indexes.
+    pub indexes: BTreeMap<&'static str, Vec<usize>>,
+}
+
+/// One served leaf of a batch.
+pub struct BatchProofItem {
+    pub reference_time: u64,
+    pub cert_data: CertDataFields,
+    pub merkle_path_cbor: Vec<u8>,
+}
+
+/// Inclusion proofs of one batch, all against one pinned view.
+pub struct BatchProofs {
+    pub block_number: u64,
+    pub uc_cbor: Vec<u8>,
+    pub items: Vec<BatchProofItem>,
+}
+
+/// Bound on remembered expired state IDs and how long they are remembered.
+const EXPIRED_MAX_ENTRIES: usize = 100_000;
+const EXPIRED_TTL: Duration = Duration::from_secs(600);
+
+/// Bounded best-effort memory of requests dropped because their deadline passed.
+#[derive(Default)]
+struct ExpiredSet {
+    at: HashMap<String, Instant>,
+    order: VecDeque<(Instant, String)>,
+}
+
+impl ExpiredSet {
+    fn insert(&mut self, state_id_hex: &str, now: Instant) {
+        self.prune(now);
+        self.at.insert(state_id_hex.to_owned(), now);
+        self.order.push_back((now, state_id_hex.to_owned()));
+        while self.at.len() > EXPIRED_MAX_ENTRIES {
+            self.pop_oldest();
+        }
+    }
+
+    fn contains(&mut self, state_id_hex: &str, now: Instant) -> bool {
+        self.prune(now);
+        self.at.contains_key(state_id_hex)
+    }
+
+    fn remove(&mut self, state_id_hex: &str) {
+        self.at.remove(state_id_hex);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some((t, _)) = self.order.front() {
+            if now.duration_since(*t) <= EXPIRED_TTL {
+                break;
+            }
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        if let Some((t, id)) = self.order.pop_front() {
+            // A re-inserted ID has a newer order entry; only the entry matching
+            // the stored time removes it.
+            if self.at.get(&id) == Some(&t) {
+                self.at.remove(&id);
+            }
+        }
+    }
 }
 
 // ─── AggregatorState ──────────────────────────────────────────────────────────
@@ -183,10 +399,17 @@ pub struct AggregatorState {
     request_tx: mpsc::Sender<ValidatedRequest>,
     /// Optional persistence backend.
     store: Option<Arc<dyn Store>>,
-    /// Latest block metadata and immutable SMT view, replaced atomically.
-    certified_proof_state: StdRwLock<Option<Arc<CertifiedProofState>>>,
-    /// Admission control in front of the bounded proof worker queue.
+    /// Retained certified views and the latest pointer, replaced atomically.
+    catalog: StdMutex<Catalog>,
+    /// Admission control in front of the bounded proof worker queues, shared by
+    /// single non-inclusion lookups and batches so more retained views cannot
+    /// multiply proof concurrency.
     proof_permits: Arc<Semaphore>,
+    /// Concurrent batch requests (each pins one view).
+    batch_permits: Arc<Semaphore>,
+    batch_permit_limit: std::sync::atomic::AtomicUsize,
+    /// Requests dropped at their deadline (hint only, bounded).
+    expired: StdMutex<ExpiredSet>,
     /// Reference time a round starting now would pin, published by the round
     /// manager so admission can fail an already-expired request immediately.
     reference_time: AtomicU64,
@@ -209,8 +432,13 @@ impl AggregatorState {
             blocks: DashMap::new(),
             request_tx,
             store,
-            certified_proof_state: StdRwLock::new(None),
+            catalog: StdMutex::new(Catalog::new(RetentionLimits::default())),
             proof_permits: Arc::new(Semaphore::new(CERTIFIED_PROOF_MAX_IN_FLIGHT)),
+            batch_permits: Arc::new(Semaphore::new(RetentionLimits::default().max_active_batches)),
+            batch_permit_limit: std::sync::atomic::AtomicUsize::new(
+                RetentionLimits::default().max_active_batches,
+            ),
+            expired: StdMutex::new(ExpiredSet::default()),
         })
     }
 
@@ -342,6 +570,15 @@ impl AggregatorState {
 
     /// Store all records from a finalized round.
     pub fn finalize_records(&self, records: Vec<FinalizedRecord>) {
+        {
+            let mut expired = self
+                .expired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for r in &records {
+                expired.remove(&r.state_id_hex);
+            }
+        }
         for r in records {
             debug!(state_id = %r.state_id_hex, block = r.block_number, "finalizing record");
             self.records.insert(
@@ -410,7 +647,8 @@ impl AggregatorState {
     }
 
     /// Atomically publish a root-pinned SMT view together with the certificate
-    /// metadata that authenticates that exact root.
+    /// metadata that authenticates that exact root. It becomes the latest view
+    /// and joins the bounded retained catalog.
     pub(crate) fn publish_certified_snapshot(
         &self,
         block: BlockInfo,
@@ -420,26 +658,69 @@ impl AggregatorState {
             block.root_hash == snapshot.root_hash(),
             "cannot publish mismatched certified block and SMT snapshot roots"
         );
-        let mut slot = self
-            .certified_proof_state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = Some(Arc::new(CertifiedProofState {
+        let unsharded = crate::api::cbor::decode_cbor_value(&block.uc_cbor)
+            .map(|uc| crate::api::cbor::unicity_certificate_is_unsharded(&uc))
+            .unwrap_or(false);
+        self.catalog().insert(Arc::new(CertifiedProofState {
             block,
             smt: snapshot,
+            unsharded,
+            retained_at: Instant::now(),
         }));
         Ok(())
     }
 
-    /// Stop new lookups from selecting an older root while a newly certified
-    /// root is being pinned and published. Already-admitted lookups retain the
-    /// old immutable snapshot and remain valid snapshot statements.
+    /// Stop new lookups from selecting an older root as *latest* while a newly
+    /// certified root is being pinned and published. Retained views stay
+    /// available to exact-root requests, and already-admitted lookups keep
+    /// their immutable snapshot, which remains a valid statement about its root.
     pub(crate) fn clear_certified_snapshot(&self) {
-        let mut slot = self
-            .certified_proof_state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *slot = None;
+        self.catalog().latest = None;
+    }
+
+    fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
+        self.catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn latest_view(&self) -> Option<Arc<CertifiedProofState>> {
+        self.catalog().latest.clone()
+    }
+
+    /// Replace the retention limits (startup configuration). Applies the new
+    /// bounds to what is already retained.
+    pub fn set_retention_limits(&self, limits: RetentionLimits) {
+        let mut catalog = self.catalog();
+        catalog.limits = limits;
+        catalog.evict(Instant::now());
+        drop(catalog);
+        // Permits are only replaced while idle at startup.
+        self.batch_permits_resize(limits.max_active_batches);
+    }
+
+    fn batch_permits_resize(&self, target: usize) {
+        // Startup only: grow or shrink the idle semaphore to the configured size.
+        let current = self.batch_permit_limit.load(Ordering::Acquire);
+        if target > current {
+            self.batch_permits.add_permits(target - current);
+        } else if target < current {
+            let _ = self.batch_permits.forget_permits(current - target);
+        }
+        self.batch_permit_limit.store(target, Ordering::Release);
+    }
+
+    pub fn retention_limits(&self) -> RetentionLimits {
+        self.catalog().limits
+    }
+
+    /// Pressure counters of the retained catalog.
+    pub fn catalog_stats(&self) -> CatalogStats {
+        let catalog = self.catalog();
+        CatalogStats {
+            retained_views: catalog.retained.len(),
+            ..catalog.stats
+        }
     }
 
     /// Generate a proof outside the round-manager task using the latest
@@ -448,12 +729,7 @@ impl AggregatorState {
         &self,
         state_id: [u8; 32],
     ) -> anyhow::Result<NonInclusionProofLookup> {
-        let Some(certified) = self
-            .certified_proof_state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
+        let Some(certified) = self.latest_view() else {
             return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
         };
 
@@ -497,6 +773,186 @@ impl AggregatorState {
                 }))
             }
         }
+    }
+
+    // ── Expired hints ─────────────────────────────────────────────────────────
+
+    /// Requests dropped because their deadline passed: remember them (bounded,
+    /// best effort) and stop counting them pending.
+    pub(crate) fn drop_expired_requests(&self, requests: &[ValidatedRequest]) {
+        {
+            let now = Instant::now();
+            let mut expired = self
+                .expired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for request in requests {
+                expired.insert(&request.state_id_hex, now);
+            }
+        }
+        self.resolve_requests(requests);
+    }
+
+    /// Unauthenticated, node-local hint about a state with no certified proof.
+    fn absence_class(&self, state_id_hex: &str) -> &'static str {
+        if self.pending_state_ids.contains_key(state_id_hex) {
+            return "pending";
+        }
+        let mut expired = self
+            .expired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if expired.contains(state_id_hex, Instant::now()) {
+            "expired"
+        } else {
+            "unknown"
+        }
+    }
+
+    // ── Batch inclusion over a pinned view ────────────────────────────────────
+
+    /// Serve inclusion proofs for `state_ids` (in request order) from one pinned
+    /// certified view: the latest or an exact retained root.
+    ///
+    /// Proofs are rebuilt against the pinned root; a record's cached original
+    /// path is never returned. The original certification data and leaf
+    /// reference time are kept, so the leaf value reproduces the certified one.
+    /// Any absent state fails the whole batch with a classified error.
+    pub async fn get_inclusion_proofs_batch(
+        &self,
+        state_ids: &[[u8; 32]],
+        selector: ViewSelector,
+    ) -> Result<BatchProofs, BatchProofError> {
+        let (limits, view) = {
+            let catalog = self.catalog();
+            let view = match selector {
+                ViewSelector::Latest => catalog.latest.clone(),
+                ViewSelector::Root(root) => catalog
+                    .retained
+                    .iter()
+                    .rev()
+                    .find(|v| v.block.root_hash == Some(root))
+                    .cloned(),
+            };
+            (catalog.limits, view)
+        };
+        let Some(view) = view else {
+            return Err(match selector {
+                ViewSelector::Latest => BatchProofError::NoFinalizedView,
+                ViewSelector::Root(_) => BatchProofError::ViewNotRetained,
+            });
+        };
+        if !view.unsharded {
+            return Err(BatchProofError::UnsupportedConfiguration);
+        }
+        // Admission: concurrent batches first, then the proof-work budget shared
+        // with single non-inclusion lookups.
+        let batch_permit = Arc::clone(&self.batch_permits)
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.catalog().stats.rejected_busy += 1;
+                BatchProofError::Busy(BusyKind::ActiveRequests)
+            })?;
+        let proof_permit = Arc::clone(&self.proof_permits)
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.catalog().stats.rejected_busy += 1;
+                BatchProofError::Busy(BusyKind::ActiveRequests)
+            })?;
+
+        let deadline = Instant::now() + limits.batch_timeout;
+        let keys: Vec<rsmt::SmtKey> = state_ids.to_vec();
+        let worker = view.smt.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            // Held until the worker answered or gave up, not until the caller
+            // stopped waiting.
+            let _permits = (batch_permit, proof_permit);
+            worker.get_inclusion_batch(keys, deadline)
+        })
+        .await
+        .map_err(|e| BatchProofError::Internal(anyhow::anyhow!("batch task failed: {e}")))?
+        .map_err(|e| match e {
+            SnapshotError::QueueFull => {
+                self.catalog().stats.rejected_busy += 1;
+                BatchProofError::Busy(BusyKind::PinnedViews)
+            }
+            SnapshotError::Deadline => BatchProofError::Busy(BusyKind::Deadline),
+            other => BatchProofError::Internal(anyhow::anyhow!(other.to_string())),
+        })?;
+        if entries.len() != state_ids.len() {
+            return Err(BatchProofError::Internal(anyhow::anyhow!(
+                "snapshot worker returned {} entries for {} keys",
+                entries.len(),
+                state_ids.len()
+            )));
+        }
+        let root = view.block.root_hash;
+
+        let latest = matches!(selector, ViewSelector::Latest);
+        let mut classes: BTreeMap<&'static str, Vec<usize>> = BTreeMap::new();
+        let mut items = Vec::with_capacity(state_ids.len());
+        for (i, (state_id, entry)) in state_ids.iter().zip(entries).enumerate() {
+            let hex_id = hex::encode(state_id);
+            let record = self.records.get(&hex_id).map(|r| r.clone());
+            match entry {
+                InclusionBatchEntry::Absent => {
+                    let class = if !latest {
+                        "not_in_root"
+                    } else if record.is_some() {
+                        // Finalized after the pinned latest view.
+                        "pending"
+                    } else {
+                        self.absence_class(&hex_id)
+                    };
+                    classes.entry(class).or_default().push(i);
+                }
+                InclusionBatchEntry::Present { proof, value } => {
+                    let record = record.ok_or_else(|| {
+                        BatchProofError::Internal(anyhow::anyhow!(
+                            "pinned view contains a leaf without a finalized record"
+                        ))
+                    })?;
+                    let expected =
+                        rsmt::leaf_value(&record.cert_data.transaction_hash, record.reference_time);
+                    let root = root.ok_or_else(|| {
+                        BatchProofError::Internal(anyhow::anyhow!("empty view holds a leaf"))
+                    })?;
+                    if value != expected.as_slice()
+                        || !rsmt::verify_inclusion(&proof, &root, state_id, &value)
+                    {
+                        return Err(BatchProofError::Internal(anyhow::anyhow!(
+                            "inclusion path does not reproduce the pinned root for the record"
+                        )));
+                    }
+                    items.push(BatchProofItem {
+                        reference_time: record.reference_time,
+                        cert_data: record.cert_data,
+                        merkle_path_cbor: proof.to_bytes(),
+                    });
+                }
+            }
+        }
+        if !classes.is_empty() {
+            let (detail, retryable) = if !latest {
+                ("state_not_in_root", false)
+            } else if classes.contains_key("unknown") {
+                ("state_unknown", false)
+            } else if classes.contains_key("expired") {
+                ("state_expired", false)
+            } else {
+                ("state_pending", true)
+            };
+            return Err(BatchProofError::Absent(AbsentStates {
+                detail,
+                retryable,
+                indexes: classes,
+            }));
+        }
+        Ok(BatchProofs {
+            block_number: view.block.block_number,
+            uc_cbor: view.block.uc_cbor.clone(),
+            items,
+        })
     }
 
     /// Latest certified block, used to publish a proof snapshot on startup.
@@ -656,5 +1112,360 @@ mod tests {
             NonInclusionProofLookup::Busy
         ));
         drop(held_permits);
+    }
+
+    // ── Retained catalog and batch serving ────────────────────────────────────
+
+    use crate::api::cbor::test_uc_cbor;
+
+    const REF_TIME: u64 = 1_755_000_000;
+
+    fn txh(seed: u8) -> Vec<u8> {
+        vec![seed; AGGREGATION_TREE_VALUE_SIZE]
+    }
+
+    fn key(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    fn finalized(seed: u8, block: u64) -> FinalizedRecord {
+        FinalizedRecord {
+            state_id_hex: hex::encode(key(seed)),
+            block_number: block,
+            reference_time: REF_TIME,
+            cert_data: CertDataFields {
+                predicate_cbor: vec![1],
+                source_state_hash: vec![2; 32],
+                transaction_hash: txh(seed),
+                expires_at: Some(TEST_EXPIRES_AT),
+                witness: vec![4; 65],
+            },
+            merkle_path_cbor: Some(vec![0xde, 0xad]), // never served by batches
+        }
+    }
+
+    /// Add `seeds` to `smt` as one round and publish the resulting view as `block`.
+    fn round(
+        state: &AggregatorState,
+        smt: &mut MemSmt,
+        seeds: &[u8],
+        block: u64,
+        shard_id: &[u8],
+    ) -> Option<[u8; 32]> {
+        let mut mutation = smt.create_snapshot();
+        for &seed in seeds {
+            mutation
+                .add_leaf(
+                    key(seed),
+                    rsmt::leaf_value(&txh(seed), REF_TIME).to_vec(),
+                )
+                .unwrap();
+        }
+        mutation.commit(smt).unwrap();
+        state.finalize_records(seeds.iter().map(|&s| finalized(s, block)).collect());
+        let root = smt.root_hash();
+        state
+            .publish_certified_snapshot(
+                BlockInfo {
+                    block_number: block,
+                    root_hash: root,
+                    uc_cbor: test_uc_cbor(root, shard_id, 0),
+                },
+                smt.create_certified_snapshot().unwrap(),
+            )
+            .unwrap();
+        root
+    }
+
+    fn new_state() -> Arc<AggregatorState> {
+        let (tx, rx) = mpsc::channel(64);
+        std::mem::forget(rx); // keep the channel open for admission
+        AggregatorState::new(tx, None)
+    }
+
+    fn assert_batch_verifies(batch: &BatchProofs, ids: &[[u8; 32]], root: [u8; 32]) {
+        assert_eq!(batch.items.len(), ids.len());
+        for (item, id) in batch.items.iter().zip(ids) {
+            let proof = rsmt::InclusionProof::from_bytes(&item.merkle_path_cbor).unwrap();
+            let value = rsmt::leaf_value(&item.cert_data.transaction_hash, item.reference_time);
+            assert!(rsmt::verify_inclusion(&proof, &root, id, &value));
+        }
+    }
+
+    #[tokio::test]
+    async fn batches_pin_latest_and_exact_roots_without_falling_back() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        let root1 = round(&state, &mut smt, &[0x11, 0x91], 1, &[0x80]).unwrap();
+        let root2 = round(&state, &mut smt, &[0x42], 2, &[0x80]).unwrap();
+        assert_ne!(root1, root2);
+
+        // Latest is the newest view and serves all three, in request order.
+        let ids = [key(0x42), key(0x11), key(0x91)];
+        let latest = state
+            .get_inclusion_proofs_batch(&ids, ViewSelector::Latest)
+            .await
+            .unwrap();
+        assert_eq!(latest.block_number, 2);
+        assert_eq!(latest.uc_cbor, test_uc_cbor(Some(root2), &[0x80], 0));
+        assert_batch_verifies(&latest, &ids, root2);
+        // The original reference time and certification data are preserved, and
+        // the cached original path of the record is not what is served.
+        assert_eq!(latest.items[0].reference_time, REF_TIME);
+        assert_ne!(latest.items[0].merkle_path_cbor, vec![0xde, 0xad]);
+
+        // Exact root 1 serves its own leaves with block 1's UC ...
+        let old_ids = [key(0x91), key(0x11)];
+        let old = state
+            .get_inclusion_proofs_batch(&old_ids, ViewSelector::Root(root1))
+            .await
+            .unwrap();
+        assert_eq!(old.block_number, 1);
+        assert_batch_verifies(&old, &old_ids, root1);
+
+        // ... and a leaf created after that root is absent from it: not in root,
+        // never silently served from the latest view.
+        let Err(BatchProofError::Absent(absent)) = state
+            .get_inclusion_proofs_batch(&[key(0x11), key(0x42)], ViewSelector::Root(root1))
+            .await
+        else {
+            panic!("a later leaf must not be in the older root");
+        };
+        assert_eq!(absent.detail, "state_not_in_root");
+        assert!(!absent.retryable);
+        assert_eq!(absent.indexes["not_in_root"], vec![1]);
+
+        // An unknown exact root never falls back to latest.
+        assert!(matches!(
+            state
+                .get_inclusion_proofs_batch(&ids, ViewSelector::Root([0x77; 32]))
+                .await,
+            Err(BatchProofError::ViewNotRetained)
+        ));
+
+        // While a new latest is being pinned, latest is unavailable (never the
+        // older view), but exact roots keep serving.
+        state.clear_certified_snapshot();
+        assert!(matches!(
+            state
+                .get_inclusion_proofs_batch(&ids, ViewSelector::Latest)
+                .await,
+            Err(BatchProofError::NoFinalizedView)
+        ));
+        state
+            .get_inclusion_proofs_batch(&old_ids, ViewSelector::Root(root1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_latest_states_are_classified_with_precedence_and_indexes() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+
+        // 0x22 pending (admitted), 0x33 expired (dropped at its deadline), 0x44 never seen.
+        state.submit_request(request(key(0x22))).await.unwrap();
+        state.submit_request(request(key(0x33))).await.unwrap();
+        state.drop_expired_requests(&[request(key(0x33))]);
+        let ids = [key(0x22), key(0x11), key(0x33), key(0x44)];
+
+        let Err(BatchProofError::Absent(a)) = state
+            .get_inclusion_proofs_batch(&ids, ViewSelector::Latest)
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(a.detail, "state_unknown", "unknown > expired > pending");
+        assert!(!a.retryable);
+        assert_eq!(a.indexes["pending"], vec![0]);
+        assert_eq!(a.indexes["expired"], vec![2]);
+        assert_eq!(a.indexes["unknown"], vec![3]);
+        assert!(!a.indexes.contains_key("not_in_root"));
+
+        let Err(BatchProofError::Absent(a)) = state
+            .get_inclusion_proofs_batch(&ids[..3], ViewSelector::Latest)
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(a.detail, "state_expired");
+        assert!(!a.retryable);
+
+        let Err(BatchProofError::Absent(a)) = state
+            .get_inclusion_proofs_batch(&ids[..2], ViewSelector::Latest)
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(a.detail, "state_pending");
+        assert!(a.retryable);
+
+        // A record finalized after the pinned latest view is pending, whatever
+        // the status memory says.
+        state.finalize_records(vec![finalized(0x55, 2)]);
+        let Err(BatchProofError::Absent(a)) = state
+            .get_inclusion_proofs_batch(&[key(0x55)], ViewSelector::Latest)
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(a.detail, "state_pending");
+
+        // Exact-root absence is not_in_root even while the request is pending now.
+        let root = state.latest_view().unwrap().block.root_hash.unwrap();
+        let Err(BatchProofError::Absent(a)) = state
+            .get_inclusion_proofs_batch(&[key(0x22)], ViewSelector::Root(root))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(a.detail, "state_not_in_root");
+    }
+
+    #[tokio::test]
+    async fn finalizing_clears_the_expired_tombstone() {
+        let state = new_state();
+        state.drop_expired_requests(&[request(key(0x33))]);
+        assert_eq!(state.absence_class(&hex::encode(key(0x33))), "expired");
+        // Re-admitted: pending wins over the old tombstone.
+        state.submit_request(request(key(0x33))).await.unwrap();
+        assert_eq!(state.absence_class(&hex::encode(key(0x33))), "pending");
+        state.finalize_records(vec![finalized(0x33, 1)]);
+        state.resolve_state_id_hex(&hex::encode(key(0x33)));
+        assert_eq!(state.absence_class(&hex::encode(key(0x33))), "unknown");
+    }
+
+    #[test]
+    fn expired_memory_is_bounded_by_count_and_ttl() {
+        let mut set = ExpiredSet::default();
+        let t0 = Instant::now();
+        for i in 0..(EXPIRED_MAX_ENTRIES + 10) {
+            set.insert(&format!("{i:08}"), t0);
+        }
+        assert_eq!(set.at.len(), EXPIRED_MAX_ENTRIES, "count cap evicts the oldest");
+        assert!(!set.contains("00000000", t0));
+        assert!(set.contains(&format!("{:08}", EXPIRED_MAX_ENTRIES + 9), t0));
+        // After the TTL everything is forgotten.
+        let later = t0 + EXPIRED_TTL + Duration::from_secs(1);
+        assert!(!set.contains(&format!("{:08}", EXPIRED_MAX_ENTRIES + 9), later));
+        assert!(set.at.is_empty() && set.order.is_empty());
+        // Re-inserting an ID refreshes it; the stale order entry must not drop it.
+        let mut set = ExpiredSet::default();
+        set.insert("a", t0);
+        set.insert("a", t0 + Duration::from_secs(500));
+        assert!(set.contains("a", t0 + EXPIRED_TTL + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn catalog_retention_is_bounded_and_never_drops_the_latest() {
+        let state = new_state();
+        state.set_retention_limits(RetentionLimits {
+            max_views: 3,
+            ..RetentionLimits::default()
+        });
+        let mut smt = MemSmt::new();
+        let roots: Vec<_> = (1..=5u8)
+            .map(|i| round(&state, &mut smt, &[i], u64::from(i), &[0x80]).unwrap())
+            .collect();
+        let stats = state.catalog_stats();
+        assert_eq!(stats.retained_views, 3);
+        assert_eq!(stats.evicted_by_count, 2);
+        let catalog = state.catalog();
+        let retained: Vec<_> = catalog.retained.iter().filter_map(|v| v.block.root_hash).collect();
+        assert_eq!(retained, roots[2..].to_vec());
+        assert_eq!(catalog.latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
+        drop(catalog);
+
+        // Age: with a zero budget every superseded view goes at the next publish,
+        // the latest stays.
+        state.set_retention_limits(RetentionLimits {
+            max_age: Duration::ZERO,
+            ..RetentionLimits::default()
+        });
+        std::thread::sleep(Duration::from_millis(2));
+        let stats = state.catalog_stats();
+        assert_eq!(stats.retained_views, 1);
+        assert_eq!(stats.evicted_by_age, 2);
+        assert_eq!(state.catalog().latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
+    }
+
+    #[test]
+    fn the_same_root_at_a_later_certification_replaces_its_attachment() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        let root = round(&state, &mut smt, &[0x11], 1, &[0x80]).unwrap();
+        // An empty round certifies the same root again as block 2.
+        round(&state, &mut smt, &[], 2, &[0x80]);
+        let catalog = state.catalog();
+        assert_eq!(catalog.retained.len(), 1);
+        assert_eq!(catalog.stats.replaced_same_root, 1);
+        let view = catalog.retained.back().unwrap();
+        assert_eq!(view.block.root_hash, Some(root));
+        assert_eq!(view.block.block_number, 2, "one coherent block/UC/snapshot");
+    }
+
+    #[tokio::test]
+    async fn sharded_certificates_are_refused_never_given_a_view() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x40]); // shard "0"
+        assert!(matches!(
+            state
+                .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
+                .await,
+            Err(BatchProofError::UnsupportedConfiguration)
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_admission_is_bounded_and_released() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+        let limit = state.retention_limits().max_active_batches;
+        let held: Vec<_> = (0..limit)
+            .map(|_| Arc::clone(&state.batch_permits).try_acquire_owned().unwrap())
+            .collect();
+        assert!(matches!(
+            state
+                .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
+                .await,
+            Err(BatchProofError::Busy(BusyKind::ActiveRequests))
+        ));
+        drop(held);
+        // The shared proof-work budget also binds batches.
+        let held: Vec<_> = (0..CERTIFIED_PROOF_MAX_IN_FLIGHT)
+            .map(|_| Arc::clone(&state.proof_permits).try_acquire_owned().unwrap())
+            .collect();
+        assert!(matches!(
+            state
+                .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
+                .await,
+            Err(BatchProofError::Busy(BusyKind::ActiveRequests))
+        ));
+        drop(held);
+        state
+            .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
+            .await
+            .unwrap();
+        assert_eq!(state.batch_permits.available_permits(), limit);
+        assert_eq!(state.proof_permits.available_permits(), CERTIFIED_PROOF_MAX_IN_FLIGHT);
+        assert!(state.catalog_stats().rejected_busy >= 2);
+    }
+
+    #[test]
+    fn the_batch_limit_can_be_reconfigured_at_startup() {
+        let state = new_state();
+        state.set_retention_limits(RetentionLimits {
+            max_active_batches: 2,
+            ..RetentionLimits::default()
+        });
+        assert_eq!(state.batch_permits.available_permits(), 2);
+        state.set_retention_limits(RetentionLimits {
+            max_active_batches: 5,
+            ..RetentionLimits::default()
+        });
+        assert_eq!(state.batch_permits.available_permits(), 5);
     }
 }
