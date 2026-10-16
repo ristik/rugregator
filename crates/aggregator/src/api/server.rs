@@ -84,9 +84,14 @@ fn valid_raw_id(raw: Option<&serde_json::value::RawValue>) -> bool {
 /// batch method has its own limits: body 64 KiB, params 32 KiB, ID 128 encoded
 /// bytes, response 8 MiB, enforced before any work and while building output.
 pub async fn dispatch(state: Arc<AggregatorState>, body: &[u8]) -> (StatusCode, String) {
-    let env: RawEnvelope = match serde_json::from_slice(body) {
-        Ok(env) => env,
-        Err(_) => {
+    use serde::Deserialize;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let parsed = RawEnvelope::deserialize(&mut de);
+    // Anything but whitespace after the request object.
+    let trailing = parsed.is_ok() && de.end().is_err();
+    let env: RawEnvelope = match parsed {
+        Ok(env) if !trailing || env.method == BATCH_METHOD => env,
+        _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 error_text(
@@ -102,7 +107,7 @@ pub async fn dispatch(state: Arc<AggregatorState>, body: &[u8]) -> (StatusCode, 
     };
 
     if env.method == BATCH_METHOD {
-        return dispatch_batch(state, body, env).await;
+        return dispatch_batch(state, body, env, trailing).await;
     }
 
     let id: serde_json::Value = env
@@ -154,6 +159,7 @@ async fn dispatch_batch(
     state: Arc<AggregatorState>,
     body: &[u8],
     env: RawEnvelope<'_>,
+    trailing: bool,
 ) -> (StatusCode, String) {
     let id_ok = valid_raw_id(env.id);
     // An invalid or oversized ID is never echoed.
@@ -164,11 +170,14 @@ async fn dispatch_batch(
     } else {
         serde_json::Value::Null
     };
-    if env.jsonrpc != "2.0" {
-        return (
+    // Go order (`pkg/jsonrpc/handler.go`): envelope validity, then trailing
+    // data, then the whole-body size; all answered with HTTP 200. The outer
+    // body ceiling (axum's default limit) is the only 413.
+    let invalid_envelope = || {
+        (
             StatusCode::OK,
             error_text(
-                id,
+                id.clone(),
                 JsonRpcError::detailed(
                     JsonRpcError::INVALID_REQUEST,
                     "Invalid Request",
@@ -179,11 +188,14 @@ async fn dispatch_batch(
                     None,
                 ),
             ),
-        );
+        )
+    };
+    if env.jsonrpc != "2.0" || env.method.is_empty() || trailing {
+        return invalid_envelope();
     }
     if body.len() > batch_limits::MAX_REQUEST_BYTES {
         return (
-            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::OK,
             error_text(
                 id,
                 JsonRpcError::limit_exceeded("request_bytes", batch_limits::MAX_REQUEST_BYTES),
@@ -392,7 +404,7 @@ mod tests {
         // Whole body over 64 KiB: 413 + limit_exceeded/request_bytes, id echoed.
         let padded = batch(json!(5), json!({"stateIds":[present], "pad": "a".repeat(70_000)}));
         let (status, r) = call(&state, padded).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(status, StatusCode::OK, "Go answers limit errors with HTTP 200");
         assert_eq!(r["error"]["code"], json!(-32007));
         assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
         assert_eq!(r["error"]["data"]["limit"], json!(batch_limits::MAX_REQUEST_BYTES));
@@ -402,6 +414,24 @@ mod tests {
         let (status, r) = call(&state, padded).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(r["error"]["data"]["limit"], json!(batch_limits::MAX_PARAMS_BYTES));
+        // Trailing data after the envelope: invalid_envelope, HTTP 200 (not -32700/400).
+        let mut body = batch(json!(6), json!({"stateIds":[present]})).to_string();
+        body.push_str(" x");
+        let (status, text) = dispatch(state.clone(), body.as_bytes()).await;
+        let r: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r["error"]["code"], json!(-32600));
+        assert_eq!(r["error"]["data"]["detail"], json!("invalid_envelope"));
+        assert_eq!(r["id"], json!(6));
+        // Trailing whitespace is fine.
+        let ws = format!("{}  \n", batch(json!(6), json!({"stateIds":[present]})));
+        let (_, text) = dispatch(state.clone(), ws.as_bytes()).await;
+        assert!(serde_json::from_str::<Value>(&text).unwrap().get("error").is_none());
+        // Empty method on the batch path cannot happen; legacy trailing data stays a parse error.
+        let legacy = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_block_height\",\"params\":{}} x";
+        let (status, text) = dispatch(state.clone(), legacy).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("-32700"));
         // Wrong jsonrpc version.
         let (_, r) = call(&state, json!({"jsonrpc":"1.0","id":1,"method":"get_inclusion_proofs.v1","params":{}})).await;
         assert_eq!(r["error"]["code"], json!(-32600));
