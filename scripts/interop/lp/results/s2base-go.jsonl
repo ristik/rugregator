@@ -1,4 +1,4 @@
-{"client":"go","server":"s2base","longPoll":true,"attempts":"3","elapsed":"2.005s","verified":true}
-{"client":"go","server":"s2base","longPoll":true,"attempts":"4","elapsed":"3.007s","verified":true}
-{"client":"go","server":"s2base","longPoll":false,"attempts":"4","elapsed":"3.008s","verified":true}
-{"client":"go","server":"s2base","longPoll":false,"attempts":"5","elapsed":"4.445s","verified":true}
+{"client":"go","server":"s2base","scenario":"go-commitment","status":"PASS","longPoll":true,"attempts":"3","elapsed":"2.005s","verified":true}
+{"client":"go","server":"s2base","scenario":"go-commitment","status":"PASS","longPoll":true,"attempts":"4","elapsed":"3.007s","verified":true}
+{"client":"go","server":"s2base","scenario":"go-commitment","status":"PASS","longPoll":false,"attempts":"4","elapsed":"3.008s","verified":true}
+{"client":"go","server":"s2base","scenario":"go-commitment","status":"PASS","longPoll":false,"attempts":"5","elapsed":"4.445s","verified":true}

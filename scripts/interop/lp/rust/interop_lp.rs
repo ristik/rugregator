@@ -623,15 +623,27 @@ fn interop_lp() {
     };
     let scen = if env("IX_SCEN").is_empty() { default.to_string() } else { env("IX_SCEN") };
     for s in scen.split(',') {
-        match s.trim() {
-            "L1" => l1(&ctx),
-            "L2" => l2(&ctx),
-            "L3" => l3(&ctx),
-            "L4" => l4(&ctx),
-            "L5" => l5(&ctx),
-            "L6" => l6(&ctx),
-            "L7" => l7(&ctx),
+        let s = s.trim().to_string();
+        let run: fn(&Ctx) = match s.as_str() {
+            "L1" => l1,
+            "L2" => l2,
+            "L3" => l3,
+            "L4" => l4,
+            "L5" => l5,
+            "L6" => l6,
+            "L7" => l7,
             other => panic!("unknown scenario {other}"),
+        };
+        // A panic (unreachable server, rejected submission, ...) is reported as a FAIL line of
+        // that scenario and the remaining scenarios still run.
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&ctx))) {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "panic".into());
+            ctx.emit(&s, "driver panic", "FAIL", &msg);
         }
     }
 }
+
