@@ -23,6 +23,23 @@ use crate::storage::{AggregatorState, BatchProofError, BusyKind, ViewSelector};
 pub struct BatchParams {
     pub state_ids: Vec<[u8; 32]>,
     pub selector: ViewSelector,
+    /// Reserved long-poll hint: `Some` iff the field was present (zero is
+    /// present). Validated but ignored — this service never waits and never
+    /// echoes `waitedMs`.
+    pub wait_ms: Option<u64>,
+}
+
+/// Largest accepted `waitMs`: 2^53 - 1, the interoperable safe-integer range.
+pub const MAX_WAIT_MS: u64 = 9_007_199_254_740_991;
+
+/// `waitMs` is a bare JSON integer token: ASCII digits only, so null, booleans,
+/// strings, containers, signs (`-0` included), fractions and exponents are all
+/// rejected, as is anything above [`MAX_WAIT_MS`] (including overflow).
+fn parse_wait_ms(token: &str) -> Option<u64> {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse::<u64>().ok().filter(|v| *v <= MAX_WAIT_MS)
 }
 
 // Typed parse failures travel through serde's error as "ni:<detail>" so the
@@ -103,6 +120,7 @@ impl<'de> Visitor<'de> for ParamsVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut ids: Option<Vec<[u8; 32]>> = None;
         let mut selector: Option<ViewSelector> = None;
+        let mut wait_ms: Option<u64> = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "stateIds" => {
@@ -128,19 +146,33 @@ impl<'de> Visitor<'de> for ParamsVisitor {
                         )
                     });
                 }
+                "waitMs" => {
+                    if wait_ms.is_some() {
+                        return Err(fail("malformed_params"));
+                    }
+                    let raw: &serde_json::value::RawValue = map.next_value()?;
+                    wait_ms = Some(parse_wait_ms(raw.get()).ok_or_else(|| fail("malformed_params"))?);
+                }
                 _ => return Err(fail("malformed_params")),
             }
+        }
+        // Waiting is only defined for the latest view: an exact root with any
+        // present waitMs, zero included, is invalid.
+        if wait_ms.is_some() && matches!(selector, Some(ViewSelector::Root(_))) {
+            return Err(fail("malformed_params"));
         }
         let state_ids = ids.filter(|i| !i.is_empty()).ok_or_else(|| fail("malformed_params"))?;
         Ok(BatchParams {
             state_ids,
             selector: selector.unwrap_or(ViewSelector::Latest),
+            wait_ms,
         })
     }
 }
 
 /// Strictly decode the params object: no unknown or duplicate fields, 1..=256
-/// distinct 32-byte IDs, `stateRoot` omitted/`"latest"`/64 hex digits.
+/// distinct 32-byte IDs, `stateRoot` omitted/`"latest"`/64 hex digits, and an
+/// optional reserved `waitMs` (validated, ignored; only with a latest view).
 pub fn parse_params(raw: &str) -> Result<BatchParams, JsonRpcError> {
     if raw.len() > limits::MAX_PARAMS_BYTES {
         return Err(JsonRpcError::limit_exceeded(
@@ -361,5 +393,100 @@ mod tests {
         let e = parse_params(&big).unwrap_err();
         assert_eq!(e.code, -32007);
         assert_eq!(e.data.unwrap()["detail"], json!("request_bytes"));
+    }
+    fn with_wait(token: &str) -> String {
+        format!(r#"{{"stateIds":["{}"],"waitMs":{token}}}"#, id(1))
+    }
+
+    #[test]
+    fn wait_ms_presence_is_separate_from_zero() {
+        let absent = parse_params(&json!({"stateIds":[id(1)]}).to_string()).unwrap();
+        assert_eq!(absent.wait_ms, None);
+        for (token, want) in [("0", 0), ("1", 1), ("20000", 20000), ("9007199254740991", MAX_WAIT_MS)] {
+            let p = parse_params(&with_wait(token)).unwrap();
+            assert_eq!((p.wait_ms, p.selector), (Some(want), ViewSelector::Latest), "{token}");
+        }
+        // A value above any server limit is still valid (clamping is not our job).
+        assert!(parse_params(&with_wait("9007199254740991")).is_ok());
+        // Field order and an explicit latest root do not matter.
+        let raw = format!(r#"{{"waitMs":5,"stateRoot":"latest","stateIds":["{}"]}}"#, id(1));
+        assert_eq!(parse_params(&raw).unwrap().wait_ms, Some(5));
+    }
+
+    #[test]
+    fn wait_ms_lexical_rules_reject_everything_but_a_plain_integer() {
+        let m = (-32602, "malformed_params".to_string());
+        for token in [
+            "null", "true", "false", r#""5""#, r#""""#, "[]", "[5]", "{}", "-1", "-0", "-0.0", "1.0", "0.5", "1e3",
+            "1E3", "5e-1", "9007199254740992", "18446744073709551616", "99999999999999999999999999999999",
+        ] {
+            assert_eq!(detail(&with_wait(token)), m, "{token}");
+        }
+        // Non-JSON tokens fail as malformed params too (leading zeros, plus sign).
+        for token in ["01", "+1", ".5", "1.", "0x10", ""] {
+            assert_eq!(detail(&with_wait(token)), m, "{token:?}");
+        }
+    }
+
+    #[test]
+    fn wait_ms_duplicate_is_invalid_even_if_both_are_valid() {
+        let m = (-32602, "malformed_params".to_string());
+        let raw = format!(r#"{{"stateIds":["{}"],"waitMs":1,"waitMs":1}}"#, id(1));
+        assert_eq!(detail(&raw), m);
+        let raw = format!(r#"{{"waitMs":0,"stateIds":["{}"],"waitMs":5}}"#, id(1));
+        assert_eq!(detail(&raw), m);
+    }
+
+    #[test]
+    fn wait_ms_with_an_exact_root_is_invalid_including_zero() {
+        let m = (-32602, "malformed_params".to_string());
+        for token in ["0", "1", "20000"] {
+            let a = format!(r#"{{"stateIds":["{}"],"stateRoot":"{}","waitMs":{token}}}"#, id(1), id(9));
+            let b = format!(r#"{{"waitMs":{token},"stateIds":["{}"],"stateRoot":"{}"}}"#, id(1), id(9));
+            assert_eq!(detail(&a), m, "{token}");
+            assert_eq!(detail(&b), m, "{token}");
+        }
+        // The exact root alone is still fine.
+        let ok = format!(r#"{{"stateIds":["{}"],"stateRoot":"{}"}}"#, id(1), id(9));
+        assert_eq!(parse_params(&ok).unwrap().wait_ms, None);
+    }
+
+    #[test]
+    fn wait_ms_does_not_change_other_validation() {
+        // Other errors keep their own detail whether or not waitMs is present.
+        let raw = format!(r#"{{"stateIds":["zz"],"waitMs":3}}"#);
+        assert_eq!(detail(&raw), (-32602, "invalid_state_id".into()));
+        let raw = format!(r#"{{"stateIds":["{}"],"stateRoot":"tip","waitMs":3}}"#, id(1));
+        assert_eq!(detail(&raw), (-32602, "invalid_state_root".into()));
+        assert_eq!(detail(r#"{"waitMs":3}"#), (-32602, "malformed_params".into()));
+    }
+    /// The frozen cross-implementation cases (aggregator-go `testdata/longpoll/params.json`,
+    /// sha256 4558bd80...cb5e, PR #225): every batch case must be accepted or rejected
+    /// with exactly the contract's error, and accepted cases carry the stated waitMs.
+    #[test]
+    fn frozen_go_fixture_cases() {
+        const RAW: &str = include_str!("../../testdata/longpoll/params.json");
+        let fixture: serde_json::Value = serde_json::from_str(RAW).unwrap();
+        let expected = &fixture["errors"]["batch_malformed_params"]["error"];
+        let mut checked = 0;
+        for case in fixture["cases"].as_array().unwrap() {
+            if case["method"] != "get_inclusion_proofs.v1" {
+                continue;
+            }
+            let params = case["params"].as_str().unwrap();
+            let name = case["name"].as_str().unwrap();
+            let got = parse_params(params);
+            if case["valid"].as_bool().unwrap() {
+                let p = got.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert_eq!(p.wait_ms, case["waitMs"].as_u64(), "{name}");
+            } else {
+                let e = got.expect_err(name);
+                assert_eq!(e.code, expected["code"], "{name}");
+                assert_eq!(e.data.as_ref().unwrap()["reason"], expected["data"]["reason"], "{name}");
+                assert_eq!(e.data.as_ref().unwrap()["detail"], expected["data"]["detail"], "{name}");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 30, "fixture shrank: {checked}");
     }
 }
