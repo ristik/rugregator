@@ -23,10 +23,11 @@ cargo build --release -p uni-aggregator --bins           # S1 (and stub-anchor)
 export AGG_GO_DIR=…/aggregator-go SDK_RUST_DIR=…/state-transition-sdk-rust SDK_JS_DIR=…/state-transition-sdk-js
 (cd "$SDK_JS_DIR" && npm ci)
 scripts/interop/matrix/run.sh s1 go rust js              # starts a fresh S1 per client
-S2_DATA=$HOME/ix-s2-data AGG_GO_DIR=$AGG_GO_DIR scripts/interop/matrix/s2/s2.sh up   # prints the trust base path
+export S2_DATA=$HOME/ix-s2-data
+scripts/interop/matrix/s2/s2.sh up                     # prints the trust base path
 S2_TRUSTBASE=$HOME/ix-s2-data/genesis/trust-base.json scripts/interop/matrix/run.sh s2 go rust js
-scripts/interop/matrix/s2/s2.sh down
-python3 scripts/interop/matrix/report.py scripts/interop/matrix/results
+scripts/interop/matrix/s2/s2.sh down                   # needs no environment; always releases the lock
+python3 scripts/interop/matrix/report.py scripts/interop/matrix/results > scripts/interop/matrix/results/matrix.md
 ```
 
 `run.sh` copies each driver into the client checkout (`cmd/interop-matrix/`, `tests/interop_matrix.rs`,

@@ -3,7 +3,7 @@
 #  - aggregator built by Dockerfile.aggregator (no RocksDB), HA off, no Redis;
 #  - everything under one compose project and a bind-mounted data directory (S2_DATA);
 #  - the aggregator published on S2_PORT (default 13000).
-# Run through run.sh (it holds the shared Docker lock). Build context: AGG_GO_DIR.
+# Started by s2.sh up (it holds the shared Docker lock until s2.sh down; run.sh s2 only uses the running stack). Build context: AGG_GO_DIR.
 services:
   bft-root:
     platform: linux/amd64
