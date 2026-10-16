@@ -460,4 +460,33 @@ mod tests {
         assert_eq!(detail(&raw), (-32602, "invalid_state_root".into()));
         assert_eq!(detail(r#"{"waitMs":3}"#), (-32602, "malformed_params".into()));
     }
+    /// The frozen cross-implementation cases (aggregator-go `testdata/longpoll/params.json`,
+    /// sha256 4558bd80...cb5e, PR #225): every batch case must be accepted or rejected
+    /// with exactly the contract's error, and accepted cases carry the stated waitMs.
+    #[test]
+    fn frozen_go_fixture_cases() {
+        const RAW: &str = include_str!("../../testdata/longpoll/params.json");
+        let fixture: serde_json::Value = serde_json::from_str(RAW).unwrap();
+        let expected = &fixture["errors"]["batch_malformed_params"]["error"];
+        let mut checked = 0;
+        for case in fixture["cases"].as_array().unwrap() {
+            if case["method"] != "get_inclusion_proofs.v1" {
+                continue;
+            }
+            let params = case["params"].as_str().unwrap();
+            let name = case["name"].as_str().unwrap();
+            let got = parse_params(params);
+            if case["valid"].as_bool().unwrap() {
+                let p = got.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert_eq!(p.wait_ms, case["waitMs"].as_u64(), "{name}");
+            } else {
+                let e = got.expect_err(name);
+                assert_eq!(e.code, expected["code"], "{name}");
+                assert_eq!(e.data.as_ref().unwrap()["reason"], expected["data"]["reason"], "{name}");
+                assert_eq!(e.data.as_ref().unwrap()["detail"], expected["data"]["detail"], "{name}");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 30, "fixture shrank: {checked}");
+    }
 }
