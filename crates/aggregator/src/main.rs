@@ -48,8 +48,16 @@ async fn main() -> anyhow::Result<()> {
 
     let bft: Arc<dyn BftCommitter> = match cfg.bft_mode.as_str() {
         "stub" | "test" => {
-            info!("BFT mode: stub");
-            Arc::new(BftCommitterStub::new())
+            anyhow::ensure!(
+                cfg.partition_id != 0,
+                "stub BFT mode needs a positive --partition-id"
+            );
+            anyhow::ensure!(
+                cfg.shard_id.as_bytes() == [0x80],
+                "stub BFT mode certifies an unsharded partition; --shard-id must be the empty shard (0x80)"
+            );
+            info!(partition = cfg.partition_id, "BFT mode: stub (native-valid test certificates; test-only trust anchor, see `stub-anchor trust-base`)");
+            Arc::new(BftCommitterStub::with_partition(cfg.partition_id))
         }
         "live" => {
             info!("BFT mode: live — connecting to BFT Core");

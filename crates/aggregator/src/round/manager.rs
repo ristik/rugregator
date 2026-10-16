@@ -20,10 +20,10 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use super::state::ProcessedRecord;
+use super::stub_uc::{self, StubUcParams};
 use crate::api::cbor::{
     decode_cbor_value, unicity_certificate_reference_time, unicity_certificate_state_root,
-    CertDataFields, INPUT_RECORD_TAG, SHARD_TREE_CERTIFICATE_TAG, UNICITY_CERTIFICATE_TAG,
-    UNICITY_SEAL_TAG, UNICITY_TREE_CERTIFICATE_TAG,
+    CertDataFields,
 };
 use crate::config::{ConsistencyProofMode, RoundConfig};
 use crate::smt::state_id_to_smt_key;
@@ -159,21 +159,29 @@ pub struct BftCommitterStub {
     /// increasing reference times as they do against a live core.
     reference_time: std::sync::atomic::AtomicU64,
     reference_time_tx: watch::Sender<u64>,
+    partition_id: u32,
+    /// Seal hash of the last certificate issued, chained into the next seal.
+    last_seal_hash: Mutex<Option<[u8; 32]>>,
 }
 
 #[derive(Clone, Copy)]
 struct StubPending {
     block_number: u64,
     root: Option<[u8; 32]>,
+    prev_root: Option<[u8; 32]>,
     reference_time: u64,
     next_reference_time: u64,
 }
 
 impl BftCommitterStub {
-    const PRIVATE_KEY: [u8; 32] = [7u8; 32];
-    const NODE_ID: &'static str = "NODE";
-
+    /// A stub certifying [`stub_uc::DEFAULT_PARTITION_ID`].
     pub fn new() -> Self {
+        Self::with_partition(stub_uc::DEFAULT_PARTITION_ID)
+    }
+
+    /// A stub certifying `partition_id`, which must be positive.
+    pub fn with_partition(partition_id: u32) -> Self {
+        assert!(partition_id != 0, "stub partition id must be positive");
         let reference_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -183,6 +191,8 @@ impl BftCommitterStub {
             pending: Mutex::new(None),
             reference_time: std::sync::atomic::AtomicU64::new(reference_time),
             reference_time_tx,
+            partition_id,
+            last_seal_hash: Mutex::new(None),
         }
     }
 }
@@ -193,7 +203,7 @@ impl BftCommitter for BftCommitterStub {
         &self,
         block_number: u64,
         new_root: Option<[u8; 32]>,
-        _prev_root: Option<[u8; 32]>,
+        prev_root: Option<[u8; 32]>,
         _zk_proof: Option<Vec<u8>>,
         reference_time: u64,
         _block_size: u64,
@@ -214,6 +224,7 @@ impl BftCommitter for BftCommitterStub {
         *self.pending.lock().unwrap() = Some(StubPending {
             block_number,
             root: new_root,
+            prev_root,
             reference_time,
             next_reference_time,
         });
@@ -245,216 +256,19 @@ impl BftCommitter for BftCommitterStub {
             pending.block_number
         );
         info!(block = block_number, "BftCommitterStub: generating stub UC");
-        Ok(stub_generate_uc(
+        let mut last = self.last_seal_hash.lock().unwrap();
+        let uc = stub_uc::generate(&StubUcParams {
+            partition_id: self.partition_id,
             block_number,
-            pending.root.as_ref(),
-            pending.reference_time,
-            pending.next_reference_time,
-            Self::PRIVATE_KEY,
-            Self::NODE_ID,
-        ))
+            prev_root: pending.prev_root.as_ref(),
+            new_root: pending.root.as_ref(),
+            reference_time: pending.reference_time,
+            seal_timestamp: pending.next_reference_time,
+            prev_seal_hash: last.as_ref(),
+        });
+        *last = Some(uc.seal_hash);
+        Ok(uc.cbor)
     }
-}
-
-// ─── Stub UC generation ───────────────────────────────────────────────────────
-
-fn cbor_uint(n: u64) -> Vec<u8> {
-    if n < 24 {
-        vec![n as u8]
-    } else if n < 0x100 {
-        vec![0x18, n as u8]
-    } else if n < 0x10000 {
-        vec![0x19, (n >> 8) as u8, n as u8]
-    } else if n < 0x1_0000_0000 {
-        vec![
-            0x1A,
-            (n >> 24) as u8,
-            (n >> 16) as u8,
-            (n >> 8) as u8,
-            n as u8,
-        ]
-    } else {
-        let mut v = vec![0x1B];
-        v.extend_from_slice(&n.to_be_bytes());
-        v
-    }
-}
-
-fn cbor_bytes(data: &[u8]) -> Vec<u8> {
-    let n = data.len();
-    let mut hdr = if n < 24 {
-        vec![0x40 | n as u8]
-    } else if n < 0x100 {
-        vec![0x58, n as u8]
-    } else {
-        vec![0x59, (n >> 8) as u8, n as u8]
-    };
-    hdr.extend_from_slice(data);
-    hdr
-}
-
-fn cbor_text(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let n = b.len();
-    let mut hdr = if n < 24 {
-        vec![0x60 | n as u8]
-    } else if n < 0x100 {
-        vec![0x78, n as u8]
-    } else {
-        vec![0x79, (n >> 8) as u8, n as u8]
-    };
-    hdr.extend_from_slice(b);
-    hdr
-}
-
-fn cbor_null() -> Vec<u8> {
-    vec![0xF6]
-}
-
-fn cbor_array(items: &[&[u8]]) -> Vec<u8> {
-    let n = items.len();
-    let mut v = if n < 24 {
-        vec![0x80 | n as u8]
-    } else {
-        vec![0x98, n as u8]
-    };
-    for item in items {
-        v.extend_from_slice(item);
-    }
-    v
-}
-
-fn cbor_map1(k: &[u8], val: &[u8]) -> Vec<u8> {
-    let mut v = vec![0xA1];
-    v.extend_from_slice(k);
-    v.extend_from_slice(val);
-    v
-}
-
-fn cbor_tag(tag: u64, data: &[u8]) -> Vec<u8> {
-    let mut hdr = if tag < 24 {
-        vec![0xC0 | tag as u8]
-    } else if tag < 0x100 {
-        vec![0xD8, tag as u8]
-    } else if tag < 0x10000 {
-        vec![0xD9, (tag >> 8) as u8, tag as u8]
-    } else {
-        vec![
-            0xDA,
-            (tag >> 24) as u8,
-            (tag >> 16) as u8,
-            (tag >> 8) as u8,
-            tag as u8,
-        ]
-    };
-    hdr.extend_from_slice(data);
-    hdr
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(data).into()
-}
-
-fn stub_generate_uc(
-    block_number: u64,
-    new_root: Option<&[u8; 32]>,
-    reference_time: u64,
-    seal_timestamp: u64,
-    private_key: [u8; 32],
-    node_id: &str,
-) -> Vec<u8> {
-    use secp256k1::{Message, Secp256k1, SecretKey};
-
-    let root_bytes: &[u8] = match new_root {
-        Some(r) => r.as_slice(),
-        None => &[],
-    };
-
-    let input_record_inner = cbor_array(&[
-        &cbor_uint(1),
-        &cbor_uint(block_number),
-        &cbor_uint(0),
-        &cbor_null(),
-        &cbor_bytes(root_bytes),
-        &cbor_bytes(&[]),
-        &cbor_uint(reference_time),
-        &cbor_null(),
-        &cbor_uint(0),
-        &cbor_null(),
-    ]);
-    let input_record_cbor = cbor_tag(INPUT_RECORD_TAG, &input_record_inner);
-
-    let shard_config = [0u8; 32];
-
-    let mut shard_root_preimage = Vec::new();
-    shard_root_preimage.extend_from_slice(&input_record_cbor);
-    shard_root_preimage.extend_from_slice(&cbor_null());
-    shard_root_preimage.extend_from_slice(&cbor_bytes(&shard_config));
-    let shard_root_hash: [u8; 32] = sha256(&shard_root_preimage);
-
-    let inner_hash = sha256(&cbor_bytes(&shard_root_hash));
-    let mut seal_hash_preimage = Vec::new();
-    seal_hash_preimage.extend_from_slice(&cbor_bytes(&[0x01u8]));
-    seal_hash_preimage.extend_from_slice(&cbor_bytes(&[0u8, 0, 0, 0]));
-    seal_hash_preimage.extend_from_slice(&cbor_bytes(&inner_hash));
-    let seal_hash_value: [u8; 32] = sha256(&seal_hash_preimage);
-
-    let seal_no_sigs_inner = cbor_array(&[
-        &cbor_uint(1),
-        &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
-        &cbor_uint(block_number),
-        &cbor_uint(0),
-        &cbor_uint(seal_timestamp),
-        &cbor_null(),
-        &cbor_bytes(&seal_hash_value),
-        &cbor_null(),
-    ]);
-    let seal_no_sigs_cbor = cbor_tag(UNICITY_SEAL_TAG, &seal_no_sigs_inner);
-
-    let actual_seal_hash: [u8; 32] = sha256(&seal_no_sigs_cbor);
-
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&private_key).expect("valid test key");
-    let msg = Message::from_digest(actual_seal_hash);
-    let (recovery_id, compact) = secp.sign_ecdsa_recoverable(&msg, &sk).serialize_compact();
-    let mut sig_bytes = [0u8; 65];
-    sig_bytes[..64].copy_from_slice(&compact);
-    sig_bytes[64] = recovery_id.to_i32() as u8;
-
-    let sig_map = cbor_map1(&cbor_text(node_id), &cbor_bytes(&sig_bytes));
-    let seal_inner = cbor_array(&[
-        &cbor_uint(1),
-        &cbor_uint(3), // LOCAL network, matching SDK NetworkId::LOCAL
-        &cbor_uint(block_number),
-        &cbor_uint(0),
-        &cbor_uint(seal_timestamp),
-        &cbor_null(),
-        &cbor_bytes(&seal_hash_value),
-        &sig_map,
-    ]);
-    let seal_cbor = cbor_tag(UNICITY_SEAL_TAG, &seal_inner);
-
-    let shard_tree_inner = cbor_array(&[
-        &cbor_uint(1),
-        &cbor_bytes(&[0x80]), // canonical empty ShardId end-marker encoding
-        &cbor_array(&[]),
-    ]);
-    let shard_tree_cert = cbor_tag(SHARD_TREE_CERTIFICATE_TAG, &shard_tree_inner);
-
-    let utc_inner = cbor_array(&[&cbor_uint(1), &cbor_uint(0), &cbor_array(&[])]);
-    let unicity_tree_cert = cbor_tag(UNICITY_TREE_CERTIFICATE_TAG, &utc_inner);
-
-    let uc_inner = cbor_array(&[
-        &cbor_uint(1),
-        &input_record_cbor,
-        &cbor_null(),
-        &cbor_bytes(&shard_config),
-        &shard_tree_cert,
-        &unicity_tree_cert,
-        &seal_cbor,
-    ]);
-    cbor_tag(UNICITY_CERTIFICATE_TAG, &uc_inner)
 }
 
 // ─── ProvingRoundData ─────────────────────────────────────────────────────────
@@ -722,6 +536,15 @@ impl<S: SmtStore> RoundManager<S> {
         let Some(block) = self.state.latest_certified_block().await else {
             return;
         };
+        if let Some(marker) = stub_uc::legacy_stub_marker(&block.uc_cbor) {
+            warn!(
+                block = block.block_number,
+                marker,
+                "recovered certificate is a legacy stub certificate (not native-valid); \
+                 native verifiers and secure batch clients reject it. Reset the stub data \
+                 directory (docs/stub-uc-migration.md)"
+            );
+        }
         let uc_root = match decode_cbor_value(&block.uc_cbor)
             .and_then(|certificate| unicity_certificate_state_root(&certificate))
         {
@@ -2053,16 +1876,49 @@ mod tests {
         assert_eq!(expired.len(), 2);
     }
 
+    /// The committer, driven the way the round manager drives it, issues a chain of
+    /// native-profile certificates: the previous root comes from the caller and each
+    /// seal chains the previous seal hash.
+    #[tokio::test]
+    async fn stub_committer_issues_a_native_profile_chain() {
+        use ciborium::Value;
+        let bft = BftCommitterStub::with_partition(5);
+        let mut prev = None;
+        let mut seen = Vec::new();
+        for (n, root) in [(1u64, Some([0xA1; 32])), (2, Some([0xB2; 32])), (3, None)] {
+            let rt = bft.reference_time();
+            bft.commit_block(n, root, prev, None, rt, 0, 0)
+                .await
+                .unwrap();
+            let uc = bft.wait_for_uc(n).await.unwrap();
+            assert_eq!(stub_uc::legacy_stub_marker(&uc), None);
+            let Value::Tag(_, v) = decode_cbor_value(&uc).unwrap() else {
+                panic!()
+            };
+            let Value::Array(v) = *v else { panic!() };
+            let Value::Tag(_, seal) = &v[6] else { panic!() };
+            let Value::Array(seal) = &**seal else {
+                panic!()
+            };
+            seen.push(seal[5].clone());
+            prev = root;
+        }
+        assert!(matches!(seen[0], Value::Null));
+        assert!(matches!(seen[1], Value::Bytes(_)) && seen[1] != seen[2]);
+    }
+
     #[test]
     fn stub_certificate_uses_the_canonical_profile() {
-        let encoded = stub_generate_uc(
-            7,
-            Some(&[0x77; 32]),
-            1_755_000_000,
-            1_755_000_001,
-            [7; 32],
-            "NODE",
-        );
+        let encoded = stub_uc::generate(&StubUcParams {
+            partition_id: stub_uc::DEFAULT_PARTITION_ID,
+            block_number: 7,
+            prev_root: Some(&[0x66; 32]),
+            new_root: Some(&[0x77; 32]),
+            reference_time: 1_755_000_000,
+            seal_timestamp: 1_755_000_001,
+            prev_seal_hash: None,
+        })
+        .cbor;
         let value = decode_cbor_value(&encoded).unwrap();
         assert_eq!(
             unicity_certificate_state_root(&value).unwrap(),
@@ -2078,7 +1934,7 @@ mod tests {
         );
         assert!(matches!(
             value,
-            ciborium::Value::Tag(UNICITY_CERTIFICATE_TAG, _)
+            ciborium::Value::Tag(crate::api::cbor::UNICITY_CERTIFICATE_TAG, _)
         ));
     }
 
