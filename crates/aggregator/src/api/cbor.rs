@@ -200,10 +200,15 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
         v => Some(val_as_u64(v, "ExpiresAt")?),
     };
     let witness = val_as_bytes(&cert_arr[5], "Witness")?;
-    if val_as_u64(&arr[3], "CertificationRequest.reserved")? != 0 {
+    // The trailing slot is aggregator-go's AggregateRequestCount: 0 (unset) and 1 both mean one
+    // request. It is not part of CertificationData, so it never enters the StateID, the signature
+    // preimage, the transaction hash or the leaf value. Larger counts denote aggregated requests,
+    // which this service does not implement, so they are refused rather than silently counted as one.
+    let count = val_as_u64(&arr[3], "CertificationRequest.aggregateRequestCount")?;
+    if count > 1 {
         return Err(CborError::TypeMismatch {
-            path: "CertificationRequest.reserved".into(),
-            msg: "expected zero".into(),
+            path: "CertificationRequest.aggregateRequestCount".into(),
+            msg: format!("expected 0 or 1, got {count}"),
         });
     }
 
@@ -725,6 +730,54 @@ mod tests {
                 ),
             ])),
         )
+    }
+
+    fn go_fixture(key: &str) -> Vec<u8> {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "testdata/aggregator_go_certification_request.json"
+        ))
+        .unwrap();
+        hex::decode(f[key].as_str().unwrap()).unwrap()
+    }
+
+    /// Requests encoded by aggregator-go with AggregateRequestCount 0 and 1 (what `cmd/commitment`
+    /// sends) parse to the same request, and the Go signature and StateID validate.
+    #[test]
+    fn accepts_aggregator_go_requests_with_count_zero_and_one() {
+        let zero = parse_certification_request_bytes(&go_fixture("count0")).unwrap();
+        let one = parse_certification_request_bytes(&go_fixture("count1")).unwrap();
+        assert_eq!(format!("{zero:?}"), format!("{one:?}"));
+        assert_eq!(
+            hex::encode(&one.state_id),
+            "63dc9acfb0668ac85eb773ebc811c0bb20dcd75ef933d99d5ee07ee5b5b464b3"
+        );
+        for p in [zero, one] {
+            crate::validation::validate_request(
+                &p.state_id,
+                &p.predicate_cbor,
+                p.engine,
+                &p.code,
+                &p.params,
+                &p.source_state_hash,
+                &p.transaction_hash,
+                p.expires_at,
+                u64::MAX,
+                &p.witness,
+            )
+            .expect("signature and state id of the Go-encoded request");
+        }
+    }
+
+    /// aggregator-go does not bound the count; this service refuses what it does not implement,
+    /// through the same invalid-params parse error as any other malformed request.
+    #[test]
+    fn rejects_aggregate_count_above_one() {
+        let err = parse_certification_request_bytes(&go_fixture("count2")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("aggregateRequestCount: expected 0 or 1, got 2"),
+            "{err}"
+        );
     }
 
     #[test]
