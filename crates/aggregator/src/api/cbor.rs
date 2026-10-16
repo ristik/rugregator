@@ -540,6 +540,33 @@ pub fn encode_inclusion_proof_response(
     Ok(hex::encode(cbor))
 }
 
+/// The "not certified (yet)" answer of `get_inclusion_proof.v2`, byte-identical to
+/// aggregator-go's `emptyInclusionProofResponse`: `[blockNumber, #6.39033([1, null, null,
+/// null, UC])]` with the latest finalized block's number and certificate. It carries no
+/// evidence about the requested state (pending, unknown and expired all look the same);
+/// the optional status hint is the only refinement.
+pub fn encode_empty_inclusion_proof_response(
+    block_number: u64,
+    uc_cbor: &[u8],
+) -> Result<String, CborError> {
+    let uc_val = decode_unicity_certificate_value(uc_cbor)?;
+    let proof_val = Value::Tag(
+        INCLUSION_PROOF_TAG,
+        Box::new(Value::Array(vec![
+            Value::Integer(ciborium::value::Integer::from(VERSION)),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            uc_val,
+        ])),
+    );
+    let response_val = Value::Array(vec![
+        Value::Integer(ciborium::value::Integer::from(block_number)),
+        proof_val,
+    ]);
+    Ok(hex::encode(encode_cbor_value(&response_val)?))
+}
+
 // ─── Encode non-inclusion proof response ────────────────────────────────────
 
 /// Encode `[blockNumber, NonInclusionProof]` as a hex-encoded CBOR value.

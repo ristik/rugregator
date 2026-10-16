@@ -58,12 +58,7 @@ struct RawEnvelope<'a> {
 
 async fn jsonrpc_handler(State(state): State<Arc<AggregatorState>>, body: Bytes) -> Response {
     let (status, text) = dispatch(state, &body).await;
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        text,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "application/json")], text).into_response()
 }
 
 fn error_text(id: serde_json::Value, err: JsonRpcError) -> String {
@@ -320,12 +315,18 @@ mod tests {
             // [blockNumber, #6.39033([1, certData, referenceTime, path, uc])]
             let bytes = hex::decode(p.as_str().unwrap()).unwrap();
             let v = crate::api::cbor::decode_cbor_value(&bytes).unwrap();
-            let ciborium::value::Value::Array(top) = v else { panic!() };
+            let ciborium::value::Value::Array(top) = v else {
+                panic!()
+            };
             assert_eq!(top[0], ciborium::value::Value::Integer(1u64.into()));
         }
         // The result is exactly what the string-built response parses to, with
         // the explicit latest selector too.
-        let (_, again) = call(&state, batch(json!("a"), json!({"stateIds": ids, "stateRoot": "latest"}))).await;
+        let (_, again) = call(
+            &state,
+            batch(json!("a"), json!({"stateIds": ids, "stateRoot": "latest"})),
+        )
+        .await;
         assert_eq!(again["result"], resp["result"]);
         assert_eq!(again["id"], json!("a"));
     }
@@ -345,23 +346,81 @@ mod tests {
             )
         };
         // never-seen state on latest
-        let (_, r) = call(&state, batch(json!(1), json!({"stateIds":[present, absent]}))).await;
-        assert_eq!(err(&r), (-32008, "proof_unavailable".into(), "state_unknown".into(), Some(false)));
+        let (_, r) = call(
+            &state,
+            batch(json!(1), json!({"stateIds":[present, absent]})),
+        )
+        .await;
+        assert_eq!(
+            err(&r),
+            (
+                -32008,
+                "proof_unavailable".into(),
+                "state_unknown".into(),
+                Some(false)
+            )
+        );
         assert_eq!(r["error"]["data"]["indexes"], json!({"unknown":[1]}));
         // exact root, absent leaf
-        let (_, r) = call(&state, batch(json!(1), json!({"stateIds":[absent], "stateRoot": hex::encode(root)}))).await;
-        assert_eq!(err(&r), (-32008, "proof_unavailable".into(), "state_not_in_root".into(), Some(false)));
+        let (_, r) = call(
+            &state,
+            batch(
+                json!(1),
+                json!({"stateIds":[absent], "stateRoot": hex::encode(root)}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            err(&r),
+            (
+                -32008,
+                "proof_unavailable".into(),
+                "state_not_in_root".into(),
+                Some(false)
+            )
+        );
         assert_eq!(r["error"]["data"]["indexes"], json!({"not_in_root":[0]}));
         // exact root not retained
-        let (_, r) = call(&state, batch(json!(1), json!({"stateIds":[present], "stateRoot": hex::encode([5u8; 32])}))).await;
-        assert_eq!(err(&r), (-32008, "proof_unavailable".into(), "view_not_retained".into(), Some(true)));
+        let (_, r) = call(
+            &state,
+            batch(
+                json!(1),
+                json!({"stateIds":[present], "stateRoot": hex::encode([5u8; 32])}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            err(&r),
+            (
+                -32008,
+                "proof_unavailable".into(),
+                "view_not_retained".into(),
+                Some(true)
+            )
+        );
         // no latest view
         state.clear_certified_snapshot();
         let (_, r) = call(&state, batch(json!(1), json!({"stateIds":[present]}))).await;
-        assert_eq!(err(&r), (-32008, "proof_unavailable".into(), "no_finalized_view".into(), Some(true)));
+        assert_eq!(
+            err(&r),
+            (
+                -32008,
+                "proof_unavailable".into(),
+                "no_finalized_view".into(),
+                Some(true)
+            )
+        );
         // invalid params
         let (_, r) = call(&state, batch(json!(1), json!({"stateIds":["zz"]}))).await;
-        assert_eq!(err(&r), (-32602, "invalid_request".into(), "invalid_state_id".into(), Some(false)));
+        assert_eq!(
+            err(&r),
+            (
+                -32602,
+                "invalid_request".into(),
+                "invalid_state_id".into(),
+                Some(false)
+            )
+        );
         assert_eq!(r["error"]["message"], json!("Invalid params"));
         // 257 ids
         let many: Vec<_> = (0..257u16)
@@ -372,7 +431,15 @@ mod tests {
             })
             .collect();
         let (_, r) = call(&state, batch(json!(1), json!({"stateIds": many}))).await;
-        assert_eq!(err(&r), (-32007, "limit_exceeded".into(), "state_count".into(), Some(false)));
+        assert_eq!(
+            err(&r),
+            (
+                -32007,
+                "limit_exceeded".into(),
+                "state_count".into(),
+                Some(false)
+            )
+        );
         assert_eq!(r["error"]["data"]["limit"], json!(256));
     }
 
@@ -395,25 +462,45 @@ mod tests {
             assert_eq!(r["id"], Value::Null);
         }
         // exactly 128 encoded bytes is fine
-        let (_, r) = call(&state, batch(json!("x".repeat(126)), json!({"stateIds":[present]}))).await;
+        let (_, r) = call(
+            &state,
+            batch(json!("x".repeat(126)), json!({"stateIds":[present]})),
+        )
+        .await;
         assert!(r.get("error").is_none(), "{r}");
         // numeric id echoes as a number
         let (_, r) = call(&state, batch(json!(-3), json!({"stateIds":[present]}))).await;
         assert_eq!(r["id"], json!(-3));
 
         // Whole body over 64 KiB: 413 + limit_exceeded/request_bytes, id echoed.
-        let padded = batch(json!(5), json!({"stateIds":[present], "pad": "a".repeat(70_000)}));
+        let padded = batch(
+            json!(5),
+            json!({"stateIds":[present], "pad": "a".repeat(70_000)}),
+        );
         let (status, r) = call(&state, padded).await;
-        assert_eq!(status, StatusCode::OK, "Go answers limit errors with HTTP 200");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Go answers limit errors with HTTP 200"
+        );
         assert_eq!(r["error"]["code"], json!(-32007));
         assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
-        assert_eq!(r["error"]["data"]["limit"], json!(batch_limits::MAX_REQUEST_BYTES));
+        assert_eq!(
+            r["error"]["data"]["limit"],
+            json!(batch_limits::MAX_REQUEST_BYTES)
+        );
         assert_eq!(r["id"], json!(5));
         // Params over 32 KiB but body under 64 KiB.
-        let padded = batch(json!(5), json!({"stateIds":[present], "pad": "a".repeat(40_000)}));
+        let padded = batch(
+            json!(5),
+            json!({"stateIds":[present], "pad": "a".repeat(40_000)}),
+        );
         let (status, r) = call(&state, padded).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(r["error"]["data"]["limit"], json!(batch_limits::MAX_PARAMS_BYTES));
+        assert_eq!(
+            r["error"]["data"]["limit"],
+            json!(batch_limits::MAX_PARAMS_BYTES)
+        );
         // Trailing data after the envelope: invalid_envelope, HTTP 200 (not -32700/400).
         let mut body = batch(json!(6), json!({"stateIds":[present]})).to_string();
         body.push_str(" x");
@@ -426,14 +513,22 @@ mod tests {
         // Trailing whitespace is fine.
         let ws = format!("{}  \n", batch(json!(6), json!({"stateIds":[present]})));
         let (_, text) = dispatch(state.clone(), ws.as_bytes()).await;
-        assert!(serde_json::from_str::<Value>(&text).unwrap().get("error").is_none());
+        assert!(serde_json::from_str::<Value>(&text)
+            .unwrap()
+            .get("error")
+            .is_none());
         // Empty method on the batch path cannot happen; legacy trailing data stays a parse error.
-        let legacy = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_block_height\",\"params\":{}} x";
+        let legacy =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_block_height\",\"params\":{}} x";
         let (status, text) = dispatch(state.clone(), legacy).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text.contains("-32700"));
         // Wrong jsonrpc version.
-        let (_, r) = call(&state, json!({"jsonrpc":"1.0","id":1,"method":"get_inclusion_proofs.v1","params":{}})).await;
+        let (_, r) = call(
+            &state,
+            json!({"jsonrpc":"1.0","id":1,"method":"get_inclusion_proofs.v1","params":{}}),
+        )
+        .await;
         assert_eq!(r["error"]["code"], json!(-32600));
         assert_eq!(r["error"]["data"]["detail"], json!("invalid_envelope"));
     }
@@ -442,9 +537,10 @@ mod tests {
     async fn oversized_responses_fail_while_building_without_partial_output() {
         let (state, _) = serving_state(&[0x11, 0x22, 0x33]);
         let ids = json!({"stateIds":[hex::encode([0x11;32]), hex::encode([0x22;32]), hex::encode([0x33;32])]}).to_string();
-        let full = crate::api::batch::handle_get_inclusion_proofs_v1(&ids, usize::MAX, Arc::clone(&state))
-            .await
-            .unwrap();
+        let full =
+            crate::api::batch::handle_get_inclusion_proofs_v1(&ids, usize::MAX, Arc::clone(&state))
+                .await
+                .unwrap();
         // Exactly the full size fits; one byte less is rejected.
         crate::api::batch::handle_get_inclusion_proofs_v1(&ids, full.len(), Arc::clone(&state))
             .await
@@ -461,17 +557,30 @@ mod tests {
     #[tokio::test]
     async fn legacy_methods_keep_their_behaviour() {
         let (state, _) = serving_state(&[0x11]);
-        let (status, r) = call(&state, json!({"jsonrpc":"2.0","id":9,"method":"get_block_height","params":{}})).await;
+        let (status, r) = call(
+            &state,
+            json!({"jsonrpc":"2.0","id":9,"method":"get_block_height","params":{}}),
+        )
+        .await;
         assert_eq!((status, &r["id"]), (StatusCode::OK, &json!(9)));
         assert!(r["result"]["blockNumber"].is_string());
         let (status, r) = call(&state, json!({"jsonrpc":"2.0","id":"s","method":"get_inclusion_proof.v2","params":{"stateId": hex::encode([0x77;32])}})).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(r["error"]["code"], json!(-32020));
-        let (status, r) = call(&state, json!({"jsonrpc":"2.0","id":1,"method":"nope","params":{}})).await;
+        // an unknown state is a normal result (aggregator-go's empty-proof answer), not -32020/404
+        assert_eq!(status, StatusCode::OK);
+        assert!(r.get("error").is_none() && r["result"].is_string(), "{r}");
+        let (status, r) = call(
+            &state,
+            json!({"jsonrpc":"2.0","id":1,"method":"nope","params":{}}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(r["error"]["code"], json!(-32601));
         // String-valued error data stays a string.
-        let (_, r) = call(&state, json!({"jsonrpc":"2.0","id":1,"method":"certification_request","params":"zz"})).await;
+        let (_, r) = call(
+            &state,
+            json!({"jsonrpc":"2.0","id":1,"method":"certification_request","params":"zz"}),
+        )
+        .await;
         assert_eq!(r["error"]["code"], json!(-32602));
         let (status, text) = dispatch(state, b"{not json").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

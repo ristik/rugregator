@@ -1,0 +1,5 @@
+{
+ "source": "aggregator-go long-poll testdata/longpoll/golden/v2-nowait.json (not-included-bare, status cases)",
+ "emptyProofHex": "8209d998798501f6f6f6d998598701d9985a8a010900f65820385e7ab1594d114f9a5d60d5a87fe4a70c22875114d448bbbafa3e582cdfa4fdf600f600f6f6f6d9985b83014180f6f6d9985d880100090000f6f6f6",
+ "blockNumber": 9
+}

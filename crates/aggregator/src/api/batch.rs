@@ -38,7 +38,10 @@ fn detail_of(err: &serde_json::Error) -> String {
     match text.find(MARK) {
         Some(start) => {
             let rest = &text[start + MARK.len()..];
-            rest.split(MARK).next().unwrap_or("malformed_params").to_owned()
+            rest.split(MARK)
+                .next()
+                .unwrap_or("malformed_params")
+                .to_owned()
         }
         None => "malformed_params".to_owned(),
     }
@@ -131,7 +134,9 @@ impl<'de> Visitor<'de> for ParamsVisitor {
                 _ => return Err(fail("malformed_params")),
             }
         }
-        let state_ids = ids.filter(|i| !i.is_empty()).ok_or_else(|| fail("malformed_params"))?;
+        let state_ids = ids
+            .filter(|i| !i.is_empty())
+            .ok_or_else(|| fail("malformed_params"))?;
         Ok(BatchParams {
             state_ids,
             selector: selector.unwrap_or(ViewSelector::Latest),
@@ -167,19 +172,37 @@ pub fn parse_params(raw: &str) -> Result<BatchParams, JsonRpcError> {
 fn map_error(err: BatchProofError) -> JsonRpcError {
     use JsonRpcError as E;
     let unavailable = |detail: &str, retryable: bool| {
-        E::detailed(E::PROOF_UNAVAILABLE, "Proof unavailable", "proof_unavailable", detail, retryable, None, None)
+        E::detailed(
+            E::PROOF_UNAVAILABLE,
+            "Proof unavailable",
+            "proof_unavailable",
+            detail,
+            retryable,
+            None,
+            None,
+        )
     };
     match err {
         BatchProofError::NoFinalizedView => unavailable("no_finalized_view", true),
         BatchProofError::ViewNotRetained => unavailable("view_not_retained", true),
-        BatchProofError::UnsupportedConfiguration => unavailable("unsupported_configuration", false),
+        BatchProofError::UnsupportedConfiguration => {
+            unavailable("unsupported_configuration", false)
+        }
         BatchProofError::Busy(kind) => {
             let detail = match kind {
                 BusyKind::ActiveRequests => "active_requests",
                 BusyKind::PinnedViews => "pinned_views",
                 BusyKind::Deadline => "deadline",
             };
-            E::detailed(E::CONCURRENCY_LIMIT, "Concurrency limit exceeded", "busy", detail, true, None, None)
+            E::detailed(
+                E::CONCURRENCY_LIMIT,
+                "Concurrency limit exceeded",
+                "busy",
+                detail,
+                true,
+                None,
+                None,
+            )
         }
         BatchProofError::Absent(a) => E::detailed(
             E::PROOF_UNAVAILABLE,
@@ -288,10 +311,21 @@ mod tests {
             ViewSelector::Root([9; 32])
         );
         assert_eq!(
-            ok(json!(format!("0X{}", id(9).to_uppercase()))).unwrap().selector,
+            ok(json!(format!("0X{}", id(9).to_uppercase())))
+                .unwrap()
+                .selector,
             ViewSelector::Root([9; 32])
         );
-        for bad in [json!(null), json!(""), json!("LATEST"), json!("Latest"), json!("tip"), json!(7), json!("ab"), json!(format!("{}00", id(9)))] {
+        for bad in [
+            json!(null),
+            json!(""),
+            json!("LATEST"),
+            json!("Latest"),
+            json!("tip"),
+            json!(7),
+            json!("ab"),
+            json!(format!("{}00", id(9))),
+        ] {
             let raw = json!({"stateIds": [id(1)], "stateRoot": bad}).to_string();
             assert_eq!(detail(&raw), (-32602, "invalid_state_root".into()), "{bad}");
         }
@@ -307,12 +341,25 @@ mod tests {
         assert_eq!(detail(r#"{"stateIds":[]}"#), m, "1..256");
         assert_eq!(detail(r#"{"stateIds":null}"#), m);
         assert_eq!(detail(r#"{"stateIds":"x"}"#), m);
-        assert_eq!(detail(&json!({"stateIds":[1]}).to_string()), m, "entries are strings");
+        assert_eq!(
+            detail(&json!({"stateIds":[1]}).to_string()),
+            m,
+            "entries are strings"
+        );
         // Unknown and duplicate fields, trailing data.
         assert_eq!(detail(&json!({"stateIds":[id(1)],"x":1}).to_string()), m);
-        assert_eq!(detail(&format!(r#"{{"stateIds":["{0}"],"stateIds":["{0}"]}}"#, id(1))), m);
         assert_eq!(
-            detail(&format!(r#"{{"stateIds":["{0}"],"stateRoot":"latest","stateRoot":"latest"}}"#, id(1))),
+            detail(&format!(
+                r#"{{"stateIds":["{0}"],"stateIds":["{0}"]}}"#,
+                id(1)
+            )),
+            m
+        );
+        assert_eq!(
+            detail(&format!(
+                r#"{{"stateIds":["{0}"],"stateRoot":"latest","stateRoot":"latest"}}"#,
+                id(1)
+            )),
             m
         );
         assert_eq!(detail(&format!(r#"{{"stateIds":["{}"]}} x"#, id(1))), m);
@@ -328,7 +375,8 @@ mod tests {
         assert_eq!(bad("ab".repeat(33)), inv);
         assert_eq!(bad(String::new()), inv);
         // Duplicates are decided on decoded bytes, so aliases collide.
-        let raw = json!({"stateIds":[id(0xab), format!("0x{}", id(0xab).to_uppercase())]}).to_string();
+        let raw =
+            json!({"stateIds":[id(0xab), format!("0x{}", id(0xab).to_uppercase())]}).to_string();
         assert_eq!(detail(&raw), (-32602, "duplicate_state_id".into()));
     }
 
@@ -348,16 +396,33 @@ mod tests {
         let e = parse_params(&n(257)).unwrap_err();
         assert_eq!(e.code, -32007);
         let d = e.data.unwrap();
-        assert_eq!((d["reason"].as_str(), d["detail"].as_str(), d["limit"].as_u64()),
-                   (Some("limit_exceeded"), Some("state_count"), Some(256)));
+        assert_eq!(
+            (
+                d["reason"].as_str(),
+                d["detail"].as_str(),
+                d["limit"].as_u64()
+            ),
+            (Some("limit_exceeded"), Some("state_count"), Some(256))
+        );
         assert_eq!(d["retryable"], json!(false));
 
         // The count is decided before decoding the rest: junk after the 257th
         // element is never inspected.
-        let raw = format!(r#"{{"stateIds":[{},"zz"]}}"#, ids(256).iter().map(|i| format!("\"{i}\"")).collect::<Vec<_>>().join(","));
+        let raw = format!(
+            r#"{{"stateIds":[{},"zz"]}}"#,
+            ids(256)
+                .iter()
+                .map(|i| format!("\"{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         assert_eq!(parse_params(&raw).unwrap_err().code, -32007);
 
-        let big = format!(r#"{{"stateIds":["{}"],"pad":"{}"}}"#, id(1), "a".repeat(batch_limits::MAX_PARAMS_BYTES));
+        let big = format!(
+            r#"{{"stateIds":["{}"],"pad":"{}"}}"#,
+            id(1),
+            "a".repeat(batch_limits::MAX_PARAMS_BYTES)
+        );
         let e = parse_params(&big).unwrap_err();
         assert_eq!(e.code, -32007);
         assert_eq!(e.data.unwrap()["detail"], json!("request_bytes"));
