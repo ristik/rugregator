@@ -1,0 +1,4 @@
+{"client":"go","server":"s1lp","longPoll":true,"attempts":"2","elapsed":"1.002s","verified":true}
+{"client":"go","server":"s1lp","longPoll":true,"attempts":"2","elapsed":"1.001s","verified":true}
+{"client":"go","server":"s1lp","longPoll":false,"attempts":"2","elapsed":"1.002s","verified":true}
+{"client":"go","server":"s1lp","longPoll":false,"attempts":"2","elapsed":"1.001s","verified":true}

@@ -90,6 +90,7 @@ services:
       USE_REDIS_FOR_COMMITMENTS: "false"
       SMT_BACKEND: "memory"
       LOG_LEVEL: "info"
+      LONG_POLL_MAX_WAITERS: "${LONG_POLL_MAX_WAITERS:-1024}"  # ignored by servers without long-poll
       BATCH_LIMIT: "1000"
       SIGNING_KEY_FILE: "/app/bft-config/aggregator/keys.json"
       BFT_ENABLED: "true"

@@ -1,0 +1,2 @@
+{"client":"rust","evidence":"result=verified elapsed_ms=618 proof_requests=4 long_poll_requests=4 wait_dropped_for_missing_echo=true pending=3 (limit 5 for 200 ms pacing)","name":"v2 wait falls back to paced polling (no echo)","scenario":"L5","server":"s1lp","status":"PASS"}
+{"client":"rust","evidence":"requests=1 retried_without_wait=false code=-32008 detail=state_pending indexes={\"pending\": [0]} waitedMs=None","name":"reservation-only batch parser accepts waitMs, no echo, no retry","scenario":"L5","server":"s1lp","status":"PASS"}
