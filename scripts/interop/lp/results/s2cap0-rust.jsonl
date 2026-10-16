@@ -1,0 +1,3 @@
+{"client":"rust","evidence":"waitedMs=Some(0) status=Some(Pending) call_ms=6","name":"cap 0: waitMs answered at once with waitedMs 0","scenario":"L6","server":"s2cap0","status":"PASS"}
+{"client":"rust","evidence":"result=verified elapsed_ms=1863 proof_requests=10 immediate_rechecks=0 wait_dropped=false","name":"cap 0: wait helper polls with pacing, no tight loop","scenario":"L6","server":"s2cap0","status":"PASS"}
+{"client":"rust","evidence":"code=-32008 detail=state_pending indexes={\"pending\": [0]} waitedMs=Some(0) call_ms=7","name":"cap 0: batch pending answers at once with data.waitedMs 0","scenario":"L6","server":"s2cap0","status":"PASS"}

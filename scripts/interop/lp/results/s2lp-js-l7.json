@@ -1,0 +1,55 @@
+{
+  "label": "S2-LP",
+  "url": "http://127.0.0.1:13000",
+  "sdk": "state-transition-sdk-js (this checkout)",
+  "started": "2026-10-16T20:48:55.996Z",
+  "results": {
+    "l7": {
+      "ok": true,
+      "polling": {
+        "mode": "polling",
+        "loadModel": "open-loop, offered 10 states/s",
+        "states": 200,
+        "verified": 200,
+        "failed": 0,
+        "totalMs": 22134,
+        "achievedStatesPerSecond": 9.04,
+        "proofRequestsVerified": 672,
+        "proofRequestsFailed": 0,
+        "proofRequestsPerVerifiedState": 3.36,
+        "submissions": 200,
+        "latencyMs": {
+          "p50": 2021,
+          "p90": 3032,
+          "p99": 3038,
+          "max": 3040
+        }
+      },
+      "longPoll": {
+        "mode": "long-poll",
+        "loadModel": "open-loop, offered 10 states/s",
+        "states": 200,
+        "verified": 200,
+        "failed": 0,
+        "totalMs": 21907,
+        "achievedStatesPerSecond": 9.13,
+        "proofRequestsVerified": 200,
+        "proofRequestsFailed": 0,
+        "proofRequestsPerVerifiedState": 1,
+        "submissions": 200,
+        "latencyMs": {
+          "p50": 1868,
+          "p90": 2382,
+          "p99": 2540,
+          "max": 2542
+        }
+      },
+      "notMeasured": [
+        "rounds from admission to verified proof",
+        "publication-to-response delay as a fraction of the round period",
+        "peak parked waiters, server RSS/heap per waiter",
+        "(all need server-side data; wall-clock latencies are indicative only on this host)"
+      ]
+    }
+  }
+}

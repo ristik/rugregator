@@ -1,0 +1,87 @@
+{
+  "aggregator": "http://127.0.0.1:18081",
+  "proxyRequests": {
+    "get_inclusion_proof.v2": 12
+  },
+  "requestCounts": {
+    "get_inclusion_proof.v2": 5,
+    "certification_request": 1
+  },
+  "package": {
+    "gitHead": "f5f0737306901215860aa920a6ab570b699efba8",
+    "integrity": "sha512-ND4mW7nQjgr8yDdxvHNFheHH3gPijD4y0NS7XU2YPzjsdyDs4LDCYlRG/ZSSEDbz3xVgMh1biL3BY60nGPIsXQ==",
+    "name": "@unicitylabs/state-transition-sdk",
+    "tarball": "https://registry.npmjs.org/@unicitylabs/state-transition-sdk/-/state-transition-sdk-3.0.1.tgz",
+    "version": "3.0.1"
+  },
+  "steps": [
+    {
+      "detail": {
+        "outcome": "error 404"
+      },
+      "ms": 23,
+      "name": "unknown state: empty answer or HTTP 404, never a proof",
+      "status": "pass",
+      "requests": {
+        "get_inclusion_proof.v2": 1
+      }
+    },
+    {
+      "detail": {
+        "status": "SUCCESS"
+      },
+      "ms": 7,
+      "name": "submission is accepted (SUCCESS)",
+      "status": "pass",
+      "requests": {
+        "certification_request": 1
+      }
+    },
+    {
+      "detail": "JsonRpcError: certification is pending\n    at JsonRpcHttpTransport.request (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/node_modules/@unicitylabs/state-transition-sdk/lib/api/json-rpc/JsonRpcHttpTransport.js:106:19)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async AggregatorClient.getInclusionProof (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/node_modules/@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js:33:69)\n    at async poll (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/node_modules/@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js:150:36)\n    at async waitInclusionProof (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/node_modules/@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js:165:36)\n    at async file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:206:17\n    at async step (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:168:20)\n    at async file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:204:1",
+      "ms": 3,
+      "name": "empty-to-included polling with full proof verification",
+      "status": "fail",
+      "requests": {
+        "get_inclusion_proof.v2": 1
+      }
+    },
+    {
+      "detail": {
+        "proofRequests": 2
+      },
+      "ms": 0,
+      "name": "the released client sends only its original request members",
+      "status": "pass",
+      "requests": {}
+    },
+    {
+      "detail": {
+        "tookMs": 301
+      },
+      "ms": 302,
+      "name": "cancellation ends a wait promptly with SleepError",
+      "status": "pass",
+      "requests": {
+        "get_inclusion_proof.v2": 3
+      }
+    },
+    {
+      "detail": "Error: needs the included proof of the earlier step\n    at file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:244:24\n    at step (file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:168:26)\n    at file:///Users/risto/uni/sync/wt/state-transition-sdk-js-ix/compat/released-3.0.1/run.mjs:243:7",
+      "ms": 0,
+      "name": "a proof corrupted in transit is rejected, never accepted",
+      "status": "fail",
+      "requests": {}
+    },
+    {
+      "detail": {
+        "requests": 12
+      },
+      "ms": 1211,
+      "name": "HTTP 404 on a proof request keeps polling (legacy unknown answer)",
+      "status": "pass",
+      "requests": {}
+    }
+  ],
+  "verdict": "fail"
+}

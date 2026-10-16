@@ -1,0 +1,27 @@
+{
+  "label": "S2-LP",
+  "url": "http://127.0.0.1:13000",
+  "sdk": "state-transition-sdk-js (this checkout)",
+  "started": "2026-10-16T20:48:53.526Z",
+  "results": {
+    "l3": {
+      "ok": true,
+      "requestedWaitMs": 300,
+      "outcome": "pending(pending)",
+      "waitedMs": 298,
+      "elapsedMs": 309,
+      "withinDeadline": true,
+      "timedOut": false,
+      "proofRequests": 1,
+      "proofRequestsWithWait": 1,
+      "submissions": 1,
+      "echoes": [
+        298
+      ],
+      "minGapMs": null,
+      "httpStatuses": [
+        200
+      ]
+    }
+  }
+}
