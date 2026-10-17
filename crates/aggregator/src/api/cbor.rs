@@ -200,10 +200,15 @@ fn parse_certification_request_v1(val: &Value) -> Result<ParsedCertificationRequ
         v => Some(val_as_u64(v, "ExpiresAt")?),
     };
     let witness = val_as_bytes(&cert_arr[5], "Witness")?;
-    if val_as_u64(&arr[3], "CertificationRequest.reserved")? != 0 {
+    // The trailing slot is aggregator-go's AggregateRequestCount: 0 (unset) and 1 both mean one
+    // request. It is not part of CertificationData, so it never enters the StateID, the signature
+    // preimage, the transaction hash or the leaf value. Larger counts denote aggregated requests,
+    // which this service does not implement, so they are refused rather than silently counted as one.
+    let count = val_as_u64(&arr[3], "CertificationRequest.aggregateRequestCount")?;
+    if count > 1 {
         return Err(CborError::TypeMismatch {
-            path: "CertificationRequest.reserved".into(),
-            msg: "expected zero".into(),
+            path: "CertificationRequest.aggregateRequestCount".into(),
+            msg: format!("expected 0 or 1, got {count}"),
         });
     }
 
@@ -301,6 +306,34 @@ fn require_u32(value: &Value, path: &str) -> Result<(), CborError> {
     Ok(())
 }
 
+/// Whether the certificate is the ordinary UC of an unsharded partition: the
+/// canonical empty shard ID (end marker only) and no shard-tree siblings.
+///
+/// Only such a UC authenticates a complete one-leaf shard tree by itself, which
+/// is what lets a batch response omit any partition-view sidecar. Anything
+/// unparsable is not unsharded.
+pub(crate) fn unicity_certificate_is_unsharded(value: &Value) -> bool {
+    let Ok(uc) = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")
+    else {
+        return false;
+    };
+    let Ok(shard) = versioned_tagged_array(
+        &uc[4],
+        SHARD_TREE_CERTIFICATE_TAG,
+        3,
+        "ShardTreeCertificate",
+    ) else {
+        return false;
+    };
+    let Ok(shard_id) = val_as_bytes(&shard[1], "ShardTreeCertificate.shard") else {
+        return false;
+    };
+    let Ok(siblings) = val_as_array(&shard[2], "ShardTreeCertificate.siblingHashList") else {
+        return false;
+    };
+    shard_id == [0x80] && siblings.is_empty()
+}
+
 /// Validate the one current, SDK-owned Unicity Certificate wire profile and
 /// return its certified aggregation-tree root.
 ///
@@ -308,6 +341,21 @@ fn require_u32(value: &Value, path: &str) -> Result<(), CborError> {
 /// BFT payload from reintroducing a second hashing/signature profile through
 /// either proof endpoint. Cryptographic trust-base verification remains the
 /// client's responsibility.
+/// Whether the certificate's input record carries the empty byte string (`h''`) as its state
+/// hash. That is valid CBOR and decodes as an absent root for old stub data, but it is not the
+/// canonical empty-tree representation (native `null`): publishing it as a certified-empty
+/// snapshot would serve non-inclusion proofs that every conforming verifier rejects.
+pub(crate) fn unicity_certificate_has_legacy_empty_root(value: &Value) -> bool {
+    let Ok(uc) = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")
+    else {
+        return false;
+    };
+    let Ok(input) = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord") else {
+        return false;
+    };
+    matches!(&input[4], Value::Bytes(bytes) if bytes.is_empty())
+}
+
 pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8; 32]>, CborError> {
     let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
     let input = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord")?;
@@ -315,7 +363,10 @@ pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8
     val_as_u64(&input[2], "InputRecord.epoch")?;
     optional_bytes(&input[3], "InputRecord.previousHash")?;
     let state_root = match &input[4] {
-        Value::Null if round == 0 => None,
+        // The native certified empty tree: `hash` is null (at any round).
+        Value::Null => None,
+        // A legacy empty byte string decodes as "no root" so old data stays readable, but it
+        // is NOT the canonical empty tree: see `unicity_certificate_has_legacy_empty_root`.
         Value::Bytes(bytes) if bytes.is_empty() => None,
         Value::Bytes(bytes) if bytes.len() == 32 => {
             Some(bytes.as_slice().try_into().expect("length checked"))
@@ -507,6 +558,33 @@ pub fn encode_inclusion_proof_response(
     Ok(hex::encode(cbor))
 }
 
+/// The "not certified (yet)" answer of `get_inclusion_proof.v2`, byte-identical to
+/// aggregator-go's `emptyInclusionProofResponse`: `[blockNumber, #6.39033([1, null, null,
+/// null, UC])]` with the latest finalized block's number and certificate. It carries no
+/// evidence about the requested state (pending, unknown and expired all look the same);
+/// the optional status hint is the only refinement.
+pub fn encode_empty_inclusion_proof_response(
+    block_number: u64,
+    uc_cbor: &[u8],
+) -> Result<String, CborError> {
+    let uc_val = decode_unicity_certificate_value(uc_cbor)?;
+    let proof_val = Value::Tag(
+        INCLUSION_PROOF_TAG,
+        Box::new(Value::Array(vec![
+            Value::Integer(ciborium::value::Integer::from(VERSION)),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            uc_val,
+        ])),
+    );
+    let response_val = Value::Array(vec![
+        Value::Integer(ciborium::value::Integer::from(block_number)),
+        proof_val,
+    ]);
+    Ok(hex::encode(encode_cbor_value(&response_val)?))
+}
+
 // ─── Encode non-inclusion proof response ────────────────────────────────────
 
 /// Encode `[blockNumber, NonInclusionProof]` as a hex-encoded CBOR value.
@@ -570,6 +648,67 @@ fn build_cert_data_value(cd: &CertDataFields) -> Result<Value, CborError> {
         CERTIFICATION_DATA_TAG,
         Box::new(Value::Array(fields)),
     ))
+}
+
+/// Structurally valid UC fixture for tests of the proof-serving plane: the
+/// given state root, an arbitrary shard ID and `siblings` shard-tree siblings.
+/// Not signed; only the profile checks of this module apply to it.
+#[cfg(test)]
+pub(crate) fn test_uc_cbor(root: Option<[u8; 32]>, shard_id: &[u8], siblings: usize) -> Vec<u8> {
+    let uint = |v: u64| Value::Integer(ciborium::value::Integer::from(v));
+    let uc = Value::Tag(
+        UNICITY_CERTIFICATE_TAG,
+        Box::new(Value::Array(vec![
+            uint(VERSION),
+            Value::Tag(
+                INPUT_RECORD_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(7),
+                    uint(0),
+                    Value::Null,
+                    Value::Bytes(root.map(|r| r.to_vec()).unwrap_or_default()),
+                    Value::Bytes(vec![]),
+                    uint(0),
+                    Value::Null,
+                    uint(0),
+                    Value::Null,
+                ])),
+            ),
+            Value::Null,
+            Value::Bytes(vec![0x22; 32]),
+            Value::Tag(
+                SHARD_TREE_CERTIFICATE_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    Value::Bytes(shard_id.to_vec()),
+                    Value::Array(vec![Value::Bytes(vec![0x44; 32]); siblings]),
+                ])),
+            ),
+            Value::Tag(
+                UNICITY_TREE_CERTIFICATE_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(0),
+                    Value::Array(vec![]),
+                ])),
+            ),
+            Value::Tag(
+                UNICITY_SEAL_TAG,
+                Box::new(Value::Array(vec![
+                    uint(VERSION),
+                    uint(3),
+                    uint(7),
+                    uint(0),
+                    uint(0),
+                    Value::Null,
+                    Value::Bytes(vec![0x33; 32]),
+                    Value::Null,
+                ])),
+            ),
+        ])),
+    );
+    encode_cbor_value(&uc).expect("fixture encodes")
 }
 
 #[cfg(test)]
@@ -638,6 +777,54 @@ mod tests {
         )
     }
 
+    fn go_fixture(key: &str) -> Vec<u8> {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "testdata/aggregator_go_certification_request.json"
+        ))
+        .unwrap();
+        hex::decode(f[key].as_str().unwrap()).unwrap()
+    }
+
+    /// Requests encoded by aggregator-go with AggregateRequestCount 0 and 1 (what `cmd/commitment`
+    /// sends) parse to the same request, and the Go signature and StateID validate.
+    #[test]
+    fn accepts_aggregator_go_requests_with_count_zero_and_one() {
+        let zero = parse_certification_request_bytes(&go_fixture("count0")).unwrap();
+        let one = parse_certification_request_bytes(&go_fixture("count1")).unwrap();
+        assert_eq!(format!("{zero:?}"), format!("{one:?}"));
+        assert_eq!(
+            hex::encode(&one.state_id),
+            "63dc9acfb0668ac85eb773ebc811c0bb20dcd75ef933d99d5ee07ee5b5b464b3"
+        );
+        for p in [zero, one] {
+            crate::validation::validate_request(
+                &p.state_id,
+                &p.predicate_cbor,
+                p.engine,
+                &p.code,
+                &p.params,
+                &p.source_state_hash,
+                &p.transaction_hash,
+                p.expires_at,
+                u64::MAX,
+                &p.witness,
+            )
+            .expect("signature and state id of the Go-encoded request");
+        }
+    }
+
+    /// aggregator-go does not bound the count; this service refuses what it does not implement,
+    /// through the same invalid-params parse error as any other malformed request.
+    #[test]
+    fn rejects_aggregate_count_above_one() {
+        let err = parse_certification_request_bytes(&go_fixture("count2")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("aggregateRequestCount: expected 0 or 1, got 2"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn accepts_core_genesis_input_record_with_null_state_hash_and_summary() {
         let mut uc = canonical_uc();
@@ -662,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_null_input_record_values_after_genesis() {
+    fn a_null_hash_is_the_empty_tree_and_a_null_summary_needs_genesis() {
         let mut uc = canonical_uc();
         let fields = match &mut uc {
             Value::Tag(_, inner) => match inner.as_mut() {
@@ -678,7 +865,8 @@ mod tests {
             _ => unreachable!(),
         };
         fields[4] = Value::Null;
-        assert!(unicity_certificate_state_root(&uc).is_err());
+        // the native certified empty tree, at any round
+        assert_eq!(unicity_certificate_state_root(&uc).unwrap(), None);
 
         let mut uc = canonical_uc();
         let fields = match &mut uc {

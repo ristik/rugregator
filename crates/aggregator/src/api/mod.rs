@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod cbor;
 pub mod handlers;
 pub mod server;

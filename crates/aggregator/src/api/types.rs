@@ -48,8 +48,10 @@ impl JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    /// A plain string for the legacy errors, a structured object for the
+    /// Go-compatible batch errors (`reason`, `detail`, `retryable`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
+    pub data: Option<serde_json::Value>,
 }
 
 impl JsonRpcError {
@@ -57,6 +59,8 @@ impl JsonRpcError {
     pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
+    /// aggregator-go's `get_inclusion_proof.v2` validation code (a malformed `stateId`).
+    pub const VALIDATION_ERROR: i32 = -32000;
     pub const INTERNAL_ERROR: i32 = -32603;
     // JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
     // errors. Within that range the Unicity aggregators split the space:
@@ -71,14 +75,67 @@ impl JsonRpcError {
     /// The aggregator has no record of this state id: neither certified nor
     /// pending. Maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32020;
-    /// A known certification request has not reached a certified block yet.
-    /// The client should keep polling.
+    /// Historical: `get_inclusion_proof.v2` used to answer a pending state with this
+    /// error. It now returns aggregator-go's empty-proof result (or the typed
+    /// `no_finalized_view` before the first finalized block), so no method emits the code
+    /// any more; clients keep handling it for older servers.
     pub const INCLUSION_PENDING: i32 = -32021;
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
     pub const STATE_INCLUDED: i32 = -32022;
     /// The bounded proof service has no free admission slot.
     pub const SERVER_BUSY: i32 = -32023;
+
+    // Go-compatible codes of `get_inclusion_proofs.v1`. They fall in the
+    // implementation-private range on purpose: the batch method is specified by
+    // aggregator-go's wire contract, and its structured `data` carries the
+    // reason and detail a client branches on.
+    pub const DATABASE_ERROR: i32 = -32004;
+    pub const CONCURRENCY_LIMIT: i32 = -32006;
+    pub const LIMIT_EXCEEDED: i32 = -32007;
+    pub const PROOF_UNAVAILABLE: i32 = -32008;
+
+    /// A Go-compatible error with structured `data`.
+    pub fn detailed(
+        code: i32,
+        message: &str,
+        reason: &str,
+        detail: &str,
+        retryable: bool,
+        limit: Option<usize>,
+        indexes: Option<&std::collections::BTreeMap<&'static str, Vec<usize>>>,
+    ) -> Self {
+        let mut data = serde_json::Map::new();
+        data.insert("reason".into(), reason.into());
+        data.insert("detail".into(), detail.into());
+        data.insert("retryable".into(), retryable.into());
+        if let Some(limit) = limit {
+            data.insert("limit".into(), limit.into());
+        }
+        if let Some(indexes) = indexes.filter(|i| !i.is_empty()) {
+            data.insert("indexes".into(), serde_json::json!(indexes));
+        }
+        Self {
+            code,
+            message: message.into(),
+            data: Some(serde_json::Value::Object(data)),
+        }
+    }
+    pub fn invalid_request_detail(detail: &str) -> Self {
+        Self::detailed(Self::INVALID_PARAMS, "Invalid params", "invalid_request", detail, false, None, None)
+    }
+    pub fn limit_exceeded(detail: &str, limit: usize) -> Self {
+        Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
+    }
+
+    /// aggregator-go's `get_inclusion_proof.v2` validation error (`-32000`, no data).
+    pub fn validation(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::VALIDATION_ERROR,
+            message: msg.into(),
+            data: None,
+        }
+    }
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
@@ -112,13 +169,6 @@ impl JsonRpcError {
         Self {
             code: Self::STATE_INCLUDED,
             message: "state is already included".into(),
-            data: None,
-        }
-    }
-    pub fn inclusion_pending() -> Self {
-        Self {
-            code: Self::INCLUSION_PENDING,
-            message: "certification is pending".into(),
             data: None,
         }
     }
@@ -163,6 +213,21 @@ impl CertificationResponse {
 pub struct GetInclusionProofParams {
     #[serde(rename = "stateId")]
     pub state_id: String, // hex-encoded state ID
+    /// Ask for the `{proof, status}` object instead of the bare hex string.
+    #[serde(rename = "includeStatus", default)]
+    pub include_status: bool,
+}
+
+// ─── get_inclusion_proofs.v1 limits ───────────────────────────────────────────
+
+/// Admission limits of `get_inclusion_proofs.v1`, identical to aggregator-go's
+/// `pkg/api/inclusion_proofs.go`.
+pub mod batch_limits {
+    pub const MAX_STATE_IDS: usize = 256;
+    pub const MAX_PARAMS_BYTES: usize = 32 << 10;
+    pub const MAX_REQUEST_BYTES: usize = 64 << 10;
+    pub const MAX_ID_BYTES: usize = 128;
+    pub const MAX_RESPONSE_BYTES: usize = 8 << 20;
 }
 
 // ─── get_non_inclusion_proof.v1 ─────────────────────────────────────────────

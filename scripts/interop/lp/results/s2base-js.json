@@ -1,0 +1,110 @@
+{
+  "label": "S2-base",
+  "url": "http://127.0.0.1:13000",
+  "sdk": "state-transition-sdk-js (this checkout)",
+  "started": "2026-10-16T20:51:32.663Z",
+  "results": {
+    "l2": {
+      "ok": true,
+      "sinceSubmitMs": 2037,
+      "totalMs": 2141,
+      "proofRequests": 3,
+      "proofRequestsWithWait": 1,
+      "submissions": 1,
+      "echoes": [
+        null,
+        null,
+        null
+      ],
+      "minGapMs": 1006,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l3": {
+      "ok": true,
+      "requestedWaitMs": 5000,
+      "outcome": "pending(pending)",
+      "waitedMs": null,
+      "elapsedMs": 10,
+      "withinDeadline": true,
+      "timedOut": false,
+      "proofRequests": 1,
+      "proofRequestsWithWait": 1,
+      "submissions": 1,
+      "echoes": [
+        null
+      ],
+      "minGapMs": null,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l4": {
+      "ok": true,
+      "requestedWaitMs": 5000,
+      "pendingAll": {
+        "kind": "error",
+        "errorKind": "unavailable",
+        "code": -32008,
+        "detail": "state_pending",
+        "waitedMs": null,
+        "requests": 2,
+        "elapsedMs": 10
+      },
+      "withUnknown": {
+        "kind": "error",
+        "errorKind": "unavailable",
+        "code": -32008,
+        "detail": "state_unknown",
+        "waitedMs": null,
+        "requests": 2,
+        "elapsedMs": 10
+      },
+      "proofRequests": 4,
+      "proofRequestsWithWait": 2,
+      "submissions": 3,
+      "echoes": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "minGapMs": 3,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l5": {
+      "ok": true,
+      "helper": {
+        "ok": true,
+        "sinceSubmitMs": 3085,
+        "totalMs": 3128,
+        "proofRequests": 4,
+        "proofRequestsWithWait": 1,
+        "submissions": 1,
+        "echoes": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "minGapMs": 1010,
+        "httpStatuses": [
+          200
+        ]
+      },
+      "batchParserProbe": {
+        "kind": "error",
+        "errorKind": "unavailable",
+        "code": -32008,
+        "detail": "state_unknown",
+        "requests": 2,
+        "httpRequests": 2,
+        "expectOneRetryOnlyAgainstAStrictParser": true
+      },
+      "intervalMs": 1000
+    }
+  }
+}

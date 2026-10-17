@@ -15,7 +15,9 @@ use rsmt::{
 
 use crate::disk::materializer::CF_SMT_NODES;
 use crate::disk::node_key::{prefix_copy_path, prefix_set_bit, NodeKey, PrefixBits};
-use crate::traits::{CertifiedSmtSnapshot, SmtStore, SmtStoreSnapshot};
+use crate::traits::{
+    answer_inclusion_batch, CertifiedSmtSnapshot, ProofRequest, SmtStore, SmtStoreSnapshot,
+};
 use crate::{declared_batch, derive_batch};
 use rsmt::path::key_bit_at;
 
@@ -179,10 +181,24 @@ impl SmtStore for MemSmt {
                 return;
             }
             for request in requests {
-                let result = tree
-                    .get_non_inclusion_proof(&request.key)
-                    .map_err(|error| anyhow::anyhow!(error));
-                let _ = request.respond_to.send(result);
+                match request {
+                    ProofRequest::NonInclusion { key, respond_to } => {
+                        let result = tree
+                            .get_non_inclusion_proof(&key)
+                            .map_err(|error| anyhow::anyhow!(error));
+                        let _ = respond_to.send(result);
+                    }
+                    ProofRequest::InclusionBatch {
+                        keys,
+                        deadline,
+                        respond_to,
+                    } => {
+                        let result = answer_inclusion_batch(&keys, deadline, |key| {
+                            tree.get_inclusion_proof_with_value(key)
+                        });
+                        let _ = respond_to.send(result);
+                    }
+                }
             }
         })
     }

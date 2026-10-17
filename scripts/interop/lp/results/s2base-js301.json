@@ -1,0 +1,110 @@
+{
+  "aggregator": "http://127.0.0.1:13000",
+  "proxyRequests": {
+    "get_inclusion_proof.v2": 16
+  },
+  "requestCounts": {
+    "get_inclusion_proof.v2": 19,
+    "certification_request": 1
+  },
+  "package": {
+    "gitHead": "f5f0737306901215860aa920a6ab570b699efba8",
+    "integrity": "sha512-ND4mW7nQjgr8yDdxvHNFheHH3gPijD4y0NS7XU2YPzjsdyDs4LDCYlRG/ZSSEDbz3xVgMh1biL3BY60nGPIsXQ==",
+    "name": "@unicitylabs/state-transition-sdk",
+    "tarball": "https://registry.npmjs.org/@unicitylabs/state-transition-sdk/-/state-transition-sdk-3.0.1.tgz",
+    "version": "3.0.1"
+  },
+  "steps": [
+    {
+      "detail": {
+        "outcome": "empty_proof"
+      },
+      "ms": 448,
+      "name": "unknown state: empty answer or HTTP 404, never a proof",
+      "status": "pass",
+      "requests": {
+        "get_inclusion_proof.v2": 1
+      }
+    },
+    {
+      "detail": {
+        "status": "SUCCESS"
+      },
+      "ms": 90,
+      "name": "submission is accepted (SUCCESS)",
+      "status": "pass",
+      "requests": {
+        "certification_request": 1
+      }
+    },
+    {
+      "detail": {
+        "polls": 15
+      },
+      "ms": 1872,
+      "name": "empty-to-included polling with full proof verification",
+      "status": "pass",
+      "requests": {
+        "get_inclusion_proof.v2": 15
+      }
+    },
+    {
+      "detail": {
+        "proofRequests": 16
+      },
+      "ms": 0,
+      "name": "the released client sends only its original request members",
+      "status": "pass",
+      "requests": {}
+    },
+    {
+      "detail": {
+        "tookMs": 300
+      },
+      "ms": 302,
+      "name": "cancellation ends a wait promptly with SleepError",
+      "status": "pass",
+      "requests": {
+        "get_inclusion_proof.v2": 3
+      }
+    },
+    {
+      "detail": {
+        "flip25": {
+          "error": "Error",
+          "message": "Invalid inclusion proof status: NOT_AUTHENTICATED",
+          "mutated": 1
+        },
+        "flip50": {
+          "error": "Error",
+          "message": "Invalid inclusion proof status: INVALID_TRUSTBASE",
+          "mutated": 1
+        },
+        "flip75": {
+          "error": "Error",
+          "message": "Invalid inclusion proof status: INVALID_TRUSTBASE",
+          "mutated": 1
+        },
+        "truncate": {
+          "error": "Error",
+          "message": "Premature end of data.",
+          "mutated": 1
+        }
+      },
+      "ms": 423,
+      "name": "a proof corrupted in transit is rejected, never accepted",
+      "status": "pass",
+      "requests": {}
+    },
+    {
+      "detail": {
+        "requests": 12
+      },
+      "ms": 1202,
+      "name": "HTTP 404 on a proof request keeps polling (legacy unknown answer)",
+      "status": "pass",
+      "requests": {}
+    }
+  ],
+  "verdict": "pass"
+}

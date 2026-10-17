@@ -1,0 +1,17 @@
+{
+  "comment": "Raw JSON-RPC envelope cases for get_inclusion_proofs.v1 (aggregator-go docs/inclusion-proofs-batch.md is the reference). gen: ids257 = 257 distinct state ids; oversize = body padded beyond 64 KiB. Expectation: HTTP status, JSON-RPC code, data.reason, data.detail (null = not checked).",
+  "cases": [
+    {"name": "state_count_257", "gen": "ids257", "http": 200, "code": -32007, "reason": "limit_exceeded", "detail": "state_count"},
+    {"name": "state_count_0", "params": {"stateIds": [], "stateRoot": "latest"}, "http": 200, "code": -32602, "reason": null, "detail": null},
+    {"name": "duplicate_state_id", "params": {"stateIds": ["{ID}", "{ID}"], "stateRoot": "latest"}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "duplicate_state_id"},
+    {"name": "invalid_state_id_hex", "params": {"stateIds": ["zz"], "stateRoot": "latest"}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_id"},
+    {"name": "invalid_state_id_short", "params": {"stateIds": ["00ff"], "stateRoot": "latest"}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_id"},
+    {"name": "params_array", "params": [], "http": 200, "code": -32602, "reason": "invalid_request", "detail": "malformed_params"},
+    {"name": "state_root_empty", "params": {"stateIds": ["{ID}"], "stateRoot": ""}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_root"},
+    {"name": "state_root_null", "params": {"stateIds": ["{ID}"], "stateRoot": null}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_root"},
+    {"name": "state_root_keyword", "params": {"stateIds": ["{ID}"], "stateRoot": "newest"}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_root"},
+    {"name": "state_root_short", "params": {"stateIds": ["{ID}"], "stateRoot": "abcd"}, "http": 200, "code": -32602, "reason": "invalid_request", "detail": "invalid_state_root"},
+    {"name": "oversize_request", "gen": "oversize", "http": 200, "code": -32007, "reason": "limit_exceeded", "detail": "request_bytes"},
+    {"name": "unknown_method", "method": "get_inclusion_proofs.v9", "params": {}, "http": 200, "code": -32601, "reason": null, "detail": null}
+  ]
+}

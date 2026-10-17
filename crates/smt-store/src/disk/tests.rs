@@ -258,3 +258,187 @@ fn certified_snapshot_remains_bound_to_old_root_after_commit() {
         NonInclusionProofOutcome::StateIncluded
     );
 }
+
+// ─── Inclusion batches on pinned views ───────────────────────────────────────
+
+mod batch {
+    use super::*;
+    use crate::disk::materializer::{materialize_for_proof, NodeReader};
+    use crate::disk::overlay::Overlay;
+    use crate::disk::store::disk_inclusion_batch;
+    use crate::traits::{InclusionBatchEntry, SnapshotError};
+    use crate::MemSmt;
+    use crate::SmtStoreSnapshot;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Deterministic pseudo-random 32-byte keys (splitmix-style), spread over the key space.
+    fn keys(n: usize, seed: u64) -> Vec<SmtKey> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                let mut k = [0u8; 32];
+                for chunk in k.chunks_mut(8) {
+                    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = x;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    chunk.copy_from_slice(&(z ^ (z >> 31)).to_be_bytes());
+                }
+                k
+            })
+            .collect()
+    }
+
+    fn leaf_pairs(ks: &[SmtKey]) -> Vec<(SmtKey, Vec<u8>)> {
+        ks.iter().map(|k| (*k, vec![k[0] ^ 0x5a; 32])).collect()
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn commit(disk: &mut DiskSmt, pairs: &[(SmtKey, Vec<u8>)]) -> [u8; 32] {
+        let (root, overlay) = disk.batch_insert_round(pairs).unwrap();
+        disk.commit_overlay(overlay, root).unwrap();
+        root.unwrap()
+    }
+
+    #[test]
+    fn memory_and_disk_batches_agree_and_verify_against_the_pinned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskSmt::open(open_test_db(&dir), 10_000).unwrap();
+        let present = keys(200, 1);
+        let pairs = leaf_pairs(&present);
+        let root = commit(&mut disk, &pairs);
+        let mut mem = MemSmt::new();
+        let mut m = mem.create_snapshot();
+        for (k, v) in &pairs {
+            m.add_leaf(*k, v.clone()).unwrap();
+        }
+        m.commit(&mut mem).unwrap();
+        assert_eq!(mem.root_hash(), Some(root));
+
+        // Mixed request: present keys interleaved with absent ones, in a fixed order.
+        let absent = keys(100, 999);
+        let request: Vec<SmtKey> = present
+            .iter()
+            .take(100)
+            .zip(&absent)
+            .flat_map(|(p, a)| [*a, *p])
+            .take(256)
+            .collect();
+        let from_disk = disk
+            .create_certified_snapshot()
+            .unwrap()
+            .get_inclusion_batch(request.clone(), far())
+            .unwrap();
+        let from_mem = mem
+            .create_certified_snapshot()
+            .unwrap()
+            .get_inclusion_batch(request.clone(), far())
+            .unwrap();
+        assert_eq!(from_disk, from_mem, "same entries from both backends");
+        for (key, entry) in request.iter().zip(&from_disk) {
+            match entry {
+                InclusionBatchEntry::Present { proof, value } => {
+                    assert!(present.contains(key));
+                    assert_eq!(value, &vec![key[0] ^ 0x5a; 32]);
+                    assert!(verify_inclusion(proof, &root, key, value));
+                }
+                InclusionBatchEntry::Absent => assert!(!present.contains(key)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_batch_view_ignores_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = DiskSmt::open(open_test_db(&dir), 10_000).unwrap();
+        let ks = keys(20, 3);
+        let old_root = commit(&mut disk, &leaf_pairs(&ks[..10]));
+        let pinned = disk.create_certified_snapshot().unwrap();
+        let new_root = commit(&mut disk, &leaf_pairs(&ks[10..]));
+        assert_ne!(old_root, new_root);
+
+        let got = pinned.get_inclusion_batch(ks.clone(), far()).unwrap();
+        for (i, entry) in got.iter().enumerate() {
+            match (i < 10, entry) {
+                (true, InclusionBatchEntry::Present { proof, value }) => {
+                    assert!(verify_inclusion(proof, &old_root, &ks[i], value));
+                }
+                (false, InclusionBatchEntry::Absent) => {}
+                _ => panic!("key {i} must follow the pinned root"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_views_answer_absent_and_bad_requests_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskSmt::open(open_test_db(&dir), 10_000).unwrap();
+        let empty = disk.create_certified_snapshot().unwrap();
+        let ks = keys(3, 4);
+        assert!(empty
+            .get_inclusion_batch(ks.clone(), far())
+            .unwrap()
+            .iter()
+            .all(|e| *e == InclusionBatchEntry::Absent));
+
+        assert!(matches!(
+            empty.get_inclusion_batch(vec![], far()),
+            Err(SnapshotError::Invalid(_))
+        ));
+        assert!(matches!(
+            empty.get_inclusion_batch(keys(257, 5), far()),
+            Err(SnapshotError::Invalid(_))
+        ));
+        // A deadline that has passed is never worked on.
+        assert!(matches!(
+            empty.get_inclusion_batch(ks, Instant::now() - Duration::from_millis(1)),
+            Err(SnapshotError::Deadline)
+        ));
+    }
+
+    /// Counts node reads.
+    struct Counting<'a, R: NodeReader>(&'a R, AtomicUsize);
+
+    impl<R: NodeReader> NodeReader for Counting<'_, R> {
+        fn get_node(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            self.0.get_node(key)
+        }
+    }
+
+    /// Hardware-independent cost: a batch reads the union of the paths, so
+    /// shared prefixes are read once instead of once per key.
+    #[test]
+    fn batch_reads_the_union_of_paths_not_one_path_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(&dir);
+        let mut disk = DiskSmt::open(Arc::clone(&db), 10_000).unwrap();
+        let ks = keys(2_000, 7);
+        commit(&mut disk, &leaf_pairs(&ks));
+        let request: Vec<SmtKey> = ks.iter().step_by(31).copied().take(64).collect();
+        assert_eq!(request.len(), 64);
+
+        let reader = Counting(&db, AtomicUsize::new(0));
+        let entries = disk_inclusion_batch(&reader, &Overlay::new(), &request, far()).unwrap();
+        assert!(entries
+            .iter()
+            .all(|e| matches!(e, InclusionBatchEntry::Present { .. })));
+        let union_reads = reader.1.load(Ordering::Relaxed);
+
+        let single = Counting(&db, AtomicUsize::new(0));
+        for key in &request {
+            materialize_for_proof(&single, &Overlay::new(), None, key).unwrap();
+        }
+        let per_key_reads = single.1.load(Ordering::Relaxed);
+        assert!(
+            union_reads * 2 <= per_key_reads,
+            "union {union_reads} should be well under per-key {per_key_reads}"
+        );
+        // And bounded by what the paths hold: at most the node count of 64 paths.
+        assert!(union_reads <= per_key_reads);
+    }
+}

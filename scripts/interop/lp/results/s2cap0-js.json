@@ -1,0 +1,28 @@
+{
+  "label": "S2-LP-cap0",
+  "url": "http://127.0.0.1:13000",
+  "sdk": "state-transition-sdk-js (this checkout)",
+  "started": "2026-10-16T20:50:43.231Z",
+  "results": {
+    "l6": {
+      "ok": true,
+      "sinceSubmitMs": 3018,
+      "totalMs": 3078,
+      "proofRequests": 4,
+      "proofRequestsWithWait": 4,
+      "submissions": 1,
+      "echoes": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "minGapMs": 1000,
+      "httpStatuses": [
+        200
+      ],
+      "intervalMs": 1000,
+      "expectationNotChecked": "against LONG_POLL_MAX_WAITERS=0 expect echoes all 0 and minGapMs >= intervalMs; `ok` does not check it"
+    }
+  }
+}

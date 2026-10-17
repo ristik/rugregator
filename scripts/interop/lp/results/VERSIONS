@@ -1,0 +1,10 @@
+# Revisions that produced the files in this directory (run of 2026-10-16/17, see orchestration/interop-lp.md)
+s2lp, s2cap0   aggregator-go long-poll a15d19bfae2cddafced6237f32da555b2986a22f (image Dockerfile.aggregator, no RocksDB)
+s2base         aggregator-go non-inclusion a352752144ec40ae5ab8b2daf1c324013dca8213
+s1lp           rugregator long-poll d000896 (release build, --bft-mode stub)
+rust driver    state-transition-sdk-rust long-poll f559ae2 (L1-L7 files); *-js*.json: state-transition-sdk-js long-poll 92ea13b
+go             aggregator-go cmd/commitment @ a15d19bf (go1.27.2)
+harness        rugregator lp/interop-matrix (this directory)
+Files: <tag>-rust.jsonl one line per check; s2lp-L7-rust.jsonl = L7 repetition 3; s2lp-L7-rep2-rust.jsonl / -rep3- = copies made by
+`cp results/s2lp-L7-rust.jsonl results/s2lp-L7-repN-rust.jsonl` after each of three `IX_SCEN=L7 IX_N=200 IX_RATE=10 run.sh s2lp` runs (repetition 1
+was overwritten, its figures are only in orchestration/interop-lp.md). *-go.jsonl: go-commitment.sh (status field added afterwards to the first run's lines).

@@ -14,7 +14,10 @@ use super::materializer::{
 };
 use super::overlay::Overlay;
 use super::persister::persist_modified;
-use crate::traits::CertifiedSmtSnapshot;
+use crate::traits::{
+    answer_inclusion_batch, CertifiedSmtSnapshot, InclusionBatchEntry, ProofRequest, SnapshotError,
+};
+use std::time::Instant;
 
 pub const CF_SMT_META: &str = "smt_meta";
 const KEY_ROOT_HASH: &[u8] = b"root_hash";
@@ -173,12 +176,28 @@ impl crate::traits::SmtStore for DiskSmt {
             }
             let empty_overlay = Overlay::new();
             for request in requests {
-                let result = materialize_for_proof(&reader, &empty_overlay, None, &request.key)
-                    .and_then(|tree| {
-                        tree.get_non_inclusion_proof(&request.key)
-                            .map_err(|error| anyhow::anyhow!(error))
-                    });
-                let _ = request.respond_to.send(result);
+                match request {
+                    ProofRequest::NonInclusion { key, respond_to } => {
+                        let result = materialize_for_proof(&reader, &empty_overlay, None, &key)
+                            .and_then(|tree| {
+                                tree.get_non_inclusion_proof(&key)
+                                    .map_err(|error| anyhow::anyhow!(error))
+                            });
+                        let _ = respond_to.send(result);
+                    }
+                    ProofRequest::InclusionBatch {
+                        keys,
+                        deadline,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(disk_inclusion_batch(
+                            &reader,
+                            &empty_overlay,
+                            &keys,
+                            deadline,
+                        ));
+                    }
+                }
             }
         })
     }
@@ -202,6 +221,22 @@ impl crate::traits::SmtStore for DiskSmt {
     ) -> anyhow::Result<Vec<InclusionProof>> {
         DiskSmt::get_inclusion_proofs_batch(self, keys)
     }
+}
+
+/// Answer an inclusion batch from one RocksDB snapshot: the union of the keys'
+/// paths is materialized once (shared prefixes are read once), then every key
+/// is answered from that partial tree. Never touches the live store.
+pub(crate) fn disk_inclusion_batch<R: super::materializer::NodeReader + ?Sized>(
+    reader: &R,
+    overlay: &Overlay,
+    keys: &[SmtKey],
+    deadline: Instant,
+) -> Result<Vec<InclusionBatchEntry>, SnapshotError> {
+    if Instant::now() >= deadline {
+        return Err(SnapshotError::Deadline);
+    }
+    let tree = materialize_for_keys(reader, overlay, None, keys).map_err(SnapshotError::Internal)?;
+    answer_inclusion_batch(keys, deadline, |key| tree.get_inclusion_proof_with_value(key))
 }
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────

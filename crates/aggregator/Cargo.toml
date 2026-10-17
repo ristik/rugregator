@@ -9,6 +9,10 @@ name = "aggregator"
 path = "src/main.rs"
 
 [[bin]]
+name = "stub-anchor"
+path = "src/bin/stub_anchor.rs"
+
+[[bin]]
 name = "perf-test"
 path = "src/bin/perf_test.rs"
 
