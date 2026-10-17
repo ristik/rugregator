@@ -173,7 +173,6 @@ pub async fn handle_get_inclusion_proof_v2(
         .await
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
-    let is_pending = matches!(proof, InclusionProofLookup::Pending);
     let (hex_cbor, status) = match proof {
         InclusionProofLookup::Proof(p) => (
             encode_inclusion_proof_response(
@@ -191,12 +190,8 @@ pub async fn handle_get_inclusion_proof_v2(
         // client polls on; only the optional status hint tells the cases apart.
         InclusionProofLookup::Pending | InclusionProofLookup::NotFound => {
             let Some(block) = state.latest_finalized_block().await else {
-                // No finalized block yet, so there is no certificate to carry. A state this
-                // server accepted keeps the poll-on answer clients already understand
-                // (-32021); an unknown one gets aggregator-go's typed retryable error.
-                if is_pending {
-                    return Err(JsonRpcError::inclusion_pending());
-                }
+                // Only the instant between startup and the initial empty-tree block: there is
+                // no certificate to carry yet. aggregator-go's typed retryable error.
                 return Err(JsonRpcError::detailed(
                     JsonRpcError::PROOF_UNAVAILABLE,
                     "Proof unavailable",
@@ -366,42 +361,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_the_first_block_unknown_is_typed_and_pending_keeps_polling() {
+    async fn before_the_first_block_every_not_certified_state_gets_the_typed_error() {
         let (state, _rx) = state_with_block(0).await;
         state
             .submit_request(validated_request([0x11u8; 32]))
             .await
             .unwrap();
         for status in [false, true] {
-            // unknown: aggregator-go's typed, retryable error
-            let e = handle_get_inclusion_proof_v2(
-                serde_json::json!({ "stateId": hex::encode([0x22u8; 32]), "includeStatus": status }),
-                Arc::clone(&state),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(e.code, JsonRpcError::PROOF_UNAVAILABLE);
-            let d = e.data.unwrap();
-            assert_eq!(
-                (
-                    d["reason"].as_str(),
-                    d["detail"].as_str(),
-                    d["retryable"].as_bool()
-                ),
-                (
-                    Some("proof_unavailable"),
-                    Some("no_finalized_view"),
-                    Some(true)
+            for id in [[0x22u8; 32], [0x11u8; 32]] {
+                let e = handle_get_inclusion_proof_v2(
+                    serde_json::json!({ "stateId": hex::encode(id), "includeStatus": status }),
+                    Arc::clone(&state),
                 )
-            );
-            // pending: no certificate exists to carry, so the poll-on error clients know
-            let e = handle_get_inclusion_proof_v2(
-                serde_json::json!({ "stateId": hex::encode([0x11u8; 32]), "includeStatus": status }),
-                Arc::clone(&state),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(e.code, JsonRpcError::INCLUSION_PENDING);
+                .await
+                .unwrap_err();
+                assert_eq!(e.code, JsonRpcError::PROOF_UNAVAILABLE);
+                let d = e.data.unwrap();
+                assert_eq!(
+                    (
+                        d["reason"].as_str(),
+                        d["detail"].as_str(),
+                        d["retryable"].as_bool()
+                    ),
+                    (
+                        Some("proof_unavailable"),
+                        Some("no_finalized_view"),
+                        Some(true)
+                    )
+                );
+            }
         }
     }
 

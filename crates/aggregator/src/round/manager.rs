@@ -372,6 +372,9 @@ pub struct RoundManager<S: SmtStore> {
     proof_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
     /// Data held while a ZK proof is generating.  `None` when not proving.
     proving_data: Option<ProvingRoundData<S>>,
+    /// True while no finalized block exists (a fresh start): an initial round without requests
+    /// certifies the empty tree so the proof service has a latest finalized view at once.
+    initial_block_needed: bool,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -435,6 +438,7 @@ impl<S: SmtStore> RoundManager<S> {
             proof_tx,
             proof_rx,
             proving_data: None,
+            initial_block_needed: false,
         }
     }
 
@@ -463,6 +467,12 @@ impl<S: SmtStore> RoundManager<S> {
         self.recover_pending_round().await;
         self.publish_reference_time();
         self.publish_current_certified_snapshot().await;
+        // A restart with existing state recovers its latest block and certifies nothing extra;
+        // only a start without any finalized block (and without a recovered in-flight round)
+        // needs the initial empty-tree block. Not in ZK mode, whose rounds need a proof.
+        self.initial_block_needed = self.inflight.is_none()
+            && self.state.latest_certified_block().await.is_none()
+            && !matches!(self.config.proof_mode, ConsistencyProofMode::Zk);
 
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -774,6 +784,13 @@ impl<S: SmtStore> RoundManager<S> {
             None => {
                 if !self.pending.is_empty() {
                     self.start_round().await;
+                } else if self.initial_block_needed {
+                    if self.state.latest_certified_block().await.is_some() {
+                        self.initial_block_needed = false;
+                    } else {
+                        info!("no finalized block yet: certifying the empty tree");
+                        self.start_round_with(true).await;
+                    }
                 }
             }
             Some(inf) => {
@@ -792,13 +809,18 @@ impl<S: SmtStore> RoundManager<S> {
     // ── Round startup ─────────────────────────────────────────────────────────
 
     async fn start_round(&mut self) {
+        self.start_round_with(false).await;
+    }
+
+    /// `allow_empty` lets a round without requests proceed (the initial empty-tree block).
+    async fn start_round_with(&mut self, allow_empty: bool) {
         // Don't start a new primary round while a ZK proof is in-flight.
         if self.proving_data.is_some() {
             return;
         }
 
         let batch = std::mem::take(&mut self.pending);
-        if batch.is_empty() {
+        if batch.is_empty() && !allow_empty {
             return;
         }
 
@@ -819,7 +841,7 @@ impl<S: SmtStore> RoundManager<S> {
             );
             self.state.drop_expired_requests(&expired);
         }
-        if batch.is_empty() {
+        if batch.is_empty() && !allow_empty {
             return;
         }
 
@@ -1980,5 +2002,56 @@ mod tests {
         assert_eq!(inflight.reference_time, current_reference_time);
         assert_eq!(inflight.submitted_batch.len(), 1);
         assert!(manager.pending.is_empty());
+    }
+    /// Run a manager on `state` until `until` holds (at most 5 s), keep it running a little
+    /// longer so idle rounds would show up, then stop it.
+    async fn run_manager(state: &Arc<AggregatorState>, until_block: bool) {
+        let (_tx, request_rx) = mpsc::channel(8);
+        let mut cfg = round_config();
+        cfg.round_duration_ms = 30;
+        let manager = RoundManager::new(
+            cfg,
+            request_rx,
+            Arc::clone(state),
+            Arc::new(BftCommitterStub::new()),
+        );
+        let notify = manager.shutdown_notify();
+        let handle = tokio::spawn(manager.run());
+        if until_block {
+            for _ in 0..100 {
+                if state.latest_finalized_block().await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        notify.notify_one();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_certifies_one_initial_empty_tree_block() {
+        let (request_tx, _request_rx) = mpsc::channel(8);
+        let state = AggregatorState::new(request_tx, None);
+        assert!(state.latest_finalized_block().await.is_none());
+        run_manager(&state, true).await;
+
+        let block = state.latest_finalized_block().await.expect("initial block");
+        assert_eq!(block.block_number, 1);
+        assert_eq!(block.root_hash, None, "the certified empty tree");
+        // idle rounds certify nothing further
+        assert_eq!(state.current_block_number().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_a_finalized_block_certifies_nothing_extra() {
+        let (request_tx, _request_rx) = mpsc::channel(8);
+        let state = AggregatorState::new(request_tx, None);
+        run_manager(&state, true).await;
+        assert_eq!(state.current_block_number().await, 2);
+        // a second manager on the same (recovered) state
+        run_manager(&state, false).await;
+        assert_eq!(state.current_block_number().await, 2, "no extra block");
     }
 }

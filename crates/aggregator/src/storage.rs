@@ -757,6 +757,12 @@ impl AggregatorState {
         let Some(certified) = self.latest_view() else {
             return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
         };
+        // The initial empty-tree block exists so that v2 lookups have a latest finalized
+        // certificate to carry; absence against an empty tree stays "no certified state"
+        // as before it (unchanged non-inclusion semantics).
+        if certified.block.root_hash.is_none() {
+            return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
+        }
 
         let permit = match Arc::clone(&self.proof_permits).try_acquire_owned() {
             Ok(permit) => permit,

@@ -348,7 +348,9 @@ pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8
     val_as_u64(&input[2], "InputRecord.epoch")?;
     optional_bytes(&input[3], "InputRecord.previousHash")?;
     let state_root = match &input[4] {
-        Value::Null if round == 0 => None,
+        // The native certified empty tree: `hash` is null (at any round; the empty byte
+        // string is accepted as the same tree for older stub data).
+        Value::Null => None,
         Value::Bytes(bytes) if bytes.is_empty() => None,
         Value::Bytes(bytes) if bytes.len() == 32 => {
             Some(bytes.as_slice().try_into().expect("length checked"))
@@ -831,39 +833,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_null_input_record_values_after_genesis() {
-        let mut uc = canonical_uc();
-        let fields = match &mut uc {
-            Value::Tag(_, inner) => match inner.as_mut() {
-                Value::Array(uc) => match &mut uc[1] {
-                    Value::Tag(_, input) => match input.as_mut() {
-                        Value::Array(input) => input,
+    fn a_null_hash_is_the_empty_tree_and_a_null_summary_needs_genesis() {
+        fn fields(uc: &mut Value) -> &mut Vec<Value> {
+            match uc {
+                Value::Tag(_, inner) => match inner.as_mut() {
+                    Value::Array(uc) => match &mut uc[1] {
+                        Value::Tag(_, input) => match input.as_mut() {
+                            Value::Array(input) => input,
+                            _ => unreachable!(),
+                        },
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        };
-        fields[4] = Value::Null;
-        assert!(unicity_certificate_state_root(&uc).is_err());
-
+            }
+        }
+        // a null hash is the native certified empty tree, whatever the round
         let mut uc = canonical_uc();
-        let fields = match &mut uc {
-            Value::Tag(_, inner) => match inner.as_mut() {
-                Value::Array(uc) => match &mut uc[1] {
-                    Value::Tag(_, input) => match input.as_mut() {
-                        Value::Array(input) => input,
-                        _ => unreachable!(),
-                    },
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        };
-        fields[5] = Value::Null;
+        fields(&mut uc)[4] = Value::Null;
+        assert_eq!(unicity_certificate_state_root(&uc).unwrap(), None);
+        // a null summary value is only the initial (round 0) record's
+        let mut uc = canonical_uc();
+        fields(&mut uc)[5] = Value::Null;
         assert!(unicity_certificate_state_root(&uc).is_err());
     }
 
