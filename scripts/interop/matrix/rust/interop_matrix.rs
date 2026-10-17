@@ -34,6 +34,21 @@ use unicity_token::transaction::{
 };
 use unicity_token::verify::NonInclusionContext;
 
+/// `InputRecord.hash` is `Vec<u8>` in older SDKs and `Option<Vec<u8>>` (native null kept) in newer ones.
+trait RootBytes {
+    fn root_bytes(self) -> Vec<u8>;
+}
+impl RootBytes for Vec<u8> {
+    fn root_bytes(self) -> Vec<u8> {
+        self
+    }
+}
+impl RootBytes for Option<Vec<u8>> {
+    fn root_bytes(self) -> Vec<u8> {
+        self.unwrap_or_default()
+    }
+}
+
 fn emit(scn: &str, name: &str, status: &str, evidence: &str) {
     println!(
         "{}",
@@ -219,7 +234,7 @@ fn interop_matrix() {
     match client.consolidate_proofs(&items, &ConsolidateOptions::default()) {
         Ok(BundleOutcome::Consolidated(bundle)) => {
             let s = &bundle.summary;
-            master_root = Some(bundle.proofs[0].unicity_certificate.input_record.hash.clone());
+            master_root = Some(bundle.proofs[0].unicity_certificate.input_record.hash.clone().root_bytes());
             // every replacement proof is independently re-verified
             let mut bad = String::new();
             for (m, p) in minted.iter().zip(&bundle.proofs) {

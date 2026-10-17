@@ -341,6 +341,21 @@ pub(crate) fn unicity_certificate_is_unsharded(value: &Value) -> bool {
 /// BFT payload from reintroducing a second hashing/signature profile through
 /// either proof endpoint. Cryptographic trust-base verification remains the
 /// client's responsibility.
+/// Whether the certificate's input record carries the empty byte string (`h''`) as its state
+/// hash. That is valid CBOR and decodes as an absent root for old stub data, but it is not the
+/// canonical empty-tree representation (native `null`): publishing it as a certified-empty
+/// snapshot would serve non-inclusion proofs that every conforming verifier rejects.
+pub(crate) fn unicity_certificate_has_legacy_empty_root(value: &Value) -> bool {
+    let Ok(uc) = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")
+    else {
+        return false;
+    };
+    let Ok(input) = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord") else {
+        return false;
+    };
+    matches!(&input[4], Value::Bytes(bytes) if bytes.is_empty())
+}
+
 pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8; 32]>, CborError> {
     let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
     let input = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord")?;
@@ -348,7 +363,10 @@ pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8
     val_as_u64(&input[2], "InputRecord.epoch")?;
     optional_bytes(&input[3], "InputRecord.previousHash")?;
     let state_root = match &input[4] {
-        Value::Null if round == 0 => None,
+        // The native certified empty tree: `hash` is null (at any round).
+        Value::Null => None,
+        // A legacy empty byte string decodes as "no root" so old data stays readable, but it
+        // is NOT the canonical empty tree: see `unicity_certificate_has_legacy_empty_root`.
         Value::Bytes(bytes) if bytes.is_empty() => None,
         Value::Bytes(bytes) if bytes.len() == 32 => {
             Some(bytes.as_slice().try_into().expect("length checked"))
@@ -538,6 +556,33 @@ pub fn encode_inclusion_proof_response(
 
     let cbor = encode_cbor_value(&response_val)?;
     Ok(hex::encode(cbor))
+}
+
+/// The "not certified (yet)" answer of `get_inclusion_proof.v2`, byte-identical to
+/// aggregator-go's `emptyInclusionProofResponse`: `[blockNumber, #6.39033([1, null, null,
+/// null, UC])]` with the latest finalized block's number and certificate. It carries no
+/// evidence about the requested state (pending, unknown and expired all look the same);
+/// the optional status hint is the only refinement.
+pub fn encode_empty_inclusion_proof_response(
+    block_number: u64,
+    uc_cbor: &[u8],
+) -> Result<String, CborError> {
+    let uc_val = decode_unicity_certificate_value(uc_cbor)?;
+    let proof_val = Value::Tag(
+        INCLUSION_PROOF_TAG,
+        Box::new(Value::Array(vec![
+            Value::Integer(ciborium::value::Integer::from(VERSION)),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            uc_val,
+        ])),
+    );
+    let response_val = Value::Array(vec![
+        Value::Integer(ciborium::value::Integer::from(block_number)),
+        proof_val,
+    ]);
+    Ok(hex::encode(encode_cbor_value(&response_val)?))
 }
 
 // ─── Encode non-inclusion proof response ────────────────────────────────────
@@ -804,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_null_input_record_values_after_genesis() {
+    fn a_null_hash_is_the_empty_tree_and_a_null_summary_needs_genesis() {
         let mut uc = canonical_uc();
         let fields = match &mut uc {
             Value::Tag(_, inner) => match inner.as_mut() {
@@ -820,7 +865,8 @@ mod tests {
             _ => unreachable!(),
         };
         fields[4] = Value::Null;
-        assert!(unicity_certificate_state_root(&uc).is_err());
+        // the native certified empty tree, at any round
+        assert_eq!(unicity_certificate_state_root(&uc).unwrap(), None);
 
         let mut uc = canonical_uc();
         let fields = match &mut uc {

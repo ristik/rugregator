@@ -511,8 +511,9 @@ mod tests {
         assert_eq!((status, &r["id"]), (StatusCode::OK, &json!(9)));
         assert!(r["result"]["blockNumber"].is_string());
         let (status, r) = call(&state, json!({"jsonrpc":"2.0","id":"s","method":"get_inclusion_proof.v2","params":{"stateId": hex::encode([0x77;32])}})).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(r["error"]["code"], json!(-32020));
+        // an unknown state is a normal result (aggregator-go's empty-proof answer), not -32020/404
+        assert_eq!(status, StatusCode::OK);
+        assert!(r.get("error").is_none() && r["result"].is_string(), "{r}");
         let (status, r) = call(&state, json!({"jsonrpc":"2.0","id":1,"method":"nope","params":{}})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(r["error"]["code"], json!(-32601));

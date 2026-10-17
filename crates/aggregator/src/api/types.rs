@@ -59,6 +59,8 @@ impl JsonRpcError {
     pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
+    /// aggregator-go's `get_inclusion_proof.v2` validation code (a malformed `stateId`).
+    pub const VALIDATION_ERROR: i32 = -32000;
     pub const INTERNAL_ERROR: i32 = -32603;
     // JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
     // errors. Within that range the Unicity aggregators split the space:
@@ -73,8 +75,10 @@ impl JsonRpcError {
     /// The aggregator has no record of this state id: neither certified nor
     /// pending. Maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32020;
-    /// A known certification request has not reached a certified block yet.
-    /// The client should keep polling.
+    /// Historical: `get_inclusion_proof.v2` used to answer a pending state with this
+    /// error. It now returns aggregator-go's empty-proof result (or the typed
+    /// `no_finalized_view` before the first finalized block), so no method emits the code
+    /// any more; clients keep handling it for older servers.
     pub const INCLUSION_PENDING: i32 = -32021;
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
@@ -124,6 +128,15 @@ impl JsonRpcError {
         Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
     }
 
+    /// aggregator-go's `get_inclusion_proof.v2` validation error (`-32000`, no data).
+    pub fn validation(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::VALIDATION_ERROR,
+            message: msg.into(),
+            data: None,
+        }
+    }
+
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
             code: Self::INVALID_PARAMS,
@@ -156,13 +169,6 @@ impl JsonRpcError {
         Self {
             code: Self::STATE_INCLUDED,
             message: "state is already included".into(),
-            data: None,
-        }
-    }
-    pub fn inclusion_pending() -> Self {
-        Self {
-            code: Self::INCLUSION_PENDING,
-            message: "certification is pending".into(),
             data: None,
         }
     }
@@ -207,6 +213,9 @@ impl CertificationResponse {
 pub struct GetInclusionProofParams {
     #[serde(rename = "stateId")]
     pub state_id: String, // hex-encoded state ID
+    /// Ask for the `{proof, status}` object instead of the bare hex string.
+    #[serde(rename = "includeStatus", default)]
+    pub include_status: bool,
 }
 
 // ─── get_inclusion_proofs.v1 limits ───────────────────────────────────────────

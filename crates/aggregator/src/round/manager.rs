@@ -573,7 +573,9 @@ impl<S: SmtStore> RoundManager<S> {
         match self.smt.create_certified_snapshot() {
             Ok(snapshot) => {
                 if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
-                    error!(err = %error, "failed to publish recovered certified SMT snapshot");
+                    error!(err = %error, "failed to publish recovered certified SMT snapshot; \
+                           the certified-snapshot proof service stays unavailable");
+                    self.state.clear_certified_snapshot();
                 }
             }
             Err(error) => {
@@ -1980,5 +1982,85 @@ mod tests {
         assert_eq!(inflight.reference_time, current_reference_time);
         assert_eq!(inflight.submitted_batch.len(), 1);
         assert!(manager.pending.is_empty());
+    }
+    /// A persisted block as recovery sees it: the stub UC of `new_root` for block 1.
+    async fn recovered_state(uc_cbor: Vec<u8>) -> (Arc<AggregatorState>, RoundManager<smt_store::MemSmt>) {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let state = AggregatorState::new(request_tx, None);
+        state
+            .finalize_round(
+                BlockInfo {
+                    block_number: 1,
+                    root_hash: None,
+                    uc_cbor,
+                },
+                vec![],
+            )
+            .await;
+        let manager = RoundManager::new(
+            round_config(),
+            request_rx,
+            Arc::clone(&state),
+            Arc::new(BftCommitterStub::new()),
+        );
+        (state, manager)
+    }
+
+    fn empty_root_uc() -> Vec<u8> {
+        stub_uc::generate(&StubUcParams {
+            partition_id: 1,
+            block_number: 1,
+            reference_time: 1_755_000_000,
+            seal_timestamp: 1_755_000_001,
+            prev_root: None,
+            new_root: None,
+            prev_seal_hash: None,
+        })
+        .cbor
+    }
+
+    #[tokio::test]
+    async fn recovery_never_publishes_a_legacy_empty_byte_string_root_as_canonical_empty() {
+        // the stub certifies an empty tree with `h''` (what the earlier forced-initial-block
+        // revision persisted)
+        let uc = empty_root_uc();
+        assert!(crate::api::cbor::unicity_certificate_has_legacy_empty_root(
+            &decode_cbor_value(&uc).unwrap()
+        ));
+        let (state, manager) = recovered_state(uc).await;
+        manager.publish_current_certified_snapshot().await;
+        assert!(
+            state.get_non_inclusion_proof([7u8; 32]).await.is_ok_and(|r| matches!(
+                r,
+                crate::storage::NonInclusionProofLookup::CertifiedStateUnavailable
+            )),
+            "no certified-empty snapshot is served from legacy data"
+        );
+        // the block itself stays (v2 can still carry its unchanged UC)
+        assert!(state.latest_finalized_block().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn recovery_keeps_a_canonical_null_root_snapshot_usable() {
+        // the same block with the native null hash (canonical certified empty tree, round > 0)
+        let mut value = decode_cbor_value(&empty_root_uc()).unwrap();
+        {
+            let ciborium::value::Value::Tag(_, inner) = &mut value else { panic!() };
+            let ciborium::value::Value::Array(uc) = &mut **inner else { panic!() };
+            let ciborium::value::Value::Tag(_, ir) = &mut uc[1] else { panic!() };
+            let ciborium::value::Value::Array(f) = &mut **ir else { panic!() };
+            f[4] = ciborium::value::Value::Null;
+        }
+        let uc = crate::api::cbor::encode_cbor_value(&value).unwrap();
+        assert!(!crate::api::cbor::unicity_certificate_has_legacy_empty_root(&value));
+        let (state, manager) = recovered_state(uc).await;
+        manager.publish_current_certified_snapshot().await;
+        assert!(
+            state.get_non_inclusion_proof([7u8; 32]).await.is_ok_and(|r| matches!(
+                r,
+                crate::storage::NonInclusionProofLookup::Proof(_)
+            )),
+            "a canonical null-root snapshot is published and serves the empty-tree proof"
+        );
     }
 }
