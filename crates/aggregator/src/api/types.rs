@@ -74,9 +74,9 @@ impl JsonRpcError {
     /// pending. Maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32020;
     /// Historical: `get_inclusion_proof.v2` used to answer a pending state with this
-    /// error. It now returns aggregator-go's empty-proof result (a fresh server certifies
-    /// an initial empty-tree block at startup), so no method emits the code any more;
-    /// clients keep handling it for older servers.
+    /// error. It now returns aggregator-go's empty-proof result (or the typed
+    /// `no_finalized_view` before the first finalized block), so no method emits the code
+    /// any more; clients keep handling it for older servers.
     pub const INCLUSION_PENDING: i32 = -32021;
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
@@ -120,26 +120,10 @@ impl JsonRpcError {
         }
     }
     pub fn invalid_request_detail(detail: &str) -> Self {
-        Self::detailed(
-            Self::INVALID_PARAMS,
-            "Invalid params",
-            "invalid_request",
-            detail,
-            false,
-            None,
-            None,
-        )
+        Self::detailed(Self::INVALID_PARAMS, "Invalid params", "invalid_request", detail, false, None, None)
     }
     pub fn limit_exceeded(detail: &str, limit: usize) -> Self {
-        Self::detailed(
-            Self::LIMIT_EXCEEDED,
-            "Limit exceeded",
-            "limit_exceeded",
-            detail,
-            false,
-            Some(limit),
-            None,
-        )
+        Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
     }
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {

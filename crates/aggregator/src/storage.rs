@@ -252,8 +252,9 @@ impl Catalog {
 
     fn evict(&mut self, now: Instant) {
         let latest = self.latest.clone();
-        let is_latest =
-            |v: &Arc<CertifiedProofState>| latest.as_ref().is_some_and(|l| Arc::ptr_eq(l, v));
+        let is_latest = |v: &Arc<CertifiedProofState>| {
+            latest.as_ref().is_some_and(|l| Arc::ptr_eq(l, v))
+        };
         let max_age = self.limits.max_age;
         let before = self.retained.len();
         self.retained
@@ -433,9 +434,7 @@ impl AggregatorState {
             store,
             catalog: StdMutex::new(Catalog::new(RetentionLimits::default())),
             proof_permits: Arc::new(Semaphore::new(CERTIFIED_PROOF_MAX_IN_FLIGHT)),
-            batch_permits: Arc::new(Semaphore::new(
-                RetentionLimits::default().max_active_batches,
-            )),
+            batch_permits: Arc::new(Semaphore::new(RetentionLimits::default().max_active_batches)),
             batch_permit_limit: std::sync::atomic::AtomicUsize::new(
                 RetentionLimits::default().max_active_batches,
             ),
@@ -757,12 +756,6 @@ impl AggregatorState {
         let Some(certified) = self.latest_view() else {
             return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
         };
-        // The initial empty-tree block exists so that v2 lookups have a latest finalized
-        // certificate to carry; absence against an empty tree stays "no certified state"
-        // as before it (unchanged non-inclusion semantics).
-        if certified.block.root_hash.is_none() {
-            return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
-        }
 
         let permit = match Arc::clone(&self.proof_permits).try_acquire_owned() {
             Ok(permit) => permit,
@@ -1186,7 +1179,10 @@ mod tests {
         let mut mutation = smt.create_snapshot();
         for &seed in seeds {
             mutation
-                .add_leaf(key(seed), rsmt::leaf_value(&txh(seed), REF_TIME).to_vec())
+                .add_leaf(
+                    key(seed),
+                    rsmt::leaf_value(&txh(seed), REF_TIME).to_vec(),
+                )
                 .unwrap();
         }
         mutation.commit(smt).unwrap();
@@ -1371,11 +1367,7 @@ mod tests {
         for i in 0..(EXPIRED_MAX_ENTRIES + 10) {
             set.insert(&format!("{i:08}"), t0);
         }
-        assert_eq!(
-            set.at.len(),
-            EXPIRED_MAX_ENTRIES,
-            "count cap evicts the oldest"
-        );
+        assert_eq!(set.at.len(), EXPIRED_MAX_ENTRIES, "count cap evicts the oldest");
         assert!(!set.contains("00000000", t0));
         assert!(set.contains(&format!("{:08}", EXPIRED_MAX_ENTRIES + 9), t0));
         // After the TTL everything is forgotten.
@@ -1404,16 +1396,9 @@ mod tests {
         assert_eq!(stats.retained_views, 3);
         assert_eq!(stats.evicted_by_count, 2);
         let catalog = state.catalog();
-        let retained: Vec<_> = catalog
-            .retained
-            .iter()
-            .filter_map(|v| v.block.root_hash)
-            .collect();
+        let retained: Vec<_> = catalog.retained.iter().filter_map(|v| v.block.root_hash).collect();
         assert_eq!(retained, roots[2..].to_vec());
-        assert_eq!(
-            catalog.latest.as_ref().unwrap().block.root_hash,
-            Some(roots[4])
-        );
+        assert_eq!(catalog.latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
         drop(catalog);
 
         // Age: with a zero budget every superseded view goes at the next publish,
@@ -1426,10 +1411,7 @@ mod tests {
         let stats = state.catalog_stats();
         assert_eq!(stats.retained_views, 1);
         assert_eq!(stats.evicted_by_age, 2);
-        assert_eq!(
-            state.catalog().latest.as_ref().unwrap().block.root_hash,
-            Some(roots[4])
-        );
+        assert_eq!(state.catalog().latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
     }
 
     #[test]
@@ -1467,11 +1449,7 @@ mod tests {
         round(&state, &mut smt, &[0x11], 1, &[0x80]);
         let limit = state.retention_limits().max_active_batches;
         let held: Vec<_> = (0..limit)
-            .map(|_| {
-                Arc::clone(&state.batch_permits)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| Arc::clone(&state.batch_permits).try_acquire_owned().unwrap())
             .collect();
         assert!(matches!(
             state
@@ -1482,11 +1460,7 @@ mod tests {
         drop(held);
         // The shared proof-work budget also binds batches.
         let held: Vec<_> = (0..CERTIFIED_PROOF_MAX_IN_FLIGHT)
-            .map(|_| {
-                Arc::clone(&state.proof_permits)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| Arc::clone(&state.proof_permits).try_acquire_owned().unwrap())
             .collect();
         assert!(matches!(
             state
@@ -1500,10 +1474,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.batch_permits.available_permits(), limit);
-        assert_eq!(
-            state.proof_permits.available_permits(),
-            CERTIFIED_PROOF_MAX_IN_FLIGHT
-        );
+        assert_eq!(state.proof_permits.available_permits(), CERTIFIED_PROOF_MAX_IN_FLIGHT);
         assert!(state.catalog_stats().rejected_busy >= 2);
     }
 
