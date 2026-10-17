@@ -160,7 +160,15 @@ pub async fn handle_get_inclusion_proof_v2(
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid params: {e}")))?;
 
     let state_id_bytes = hex::decode(&p.state_id)
-        .map_err(|_| JsonRpcError::invalid_params("stateId must be a hex string"))?;
+        .map_err(|e| JsonRpcError::validation(format!("Invalid parameters: invalid hex string: {e}")))?;
+    // Like aggregator-go: a state id is exactly 32 raw bytes. Anything else can never be a state,
+    // so it is an error (terminal for clients), not a pollable "not certified" answer.
+    if state_id_bytes.len() != 32 {
+        return Err(JsonRpcError::validation(format!(
+            "stateId must be exactly 32 bytes (v2 wire format), got {}",
+            state_id_bytes.len()
+        )));
+    }
 
     // The hint is read before the proof: a state that finalizes in between returns its proof
     // (included wins), never "unknown" for a state that has one.
@@ -190,8 +198,8 @@ pub async fn handle_get_inclusion_proof_v2(
         // client polls on; only the optional status hint tells the cases apart.
         InclusionProofLookup::Pending | InclusionProofLookup::NotFound => {
             let Some(block) = state.latest_finalized_block().await else {
-                // Only the instant between startup and the initial empty-tree block: there is
-                // no certificate to carry yet. aggregator-go's typed retryable error.
+                // No finalized block yet (a fresh server, until its first certified request):
+                // there is no certificate to carry. aggregator-go's typed retryable error.
                 return Err(JsonRpcError::detailed(
                     JsonRpcError::PROOF_UNAVAILABLE,
                     "Proof unavailable",
@@ -281,6 +289,13 @@ mod tests {
         // and the UC follows as the tagged certificate in both
         assert!(golden_hex[prefix.len()..].starts_with("d99859"));
         assert!(mine[prefix.len()..].starts_with("d99859"));
+        // the signed UC is carried unchanged: the whole answer is framing || block.uc_cbor, for
+        // small and multi-byte block numbers alike
+        for (block, head) in [(9u64, "09"), (300, "19012c")] {
+            let answer = encode_empty_inclusion_proof_response(block, &test_uc()).unwrap();
+            let want = format!("82{head}d998798501f6f6f6{}", hex::encode(test_uc()));
+            assert_eq!(answer, want, "block {block}");
+        }
     }
 
     async fn state_with_block(
@@ -431,5 +446,32 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(e.code, JsonRpcError::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_state_id_is_a_validation_error_not_a_not_certified_answer() {
+        let (state, _rx) = state_with_block(2).await;
+        for id in ["", "00", "abcd", &"ab".repeat(31), &"ab".repeat(33)] {
+            for status in [false, true] {
+                let e = handle_get_inclusion_proof_v2(
+                    serde_json::json!({ "stateId": id, "includeStatus": status }),
+                    Arc::clone(&state),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(e.code, JsonRpcError::VALIDATION_ERROR, "{id:?}");
+                assert!(
+                    e.message.starts_with("stateId must be exactly 32 bytes (v2 wire format), got "),
+                    "{}",
+                    e.message
+                );
+            }
+        }
+        // non-hex text is a validation error too; exactly 32 bytes is accepted
+        let e = handle_get_inclusion_proof_v2(serde_json::json!({ "stateId": "zz" }), Arc::clone(&state))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, JsonRpcError::VALIDATION_ERROR);
+        assert!(v2(&state, [0x22u8; 32], false).await.is_string());
     }
 }

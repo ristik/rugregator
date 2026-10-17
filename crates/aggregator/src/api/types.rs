@@ -59,6 +59,8 @@ impl JsonRpcError {
     pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
+    /// aggregator-go's `get_inclusion_proof.v2` validation code (a malformed `stateId`).
+    pub const VALIDATION_ERROR: i32 = -32000;
     pub const INTERNAL_ERROR: i32 = -32603;
     // JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
     // errors. Within that range the Unicity aggregators split the space:
@@ -124,6 +126,15 @@ impl JsonRpcError {
     }
     pub fn limit_exceeded(detail: &str, limit: usize) -> Self {
         Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
+    }
+
+    /// aggregator-go's `get_inclusion_proof.v2` validation error (`-32000`, no data).
+    pub fn validation(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::VALIDATION_ERROR,
+            message: msg.into(),
+            data: None,
+        }
     }
 
     pub fn invalid_params(msg: impl Into<String>) -> Self {
