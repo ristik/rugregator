@@ -687,9 +687,24 @@ fn make_cert_cbor(
     req.signature = None;
     let raw = cbor_cert_req(&req)?;
     let hash: [u8; 32] = Sha256::digest(&raw).into();
-    let sig = secp.sign_ecdsa(&Message::from_digest(hash), sig_key);
-    req.signature = Some(sig.serialize_compact().to_vec());
+    req.signature = Some(sign_recoverable(secp, sig_key, hash));
     cbor_cert_req(&req)
+}
+
+/// Sign a 32-byte digest as the 65-byte `r || s || v` recoverable signature that
+/// bft-go-base's strict verifier requires (low-S is guaranteed by libsecp256k1, v is 0 or 1).
+fn sign_recoverable(
+    secp: &Secp256k1<secp256k1::All>,
+    key: &SecretKey,
+    digest: [u8; 32],
+) -> Vec<u8> {
+    let (rec_id, compact) = secp
+        .sign_ecdsa_recoverable(&Message::from_digest(digest), key)
+        .serialize_compact();
+    let mut sig = Vec::with_capacity(65);
+    sig.extend_from_slice(&compact);
+    sig.push(rec_id.to_i32() as u8);
+    sig
 }
 
 fn reference_time_changed(pinned: u64, current: u64) -> CertRejection {
@@ -1190,17 +1205,32 @@ mod tests {
             .unwrap();
             let mut request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
             assert_eq!(request.shard_id, shard_id);
-            let signature =
-                secp256k1::ecdsa::Signature::from_compact(request.signature.as_ref().unwrap())
-                    .unwrap();
-            request.signature = None;
-            let digest: [u8; 32] = Sha256::digest(cbor_cert_req(&request).unwrap()).into();
-            secp.verify_ecdsa(
-                &Message::from_digest(digest),
-                &signature,
-                &secp256k1::PublicKey::from_secret_key(&secp, &signing_key),
+            let sig = request.signature.clone().unwrap();
+            assert_eq!(sig.len(), 65);
+            assert!(sig[64] <= 1, "v must be 0 or 1");
+            let recoverable = secp256k1::ecdsa::RecoverableSignature::from_compact(
+                &sig[..64],
+                secp256k1::ecdsa::RecoveryId::from_i32(sig[64] as i32).unwrap(),
             )
             .unwrap();
+            // low-S: normalizing must be a no-op
+            let mut normalized = recoverable.to_standard();
+            let before = normalized.serialize_compact();
+            normalized.normalize_s();
+            assert_eq!(
+                before,
+                normalized.serialize_compact(),
+                "signature must be low-S"
+            );
+            request.signature = None;
+            let digest: [u8; 32] = Sha256::digest(cbor_cert_req(&request).unwrap()).into();
+            let recovered = secp
+                .recover_ecdsa(&Message::from_digest(digest), &recoverable)
+                .unwrap();
+            assert_eq!(
+                recovered,
+                secp256k1::PublicKey::from_secret_key(&secp, &signing_key)
+            );
         }
     }
 
