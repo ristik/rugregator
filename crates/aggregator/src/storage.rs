@@ -614,6 +614,30 @@ impl AggregatorState {
 
     // ── Lookups ───────────────────────────────────────────────────────────────
 
+    /// The latest finalized block, the one the "not certified" v2 answer carries (the
+    /// counterpart of aggregator-go's latest finalized UC). `None` before the first block.
+    pub async fn latest_finalized_block(&self) -> Option<BlockInfo> {
+        let next = *self.block_number.read().await;
+        let by_number = next
+            .checked_sub(1)
+            .filter(|n| *n > 0)
+            .and_then(|n| self.blocks.get(&n).map(|b| b.clone()));
+        // The published latest view is a finalized block as well (it is only absent while a
+        // new root is being pinned, when the round counter is the better source).
+        by_number.or_else(|| self.latest_view().map(|v| v.block.clone()))
+    }
+
+    /// Unauthenticated, node-local status hint of a state: `included` (a certified record
+    /// exists), `pending`, `expired` (dropped at its deadline) or `unknown`. Never evidence
+    /// about the state.
+    pub fn proof_status_hint(&self, state_id: &[u8]) -> &'static str {
+        let key = hex::encode(state_id);
+        if self.records.contains_key(&key) {
+            return "included";
+        }
+        self.absence_class(&key)
+    }
+
     pub async fn get_inclusion_proof(
         &self,
         state_id: &[u8],
@@ -658,7 +682,20 @@ impl AggregatorState {
             block.root_hash == snapshot.root_hash(),
             "cannot publish mismatched certified block and SMT snapshot roots"
         );
-        let unsharded = crate::api::cbor::decode_cbor_value(&block.uc_cbor)
+        let decoded = crate::api::cbor::decode_cbor_value(&block.uc_cbor);
+        // A legacy `h''`-root certificate is not the canonical certified empty tree: never publish
+        // it as a (non-inclusion) snapshot. Its bytes stay as they are; reset the stub data
+        // directory to migrate (docs/stub-uc-migration.md).
+        anyhow::ensure!(
+            !(block.root_hash.is_none()
+                && decoded
+                    .as_ref()
+                    .is_ok_and(crate::api::cbor::unicity_certificate_has_legacy_empty_root)),
+            "block {} certifies the empty tree with a legacy empty-byte-string root; it cannot be \
+             served as a canonical certified-empty snapshot",
+            block.block_number
+        );
+        let unsharded = decoded
             .map(|uc| crate::api::cbor::unicity_certificate_is_unsharded(&uc))
             .unwrap_or(false);
         self.catalog().insert(Arc::new(CertifiedProofState {

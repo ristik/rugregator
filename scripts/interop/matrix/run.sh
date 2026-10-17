@@ -18,6 +18,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 OUT="${OUT:-$HERE/results}"; mkdir -p "$OUT"
 server="${1:?usage: run.sh s1|s2 [go] [rust] [js]}"; shift
+tag="$server"; [ "$server" = s1 ] && [ -n "${S1_COLD:-}" ] && tag=s1cold
 clients=("$@"); [ ${#clients[@]} -gt 0 ] || clients=(go rust js)
 export IX_CASES="$HERE/envelope_cases.json" IX_N="${IX_N:-6}"
 
@@ -31,12 +32,33 @@ start_s1() {
     curl -fsS -m 2 -X POST "http://127.0.0.1:$port/" -d '{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{}}' >/dev/null 2>&1 && break
     sleep 0.2
   done
+  # rugregator certifies only rounds that have requests, so a fresh server has no finalized block
+  # until its first certified request, and until then every not-certified v2 lookup gets the typed
+  # `-32008 no_finalized_view` (a hard error for most clients; released JS 3.0.1 is 3/7 cold).
+  # By default the matrix measures the steady state: warm the server with one certification
+  # (`cmd/commitment`; needs `go` and AGG_GO_DIR). The outcome is recorded in $OUT/<tag>-warmup.txt
+  # and a failed requested warm-up fails the run, so a cold run is never reported as warm.
+  # S1_COLD=1 skips the warm-up and writes the cold results as s1cold-<client>.jsonl.
+  if [ -n "${S1_COLD:-}" ]; then
+    echo "cold" > "$OUT/$tag-warmup.txt"
+  elif [ -z "${AGG_GO_DIR:-}" ]; then
+    echo "S1 warm-up: skipped (AGG_GO_DIR unset): results are COLD" >&2
+    echo "skipped" > "$OUT/$tag-warmup.txt"
+  elif (cd "$AGG_GO_DIR" && go run ./cmd/commitment -url "http://127.0.0.1:$port" -timeout 30s -v=false -long-poll=false) >/dev/null 2>&1; then
+    echo "S1 warm-up: ok" >&2
+    echo "ok" > "$OUT/$tag-warmup.txt"
+  else
+    echo "S1 warm-up: FAILED (go/cmd/commitment); refusing to report cold results as warm" >&2
+    echo "failed" > "$OUT/$tag-warmup.txt"
+    stop_s1 warmup-failed
+    exit 1
+  fi
   export IX_URL="http://127.0.0.1:$port" IX_TRUSTBASE="$S1_DIR/trust-base.json" IX_PARTITION=1 IX_RETAINED=32 IX_ROUND_MS=1000
 }
-stop_s1() { [ -n "${S1_PID:-}" ] && kill "$S1_PID" 2>/dev/null; wait "$S1_PID" 2>/dev/null; cp "$S1_DIR/server.log" "$OUT/$server-$1-server.log" 2>/dev/null; S1_PID=; }
+stop_s1() { [ -n "${S1_PID:-}" ] && kill "$S1_PID" 2>/dev/null; wait "$S1_PID" 2>/dev/null; cp "$S1_DIR/server.log" "$OUT/$tag-$1-server.log" 2>/dev/null; S1_PID=; }
 
 run_client() {
-  local c="$1" f="$OUT/$server-$c.jsonl"
+  local c="$1" f="$OUT/$tag-$c.jsonl"
   : > "$f"
   case "$c" in
     go)
@@ -51,7 +73,7 @@ run_client() {
       cp "$HERE/js/InteropMatrixTest.ts" "$SDK_JS_DIR/tests/interop/InteropMatrixTest.ts"
       (cd "$SDK_JS_DIR" && IX_OUT="$f" npx jest --testPathPatterns=tests/interop --coverage=false --runInBand) > "$OUT/$server-$c.stderr" 2>&1 ;;
   esac
-  echo "== $server x $c: $(grep -c '"PASS"' "$f") PASS, $(grep -c '"FAIL"' "$f") FAIL, $(grep -c '"N-A"' "$f") N-A" >&2
+  echo "== $tag x $c: $(grep -c '"PASS"' "$f") PASS, $(grep -c '"FAIL"' "$f") FAIL, $(grep -c '"N-A"' "$f") N-A" >&2
 }
 
 case "$server" in
