@@ -341,6 +341,21 @@ pub(crate) fn unicity_certificate_is_unsharded(value: &Value) -> bool {
 /// BFT payload from reintroducing a second hashing/signature profile through
 /// either proof endpoint. Cryptographic trust-base verification remains the
 /// client's responsibility.
+/// Whether the certificate's input record carries the empty byte string (`h''`) as its state
+/// hash. That is valid CBOR and decodes as an absent root for old stub data, but it is not the
+/// canonical empty-tree representation (native `null`): publishing it as a certified-empty
+/// snapshot would serve non-inclusion proofs that every conforming verifier rejects.
+pub(crate) fn unicity_certificate_has_legacy_empty_root(value: &Value) -> bool {
+    let Ok(uc) = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")
+    else {
+        return false;
+    };
+    let Ok(input) = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord") else {
+        return false;
+    };
+    matches!(&input[4], Value::Bytes(bytes) if bytes.is_empty())
+}
+
 pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8; 32]>, CborError> {
     let uc = versioned_tagged_array(value, UNICITY_CERTIFICATE_TAG, 7, "UnicityCertificate")?;
     let input = versioned_tagged_array(&uc[1], INPUT_RECORD_TAG, 10, "InputRecord")?;
@@ -348,7 +363,10 @@ pub(crate) fn unicity_certificate_state_root(value: &Value) -> Result<Option<[u8
     val_as_u64(&input[2], "InputRecord.epoch")?;
     optional_bytes(&input[3], "InputRecord.previousHash")?;
     let state_root = match &input[4] {
-        Value::Null if round == 0 => None,
+        // The native certified empty tree: `hash` is null (at any round).
+        Value::Null => None,
+        // A legacy empty byte string decodes as "no root" so old data stays readable, but it
+        // is NOT the canonical empty tree: see `unicity_certificate_has_legacy_empty_root`.
         Value::Bytes(bytes) if bytes.is_empty() => None,
         Value::Bytes(bytes) if bytes.len() == 32 => {
             Some(bytes.as_slice().try_into().expect("length checked"))
@@ -831,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_null_input_record_values_after_genesis() {
+    fn a_null_hash_is_the_empty_tree_and_a_null_summary_needs_genesis() {
         let mut uc = canonical_uc();
         let fields = match &mut uc {
             Value::Tag(_, inner) => match inner.as_mut() {
@@ -847,7 +865,8 @@ mod tests {
             _ => unreachable!(),
         };
         fields[4] = Value::Null;
-        assert!(unicity_certificate_state_root(&uc).is_err());
+        // the native certified empty tree, at any round
+        assert_eq!(unicity_certificate_state_root(&uc).unwrap(), None);
 
         let mut uc = canonical_uc();
         let fields = match &mut uc {

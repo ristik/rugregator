@@ -682,7 +682,20 @@ impl AggregatorState {
             block.root_hash == snapshot.root_hash(),
             "cannot publish mismatched certified block and SMT snapshot roots"
         );
-        let unsharded = crate::api::cbor::decode_cbor_value(&block.uc_cbor)
+        let decoded = crate::api::cbor::decode_cbor_value(&block.uc_cbor);
+        // A legacy `h''`-root certificate is not the canonical certified empty tree: never publish
+        // it as a (non-inclusion) snapshot. Its bytes stay as they are; reset the stub data
+        // directory to migrate (docs/stub-uc-migration.md).
+        anyhow::ensure!(
+            !(block.root_hash.is_none()
+                && decoded
+                    .as_ref()
+                    .is_ok_and(crate::api::cbor::unicity_certificate_has_legacy_empty_root)),
+            "block {} certifies the empty tree with a legacy empty-byte-string root; it cannot be \
+             served as a canonical certified-empty snapshot",
+            block.block_number
+        );
+        let unsharded = decoded
             .map(|uc| crate::api::cbor::unicity_certificate_is_unsharded(&uc))
             .unwrap_or(false);
         self.catalog().insert(Arc::new(CertifiedProofState {
