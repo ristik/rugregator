@@ -48,12 +48,15 @@ described in the PR.
 
 ## Existing experimental data
 
-Certificates issued by earlier stub builds (partition 0, or the former default
-partition 1; null `trHash`, epoch 0, zero configuration hash) are **not** repaired in transit: relabelling a
+Certificates issued by earlier stub builds (partition 0, null `trHash`, epoch 0, zero
+configuration hash) are **not** repaired in transit: relabelling a
 signed UC would invalidate its signature, and padding the hash would be a forgery.
 Native verifiers and secure batch clients reject them, and rejecting them is
-correct. The SDKs now accept only the aggregation partition 7, so stub data of the
-former default partition 1 is rejected the same way: reset it, never relabel it.
+correct. The SDKs now accept only the aggregation partition 7, so data certified under
+any other partition (for example the former stub default 1) is rejected by them too:
+reset it, never relabel it. That is not a legacy marker; the aggregator logs it
+separately as a certificate of a partition other than 7 (partition-1 certificates
+of a live BFT Core are native-valid, just not accepted by the SDKs).
 
 The aggregator logs a warning at startup when the latest recovered
 certificate carries a legacy marker (`round::stub_uc::legacy_stub_marker`;
