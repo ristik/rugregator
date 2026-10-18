@@ -225,7 +225,7 @@ Example shard configuration:
 {
   "version": 1,
   "networkId": 3,
-  "partitionId": 1,
+  "partitionId": 7,
   "shardId": "0x80",
   "partitionTypeId": 1,
   "typeIdLength": 8,

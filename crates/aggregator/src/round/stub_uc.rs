@@ -29,9 +29,13 @@ use crate::api::cbor::{
     UNICITY_TREE_CERTIFICATE_TAG,
 };
 
-/// Partition the stub certifies unless configured otherwise. Partition 0 is
-/// never valid.
-pub const DEFAULT_PARTITION_ID: u32 = 1;
+/// Partition the stub certifies unless configured otherwise: the fixed Unicity
+/// aggregation partition (`AGGREGATION_PARTITION_ID` of the SDKs, 7). Partition 0
+/// is never valid.
+pub const DEFAULT_PARTITION_ID: u32 = 7;
+/// The stub's default before the fixed aggregation partition (arch-cd D3). Stub
+/// certificates of this partition are experimental data that needs a reset.
+const RETIRED_DEFAULT_PARTITION_ID: u64 = 1;
 /// `NetworkId::LOCAL` of the SDKs and `NetworkLocal` of bft-go-base.
 pub const NETWORK_ID: u64 = 3;
 /// Epoch of both the shard (input record, technical record) and the root chain
@@ -311,8 +315,8 @@ pub fn generate(p: &StubUcParams<'_>) -> StubUc {
 }
 
 /// Why `uc_cbor` is not a native-valid certificate of the stub profile, if it
-/// is one of the legacy stub certificates (partition 0, null technical-record
-/// hash, epoch 0) issued before this profile. `None` means no legacy marker was
+/// is one of the legacy stub certificates (partition 0 or the retired default 1,
+/// null technical-record hash, epoch 0) issued before this profile. `None` means no legacy marker was
 /// found; it is not a verification result. Real native certificates never carry
 /// these markers, so the check is independent of the BFT mode.
 pub fn legacy_stub_marker(uc_cbor: &[u8]) -> Option<&'static str> {
@@ -328,6 +332,10 @@ pub fn legacy_stub_marker(uc_cbor: &[u8]) -> Option<&'static str> {
         if let Value::Array(utc) = &**utc {
             if matches!(utc.get(1), Some(Value::Integer(i)) if u64::try_from(*i) == Ok(0)) {
                 return Some("partition id is 0");
+            }
+            if matches!(utc.get(1), Some(Value::Integer(i)) if u64::try_from(*i) == Ok(RETIRED_DEFAULT_PARTITION_ID))
+            {
+                return Some("partition id is the retired stub default 1");
             }
         }
     }
@@ -420,6 +428,26 @@ mod tests {
             Some("technical record hash is null")
         );
         assert_eq!(legacy_stub_marker(&[0xaa]), None);
+    }
+
+    /// The default is the fixed aggregation partition, and a certificate of the retired default
+    /// (partition 1) is flagged as old experimental data that needs a reset.
+    #[test]
+    fn the_default_is_the_aggregation_partition_and_the_retired_default_is_flagged() {
+        assert_eq!(DEFAULT_PARTITION_ID, 7);
+        let a = [0xA1; 32];
+        let retired = generate(&StubUcParams {
+            partition_id: 1,
+            ..params(1, None, Some(&a))
+        });
+        assert_eq!(
+            legacy_stub_marker(&retired.cbor),
+            Some("partition id is the retired stub default 1")
+        );
+        assert_eq!(
+            legacy_stub_marker(&generate(&params(1, None, Some(&a))).cbor),
+            None
+        );
     }
 
     #[test]

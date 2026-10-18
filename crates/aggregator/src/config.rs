@@ -91,8 +91,9 @@ pub struct Config {
     pub bft_mode: String,
 
     // ── Live BFT Core connectivity (used when bft_mode = "live") ─────────────
-    /// BFT Core partition ID (u32).
-    #[arg(long, env = "AGGREGATOR_PARTITION_ID", default_value_t = 1)]
+    /// BFT Core partition ID (u32). Defaults to the fixed Unicity aggregation
+    /// partition 7.
+    #[arg(long, env = "AGGREGATOR_PARTITION_ID", default_value_t = 7)]
     pub partition_id: u32,
 
     /// BFT Core shard ID in canonical end-marker encoding (e.g. 0x80 for the default shard).

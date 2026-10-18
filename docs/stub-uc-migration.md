@@ -10,7 +10,7 @@ verifiers to tolerate malformed ones. No verifier is relaxed.
 
 | Field | Value |
 |---|---|
-| partition | `--partition-id` (default **1**); 0 is refused |
+| partition | `--partition-id` (default **7**, the fixed aggregation partition); 0 is refused |
 | shard | the empty shard ID, no sibling hashes (`--shard-id` must be `0x80`) |
 | network / epoch / epoch start | 3 (LOCAL) / 1 / root round 1; shard and root epoch are both 1 |
 | shard round, seal root round | the block number (blocks start at 1, so every seal is at or after the epoch start) |
@@ -48,11 +48,12 @@ described in the PR.
 
 ## Existing experimental data
 
-Certificates issued by earlier stub builds (partition 0, null `trHash`, epoch
-0, zero configuration hash) are **not** repaired in transit: relabelling a
+Certificates issued by earlier stub builds (partition 0, or the former default
+partition 1; null `trHash`, epoch 0, zero configuration hash) are **not** repaired in transit: relabelling a
 signed UC would invalidate its signature, and padding the hash would be a forgery.
 Native verifiers and secure batch clients reject them, and rejecting them is
-correct.
+correct. The SDKs now accept only the aggregation partition 7, so stub data of the
+former default partition 1 is rejected the same way: reset it, never relabel it.
 
 The aggregator logs a warning at startup when the latest recovered
 certificate carries a legacy marker (`round::stub_uc::legacy_stub_marker`;
