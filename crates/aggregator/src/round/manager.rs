@@ -2008,7 +2008,7 @@ mod tests {
 
     fn empty_root_uc() -> Vec<u8> {
         stub_uc::generate(&StubUcParams {
-            partition_id: 1,
+            partition_id: stub_uc::DEFAULT_PARTITION_ID,
             block_number: 1,
             reference_time: 1_755_000_000,
             seal_timestamp: 1_755_000_001,
