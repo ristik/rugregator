@@ -88,7 +88,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --batch-limit 50000
 ```
 
-The stub BFT committer signs its own native-valid UCs (partition `--partition-id`, default 1) with a published test key — no BFT Core process needed. The matching test-only trust anchor is printed by `stub-anchor trust-base`; see [docs/stub-uc-migration.md](docs/stub-uc-migration.md), which also covers resetting data written by earlier stub builds. With no `--db-path` the aggregator runs fully in-memory; state is lost on restart.
+The stub BFT committer signs its own native-valid UCs (partition `--partition-id`, default 7) with a published test key — no BFT Core process needed. The matching test-only trust anchor is printed by `stub-anchor trust-base`; see [docs/stub-uc-migration.md](docs/stub-uc-migration.md), which also covers resetting data written by earlier stub builds. With no `--db-path` the aggregator runs fully in-memory; state is lost on restart.
 
 ### SMT backend selection
 
@@ -141,7 +141,7 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --p2p-addr     /ip4/0.0.0.0/tcp/0 \
   --auth-key-hex <32-byte-hex-secp256k1-auth-key> \
   --sig-key-hex  <32-byte-hex-secp256k1-signing-key> \
-  --partition-id 1 \
+  --partition-id 7 \
   --uc-timeout-ms 15000 \
   --db-path      /var/lib/aggregator/db \
   --smt-backend  disk \
@@ -163,7 +163,7 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--db-path` | `AGGREGATOR_DB_PATH` | _(empty)_ | RocksDB directory; empty = in-memory only |
 | `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, or `disk` |
 | `--cache-mb` | `AGGREGATOR_CACHE_MB` | `0` | RocksDB block cache size in MB (0 = RocksDB default ~8 MB) |
-| `--partition-id` | `AGGREGATOR_PARTITION_ID` | `1` | BFT Core partition ID |
+| `--partition-id` | `AGGREGATOR_PARTITION_ID` | `7` | BFT Core partition ID |
 | `--shard-id` | `AGGREGATOR_SHARD_ID` | `0x80` | Canonical BFT Core shard ID (end-marker hex) |
 | `--bft-peer-id` | `AGGREGATOR_BFT_PEER_ID` | | BFT Core root node peer ID |
 | `--bft-addr` | `AGGREGATOR_BFT_ADDR` | `/ip4/127.0.0.1/tcp/26652` | BFT Core multiaddr |

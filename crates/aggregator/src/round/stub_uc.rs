@@ -33,9 +33,6 @@ use crate::api::cbor::{
 /// aggregation partition (`AGGREGATION_PARTITION_ID` of the SDKs, 7). Partition 0
 /// is never valid.
 pub const DEFAULT_PARTITION_ID: u32 = 7;
-/// The stub's default before the fixed aggregation partition (arch-cd D3). Stub
-/// certificates of this partition are experimental data that needs a reset.
-const RETIRED_DEFAULT_PARTITION_ID: u64 = 1;
 /// `NetworkId::LOCAL` of the SDKs and `NetworkLocal` of bft-go-base.
 pub const NETWORK_ID: u64 = 3;
 /// Epoch of both the shard (input record, technical record) and the root chain
@@ -315,10 +312,12 @@ pub fn generate(p: &StubUcParams<'_>) -> StubUc {
 }
 
 /// Why `uc_cbor` is not a native-valid certificate of the stub profile, if it
-/// is one of the legacy stub certificates (partition 0 or the retired default 1,
-/// null technical-record hash, epoch 0) issued before this profile. `None` means no legacy marker was
+/// is one of the legacy stub certificates (partition 0, null technical-record
+/// hash, epoch 0) issued before this profile. `None` means no legacy marker was
 /// found; it is not a verification result. Real native certificates never carry
-/// these markers, so the check is independent of the BFT mode.
+/// these markers, so the check is independent of the BFT mode. A native-valid
+/// certificate of another partition (for example a live BFT Core partition 1) is
+/// not legacy; see [`foreign_partition`].
 pub fn legacy_stub_marker(uc_cbor: &[u8]) -> Option<&'static str> {
     use ciborium::Value;
     let Value::Tag(_, uc) = crate::api::cbor::decode_cbor_value(uc_cbor).ok()? else {
@@ -333,10 +332,6 @@ pub fn legacy_stub_marker(uc_cbor: &[u8]) -> Option<&'static str> {
             if matches!(utc.get(1), Some(Value::Integer(i)) if u64::try_from(*i) == Ok(0)) {
                 return Some("partition id is 0");
             }
-            if matches!(utc.get(1), Some(Value::Integer(i)) if u64::try_from(*i) == Ok(RETIRED_DEFAULT_PARTITION_ID))
-            {
-                return Some("partition id is the retired stub default 1");
-            }
         }
     }
     if let Some(Value::Tag(_, seal)) = uc.get(6) {
@@ -347,6 +342,30 @@ pub fn legacy_stub_marker(uc_cbor: &[u8]) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The partition of `uc_cbor` when it is not the fixed aggregation partition
+/// ([`DEFAULT_PARTITION_ID`]). Informational only: such a certificate can be native-valid
+/// (a live BFT Core of another partition, or an explicit `--partition-id`), but SDKs that
+/// accept only the aggregation partition reject it.
+pub fn foreign_partition(uc_cbor: &[u8]) -> Option<u64> {
+    use ciborium::Value;
+    let Value::Tag(_, uc) = crate::api::cbor::decode_cbor_value(uc_cbor).ok()? else {
+        return None;
+    };
+    let Value::Array(uc) = *uc else { return None };
+    let Some(Value::Tag(_, utc)) = uc.get(5) else {
+        return None;
+    };
+    let Value::Array(utc) = &**utc else {
+        return None;
+    };
+    match utc.get(1) {
+        Some(Value::Integer(i)) => u64::try_from(*i)
+            .ok()
+            .filter(|p| *p != u64::from(DEFAULT_PARTITION_ID)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -430,24 +449,28 @@ mod tests {
         assert_eq!(legacy_stub_marker(&[0xaa]), None);
     }
 
-    /// The default is the fixed aggregation partition, and a certificate of the retired default
-    /// (partition 1) is flagged as old experimental data that needs a reset.
+    /// The default is the fixed aggregation partition: a valid partition-7 certificate carries
+    /// neither a legacy marker nor a foreign-partition note.
     #[test]
-    fn the_default_is_the_aggregation_partition_and_the_retired_default_is_flagged() {
+    fn a_partition_7_certificate_is_not_flagged() {
         assert_eq!(DEFAULT_PARTITION_ID, 7);
         let a = [0xA1; 32];
-        let retired = generate(&StubUcParams {
+        let uc = generate(&params(1, None, Some(&a)));
+        assert_eq!(legacy_stub_marker(&uc.cbor), None);
+        assert_eq!(foreign_partition(&uc.cbor), None);
+    }
+
+    /// A native-valid certificate of another partition (partition 1 of a live BFT Core, or an
+    /// explicit `--partition-id 1`) is not legacy; it is only reported as a foreign partition.
+    #[test]
+    fn a_partition_1_certificate_is_foreign_not_legacy() {
+        let a = [0xA1; 32];
+        let uc = generate(&StubUcParams {
             partition_id: 1,
             ..params(1, None, Some(&a))
         });
-        assert_eq!(
-            legacy_stub_marker(&retired.cbor),
-            Some("partition id is the retired stub default 1")
-        );
-        assert_eq!(
-            legacy_stub_marker(&generate(&params(1, None, Some(&a))).cbor),
-            None
-        );
+        assert_eq!(legacy_stub_marker(&uc.cbor), None);
+        assert_eq!(foreign_partition(&uc.cbor), Some(1));
     }
 
     #[test]
