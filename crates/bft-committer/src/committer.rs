@@ -447,16 +447,52 @@ impl BftCommitter {
 
         // Sign with secp256k1
         let message = Message::from_digest_slice(&hash)?;
-        let signature = self.secp.sign_ecdsa(&message, &self.config.signing_key);
-        let sig_bytes = signature.serialize_compact();
-
-        Ok(sig_bytes.to_vec())
+        Ok(sign_recoverable(&self.secp, &self.config.signing_key, &message))
     }
+}
+
+/// Sign a digest as the 65-byte `r || s || v` recoverable signature that bft-go-base's strict
+/// verifier requires (low-S is guaranteed by libsecp256k1, v is 0 or 1).
+fn sign_recoverable(
+    secp: &Secp256k1<secp256k1::All>,
+    key: &SecretKey,
+    message: &Message,
+) -> Vec<u8> {
+    let (rec_id, compact) = secp.sign_ecdsa_recoverable(message, key).serialize_compact();
+    let mut sig = Vec::with_capacity(65);
+    sig.extend_from_slice(&compact);
+    sig.push(rec_id.to_i32() as u8);
+    sig
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_is_65_byte_low_s_and_recovers_signer() {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        for i in 0u8..32 {
+            let message = Message::from_digest([i; 32]);
+            let sig = sign_recoverable(&secp, &key, &message);
+            assert_eq!(sig.len(), 65);
+            assert!(sig[64] <= 1);
+            let rec = secp256k1::ecdsa::RecoverableSignature::from_compact(
+                &sig[..64],
+                secp256k1::ecdsa::RecoveryId::from_i32(sig[64] as i32).unwrap(),
+            )
+            .unwrap();
+            let mut std_sig = rec.to_standard();
+            let before = std_sig.serialize_compact();
+            std_sig.normalize_s();
+            assert_eq!(before, std_sig.serialize_compact(), "must be low-S");
+            assert_eq!(
+                secp.recover_ecdsa(&message, &rec).unwrap(),
+                secp256k1::PublicKey::from_secret_key(&secp, &key)
+            );
+        }
+    }
 
     #[test]
     fn test_config_creation() {
