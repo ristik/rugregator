@@ -544,6 +544,14 @@ impl<S: SmtStore> RoundManager<S> {
                  native verifiers and secure batch clients reject it. Reset the stub data \
                  directory (docs/stub-uc-migration.md)"
             );
+        } else if let Some(partition) = stub_uc::foreign_partition(&block.uc_cbor) {
+            warn!(
+                block = block.block_number,
+                partition,
+                "recovered certificate is for partition {partition}, not the aggregation \
+                 partition {}; SDKs that accept only the aggregation partition reject it",
+                stub_uc::DEFAULT_PARTITION_ID
+            );
         }
         let uc_root = match decode_cbor_value(&block.uc_cbor)
             .and_then(|certificate| unicity_certificate_state_root(&certificate))
@@ -2008,7 +2016,7 @@ mod tests {
 
     fn empty_root_uc() -> Vec<u8> {
         stub_uc::generate(&StubUcParams {
-            partition_id: 1,
+            partition_id: stub_uc::DEFAULT_PARTITION_ID,
             block_number: 1,
             reference_time: 1_755_000_000,
             seal_timestamp: 1_755_000_001,
