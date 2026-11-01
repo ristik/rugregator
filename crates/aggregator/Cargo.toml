@@ -97,3 +97,4 @@ zk = ["zk-host/prove"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
