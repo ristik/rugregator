@@ -123,6 +123,12 @@ struct Shared {
 // ─── Parsed UC event ─────────────────────────────────────────────────────────
 
 struct UcEvent {
+    /// CertificationResponse.Partition / .Shard (None when the field is not of the expected type).
+    partition: Option<u64>,
+    shard: Option<Vec<u8>>,
+    /// UnicitySeal.RootChainRoundNumber: advances with every root round, including timeout and
+    /// repeat certificates.
+    root_round: u64,
     /// IR.round_number — 0 for sync (proactive) UCs.
     uc_round: u64,
     /// TechnicalRecord.round — the round number for the next cert request.
@@ -193,7 +199,9 @@ impl Codec for BftCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_uvi(io).await
+        // Requests are only ever read on the inbound UC protocol (the other two are outbound
+        // only): a certification response is a few KiB, so the frame is bounded tightly.
+        read_uvi_limited(io, MAX_UC_FRAME_BYTES).await
     }
     async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Vec<u8>>
     where
@@ -225,11 +233,22 @@ impl Codec for BftCodec {
     }
 }
 
+/// Frame limit of an inbound certification response (aggregator-go bounds a V1 response the same
+/// way). It is checked before any allocation.
+const MAX_UC_FRAME_BYTES: u64 = 256 * 1024;
+
 async fn read_uvi<R: AsyncRead + Unpin + Send>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    read_uvi_limited(r, 10 * 1024 * 1024).await
+}
+
+async fn read_uvi_limited<R: AsyncRead + Unpin + Send>(
+    r: &mut R,
+    max: u64,
+) -> std::io::Result<Vec<u8>> {
     let len = unsigned_varint::aio::read_u64(&mut *r)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if len == 0 || len > 10 * 1024 * 1024 {
+    if len == 0 || len > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad len",
@@ -622,7 +641,26 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
         _ => String::new(),
     };
 
+    let root_round = if uc_arr.len() >= 7 {
+        match strip_tags(&uc_arr[6]) {
+            ciborium::value::Value::Array(seal) if seal.len() >= 3 => {
+                cbor_u64(&seal[2]).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let partition = arr.first().and_then(cbor_u64);
+    let shard = match arr.get(1) {
+        Some(ciborium::value::Value::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    };
+
     Some(UcEvent {
+        partition,
+        shard,
+        root_round,
         uc_round,
         next_round,
         epoch,
@@ -633,6 +671,98 @@ fn parse_uc(data: &[u8]) -> Option<UcEvent> {
         status,
         message,
     })
+}
+
+// ─── Certification-response intake ───────────────────────────────────────────
+
+/// Frames per second and burst accepted from the admitted root peer (token bucket). A root sends
+/// about one UC per root round, so this is far above honest traffic and bounds the CPU a faulty
+/// or hijacked feed can cost (aggregator-go `peerRate`/`peerBurst`).
+const INTAKE_RATE: f64 = 20.0;
+const INTAKE_BURST: f64 = 40.0;
+
+/// Why an inbound certification response was not used.
+#[derive(Debug, PartialEq, Eq)]
+enum IntakeDrop {
+    /// Sent by a peer other than the configured BFT Core root peer. The transport is
+    /// authenticated (noise), so the peer id is not spoofable.
+    NotAdmitted,
+    /// More frames than the peer quota allows.
+    RateLimited,
+    /// Addressed to another partition or shard.
+    WrongPartition,
+    /// A certificate whose root round is behind one already accepted (replay or reordering).
+    StaleRootRound,
+}
+
+/// Admission and sequencing of inbound certification responses. Everything a response may change
+/// (the next round, the reference time, the liveness timer) happens only for a response that
+/// passed this gate.
+///
+/// Not covered: the unicity seal signatures are not verified against a trust base, because the
+/// service has no trust base. The admitted peer, the partition/shard match and the root round
+/// sequence are the checks available without one.
+struct UcIntake {
+    root_peer: PeerId,
+    partition_id: u32,
+    shard_id: Vec<u8>,
+    max_root_round: u64,
+    tokens: f64,
+    refilled: std::time::Instant,
+}
+
+impl UcIntake {
+    fn new(root_peer: PeerId, partition_id: u32, shard_id: Vec<u8>) -> Self {
+        Self {
+            root_peer,
+            partition_id,
+            shard_id,
+            max_root_round: 0,
+            tokens: INTAKE_BURST,
+            refilled: std::time::Instant::now(),
+        }
+    }
+
+    /// Peer admission and quota. Runs before the frame is parsed.
+    fn admit_frame(&mut self, peer: &PeerId, now: std::time::Instant) -> Result<(), IntakeDrop> {
+        if *peer != self.root_peer {
+            return Err(IntakeDrop::NotAdmitted);
+        }
+        let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.refilled = now;
+        self.tokens = (self.tokens + elapsed * INTAKE_RATE).min(INTAKE_BURST);
+        if self.tokens < 1.0 {
+            return Err(IntakeDrop::RateLimited);
+        }
+        self.tokens -= 1.0;
+        Ok(())
+    }
+
+    /// Context and sequence check of a parsed response. Returns whether it advanced the root round:
+    /// only an advance counts as proof of a live feed, so an old certificate replayed by the peer
+    /// cannot suppress the inactivity recovery.
+    ///
+    /// A typed rejection (`status != 0`) wraps the last-good certificate, whose root round is
+    /// legitimately behind: it is not sequence-checked and does not count as liveness of the
+    /// certificate feed.
+    fn check(&mut self, ev: &UcEvent) -> Result<bool, IntakeDrop> {
+        if ev
+            .partition
+            .is_some_and(|p| p != u64::from(self.partition_id))
+            || ev.shard.as_ref().is_some_and(|s| *s != self.shard_id)
+        {
+            return Err(IntakeDrop::WrongPartition);
+        }
+        if ev.status != 0 {
+            return Ok(false);
+        }
+        if ev.root_round < self.max_root_round {
+            return Err(IntakeDrop::StaleRootRound);
+        }
+        let advanced = ev.root_round > self.max_root_round;
+        self.max_root_round = ev.root_round;
+        Ok(advanced)
+    }
 }
 
 // ─── Network loop ─────────────────────────────────────────────────────────────
@@ -755,6 +885,7 @@ async fn network_loop(
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_uc_time = std::time::Instant::now();
+    let mut intake = UcIntake::new(bft_peer, partition_id, shard_id.clone());
 
     loop {
         // `biased` ensures swarm events (including incoming UCs) are always
@@ -778,15 +909,33 @@ async fn network_loop(
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Uc(
                         request_response::Event::Message {
+                            peer,
                             message: request_response::Message::Request { request, channel, .. },
                             ..
                         },
                     )) => {
                         debug!("UC arrived ({} bytes)", request.len());
+                        // Authenticate before anything else: a frame from a peer that is not the
+                        // BFT Core root is dropped unanswered and changes no state, and the
+                        // liveness timer is refreshed only by a response that passed the intake.
+                        if let Err(drop) = intake.admit_frame(&peer, std::time::Instant::now()) {
+                            warn!(%peer, ?drop, "certification response dropped");
+                            continue;
+                        }
                         let _ = swarm.behaviour_mut().uc.send_response(channel, vec![]);
 
-                        last_uc_time = std::time::Instant::now();
                         let ev = match parse_uc(&request) { Some(e) => e, None => continue };
+                        match intake.check(&ev) {
+                            Ok(advanced) => {
+                                if advanced || ev.status != 0 {
+                                    last_uc_time = std::time::Instant::now();
+                                }
+                            }
+                            Err(drop) => {
+                                warn!(%peer, ?drop, root_round = ev.root_round, "certification response dropped");
+                                continue;
+                            }
+                        }
                         info!(uc_round = ev.uc_round, next_round = ev.next_round, epoch = ev.epoch, status = ev.status, "UC received from BFT Core");
 
                         // Always update last_uc from every valid UC.
@@ -1245,6 +1394,102 @@ mod tests {
             let handshake: Handshake = ciborium::from_reader(initial.as_slice()).unwrap();
             assert_eq!(handshake.shard_id, shard_id);
         }
+    }
+
+    fn event(root_round: u64, status: u32) -> UcEvent {
+        UcEvent {
+            partition: Some(7),
+            shard: Some(vec![0x80]),
+            root_round,
+            uc_round: 1,
+            next_round: 2,
+            epoch: 0,
+            prev_hash: None,
+            input_record_timestamp: 0,
+            timestamp: 0,
+            uc_cbor: vec![],
+            status,
+            message: String::new(),
+        }
+    }
+
+    fn intake() -> (UcIntake, PeerId) {
+        let root = PeerId::random();
+        (UcIntake::new(root, 7, vec![0x80]), root)
+    }
+
+    #[test]
+    fn only_the_configured_root_peer_is_admitted() {
+        let (mut intake, root) = intake();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            intake.admit_frame(&PeerId::random(), now),
+            Err(IntakeDrop::NotAdmitted)
+        );
+        assert_eq!(intake.admit_frame(&root, now), Ok(()));
+    }
+
+    #[test]
+    fn the_admitted_peer_is_rate_limited_and_refills() {
+        let (mut intake, root) = intake();
+        let t0 = std::time::Instant::now();
+        for _ in 0..INTAKE_BURST as usize {
+            assert_eq!(intake.admit_frame(&root, t0), Ok(()));
+        }
+        assert_eq!(intake.admit_frame(&root, t0), Err(IntakeDrop::RateLimited));
+        let later = t0 + std::time::Duration::from_secs(1);
+        assert_eq!(intake.admit_frame(&root, later), Ok(()));
+    }
+
+    #[test]
+    fn only_an_advancing_root_round_counts_as_liveness_and_regressions_are_dropped() {
+        let (mut intake, _) = intake();
+        assert_eq!(intake.check(&event(10, 0)), Ok(true));
+        // the same round again (repeat) is used but is not liveness
+        assert_eq!(intake.check(&event(10, 0)), Ok(false));
+        assert_eq!(intake.check(&event(11, 0)), Ok(true));
+        // an old valid certificate replayed
+        assert_eq!(intake.check(&event(9, 0)), Err(IntakeDrop::StaleRootRound));
+        // a typed rejection wraps the last-good (older) certificate: used, not sequenced, not liveness
+        assert_eq!(intake.check(&event(5, 2)), Ok(false));
+        assert_eq!(intake.check(&event(12, 0)), Ok(true));
+    }
+
+    #[test]
+    fn a_response_for_another_partition_or_shard_is_dropped() {
+        let (mut intake, _) = intake();
+        let mut other = event(10, 0);
+        other.partition = Some(8);
+        assert_eq!(intake.check(&other), Err(IntakeDrop::WrongPartition));
+        let mut other = event(10, 0);
+        other.shard = Some(vec![0x40]);
+        assert_eq!(intake.check(&other), Err(IntakeDrop::WrongPartition));
+        // a dropped response does not move the sequence
+        assert_eq!(intake.check(&event(1, 0)), Ok(true));
+    }
+
+    #[test]
+    fn inbound_frames_are_bounded_before_allocation() {
+        let frame = |len: u64| {
+            let mut buf = unsigned_varint::encode::u64_buffer();
+            unsigned_varint::encode::u64(len, &mut buf).to_vec()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut over = futures::io::Cursor::new(frame(MAX_UC_FRAME_BYTES + 1));
+            assert!(read_uvi_limited(&mut over, MAX_UC_FRAME_BYTES)
+                .await
+                .is_err());
+            let mut ok = frame(3);
+            ok.extend_from_slice(&[1, 2, 3]);
+            let mut ok = futures::io::Cursor::new(ok);
+            assert_eq!(
+                read_uvi_limited(&mut ok, MAX_UC_FRAME_BYTES).await.unwrap(),
+                vec![1, 2, 3]
+            );
+        });
     }
 
     #[test]
