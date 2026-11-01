@@ -223,6 +223,9 @@ struct Catalog {
     /// `None` while a newly certified root is being pinned or if publication
     /// failed: latest is then unavailable, never an older view.
     latest: Option<Arc<CertifiedProofState>>,
+    /// Highest block number ever published. Latest never moves to an older block, also not after
+    /// it was made unavailable (a late, older publication must not revive history as latest).
+    head_block: u64,
     stats: CatalogStats,
 }
 
@@ -232,6 +235,7 @@ impl Catalog {
             limits,
             retained: VecDeque::new(),
             latest: None,
+            head_block: 0,
             stats: CatalogStats::default(),
         }
     }
@@ -245,6 +249,7 @@ impl Catalog {
             self.retained.retain(|v| v.block.root_hash != Some(root));
             self.stats.replaced_same_root += (before - self.retained.len()) as u64;
         }
+        self.head_block = self.head_block.max(view.block.block_number);
         self.retained.push_back(Arc::clone(&view));
         self.latest = Some(view);
         self.evict(Instant::now());
@@ -698,12 +703,20 @@ impl AggregatorState {
         let unsharded = decoded
             .map(|uc| crate::api::cbor::unicity_certificate_is_unsharded(&uc))
             .unwrap_or(false);
-        self.catalog().insert(Arc::new(CertifiedProofState {
+        let mut catalog = self.catalog();
+        anyhow::ensure!(
+            block.block_number >= catalog.head_block,
+            "block {} precedes the published head {}; latest does not move back",
+            block.block_number,
+            catalog.head_block
+        );
+        catalog.insert(Arc::new(CertifiedProofState {
             block,
             smt: snapshot,
             unsharded,
             retained_at: Instant::now(),
         }));
+        drop(catalog);
         Ok(())
     }
 
@@ -1440,6 +1453,26 @@ mod tests {
         let view = catalog.retained.back().unwrap();
         assert_eq!(view.block.root_hash, Some(root));
         assert_eq!(view.block.block_number, 2, "one coherent block/UC/snapshot");
+    }
+
+    #[tokio::test]
+    async fn latest_never_moves_back_to_an_older_block() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+        let old = smt.create_certified_snapshot().unwrap();
+        round(&state, &mut smt, &[0x22], 2, &[0x80]);
+        state.clear_certified_snapshot();
+        let old_block = state.catalog().retained.front().unwrap().block.clone();
+        assert_eq!(old_block.block_number, 1);
+        let err = state
+            .publish_certified_snapshot(old_block, old)
+            .unwrap_err();
+        assert!(err.to_string().contains("precedes the published head"));
+        assert!(
+            state.latest_view().is_none(),
+            "no revival of history as latest"
+        );
     }
 
     #[tokio::test]

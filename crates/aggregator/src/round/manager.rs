@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::state::ProcessedRecord;
 use super::stub_uc::{self, StubUcParams};
@@ -372,6 +372,12 @@ pub struct RoundManager<S: SmtStore> {
     proof_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
     /// Data held while a ZK proof is generating.  `None` when not proving.
     proving_data: Option<ProvingRoundData<S>>,
+    /// The committed head could not be pinned or published as the latest proof view (a transient
+    /// failure): the timer retries it while no round is in flight, so the proof service does not
+    /// stay unavailable until the next block.
+    republish_pending: std::sync::atomic::AtomicBool,
+    /// Consecutive failed publication attempts of the current head (only the first is logged loudly).
+    republish_failures: std::sync::atomic::AtomicU32,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -435,6 +441,8 @@ impl<S: SmtStore> RoundManager<S> {
             proof_tx,
             proof_rx,
             proving_data: None,
+            republish_pending: std::sync::atomic::AtomicBool::new(false),
+            republish_failures: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -578,16 +586,35 @@ impl<S: SmtStore> RoundManager<S> {
             self.state.clear_certified_snapshot();
             return;
         }
+        // A legacy `h''`-root certificate is refused for good by the publication: not retried.
+        if block.root_hash.is_none()
+            && decode_cbor_value(&block.uc_cbor)
+                .is_ok_and(|uc| crate::api::cbor::unicity_certificate_has_legacy_empty_root(&uc))
+        {
+            self.note_publish_success();
+            self.state.clear_certified_snapshot();
+            return;
+        }
         match self.smt.create_certified_snapshot() {
             Ok(snapshot) => {
                 if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
-                    error!(err = %error, "failed to publish recovered certified SMT snapshot; \
-                           the certified-snapshot proof service stays unavailable");
+                    if self.note_publish_failure() {
+                        error!(err = %error, "failed to publish recovered certified SMT snapshot; \
+                               the certified-snapshot proof service is unavailable and is retried");
+                    } else {
+                        debug!(err = %error, "retry of the certified SMT snapshot publication failed");
+                    }
                     self.state.clear_certified_snapshot();
+                } else {
+                    self.note_publish_success();
                 }
             }
             Err(error) => {
-                error!(err = %error, "failed to pin recovered certified SMT snapshot");
+                if self.note_publish_failure() {
+                    error!(err = %error, "failed to pin recovered certified SMT snapshot; it is retried");
+                } else {
+                    debug!(err = %error, "retry of pinning the certified SMT snapshot failed");
+                }
                 self.state.clear_certified_snapshot();
             }
         }
@@ -779,7 +806,31 @@ impl<S: SmtStore> RoundManager<S> {
     }
 
     /// Timer tick: either kick off a new round or prepare a speculative one.
+    /// Records a transient failure to publish the committed head's proof view. Returns whether it
+    /// is the first one for this head (the caller logs it loudly; retries stay quiet).
+    fn note_publish_failure(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.republish_pending.store(true, Relaxed);
+        self.republish_failures.fetch_add(1, Relaxed) == 0
+    }
+
+    fn note_publish_success(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.republish_pending.store(false, Relaxed);
+        self.republish_failures.store(0, Relaxed);
+    }
+
     async fn on_timer_tick(&mut self) {
+        // Retry an unavailable latest view of the committed head. Only between rounds: with a
+        // round in flight the committed SMT is not the state the head certified.
+        if self.inflight.is_none()
+            && self.proving_data.is_none()
+            && self
+                .republish_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.publish_current_certified_snapshot().await;
+        }
         match self.inflight.as_ref() {
             None => {
                 if !self.pending.is_empty() {
@@ -1576,9 +1627,11 @@ impl<S: SmtStore> RoundManager<S> {
                 // selecting the old certified view, then pin the new backend
                 // view before any later round can mutate the store again.
                 self.state.clear_certified_snapshot();
+                self.note_publish_success(); // a new head: its own failure history
                 let certified_snapshot = match self.smt.create_certified_snapshot() {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
+                        self.note_publish_failure(); // retried by the timer between rounds
                         error!(
                             block = inf.block_number,
                             err = %error,
@@ -1620,6 +1673,7 @@ impl<S: SmtStore> RoundManager<S> {
                 }
                 if let Some(snapshot) = certified_snapshot {
                     if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
+                        self.note_publish_failure(); // retried by the timer between rounds
                         error!(
                             block = inf.block_number,
                             err = %error,
@@ -2070,5 +2124,72 @@ mod tests {
             )),
             "a canonical null-root snapshot is published and serves the empty-tree proof"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transient_publication_failure_is_retried_between_rounds() {
+        let mut value = decode_cbor_value(&empty_root_uc()).unwrap();
+        {
+            let ciborium::value::Value::Tag(_, inner) = &mut value else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(uc) = &mut **inner else {
+                panic!()
+            };
+            let ciborium::value::Value::Tag(_, ir) = &mut uc[1] else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(f) = &mut **ir else {
+                panic!()
+            };
+            f[4] = ciborium::value::Value::Null;
+        }
+        let uc = crate::api::cbor::encode_cbor_value(&value).unwrap();
+        let (state, mut manager) = recovered_state(uc).await;
+        // the latest view is unavailable after a (simulated) transient failure
+        assert!(manager.note_publish_failure());
+        assert!(
+            !manager.note_publish_failure(),
+            "only the first failure is loud"
+        );
+        assert!(state
+            .get_non_inclusion_proof([7u8; 32])
+            .await
+            .is_ok_and(|r| matches!(
+                r,
+                crate::storage::NonInclusionProofLookup::CertifiedStateUnavailable
+            )));
+        manager.on_timer_tick().await;
+        assert!(
+            state
+                .get_non_inclusion_proof([7u8; 32])
+                .await
+                .is_ok_and(|r| matches!(r, crate::storage::NonInclusionProofLookup::Proof(_))),
+            "the timer republished the committed head"
+        );
+        assert!(!manager
+            .republish_pending
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            manager.note_publish_failure(),
+            "a success resets the failure history"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deterministic_refusal_is_not_retried() {
+        let (state, mut manager) = recovered_state(empty_root_uc()).await; // legacy h'' root
+        manager.publish_current_certified_snapshot().await;
+        assert!(!manager
+            .republish_pending
+            .load(std::sync::atomic::Ordering::Relaxed));
+        manager.on_timer_tick().await;
+        assert!(state
+            .get_non_inclusion_proof([7u8; 32])
+            .await
+            .is_ok_and(|r| matches!(
+                r,
+                crate::storage::NonInclusionProofLookup::CertifiedStateUnavailable
+            )));
     }
 }
