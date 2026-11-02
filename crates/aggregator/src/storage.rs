@@ -725,6 +725,7 @@ impl AggregatorState {
     /// certified root is being pinned and published. Retained views stay
     /// available to exact-root requests, and already-admitted lookups keep
     /// their immutable snapshot, which remains a valid statement about its root.
+    #[cfg(test)]
     pub(crate) fn clear_certified_snapshot(&self) {
         self.catalog().latest = None;
     }
