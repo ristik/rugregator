@@ -24,30 +24,60 @@ use axum::{Extension, Router};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use tokio::io::Interest;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, Sleep};
 use tracing::{debug, warn};
 
 use crate::longpoll::ActiveHandle;
 
-/// Bound on reading a request head (slow-header clients).
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Transport bounds. Each connection costs two descriptors (the socket and the duplicate used by
+/// the close watcher), so `max_connections` also bounds descriptor use.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportConfig {
+    /// Bound on reading a request head (slow-header clients).
+    pub header_read_timeout: Duration,
+    /// Connections served at once. At the bound the loop stops accepting (new peers wait in the
+    /// kernel backlog) until a connection closes.
+    pub max_connections: usize,
+    /// `SO_SNDBUF` of accepted sockets (the kernel default when `None`). Mostly a test hook: a
+    /// small buffer makes write backpressure deterministic.
+    pub send_buffer: Option<usize>,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Duration::from_secs(10),
+            max_connections: 10_000,
+            send_buffer: None,
+        }
+    }
+}
 
 /// Per-connection state shared between the response body and the socket wrapper.
 #[derive(Default)]
 pub struct ConnCtx {
     /// The unit of the global budget of the response being written, and the deadline of that write.
-    pending: Mutex<Option<(ActiveHandle, Instant)>>,
+    pending: Mutex<Option<(Option<ActiveHandle>, Instant)>>,
 }
 
 impl ConnCtx {
-    /// A response is framed and about to be written: hold `handle` until the flush completes or
-    /// `deadline` passes.
-    pub fn arm_write(&self, handle: ActiveHandle, deadline: Instant) {
+    /// A response exists and is about to be written: from the first byte, the write must finish
+    /// by `deadline`; `handle` (if the request holds one) is released when the flush completes
+    /// or the connection closes. Armed when the response is built, before hyper frames or
+    /// flushes anything, so even a body larger than hyper's write buffer (which blocks in
+    /// backpressure before the body is dropped) and replies without a handle are bounded.
+    pub fn arm_write(&self, handle: Option<ActiveHandle>, deadline: Instant) {
         *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some((handle, deadline));
+    }
+
+    /// The armed write deadline, if a response is being written.
+    pub fn armed_deadline(&self) -> Option<Instant> {
+        self.deadline()
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -153,11 +183,19 @@ impl Drop for Io {
     }
 }
 
-/// Resolves when the peer has closed (EOF) or reset the connection. Peeks at a duplicate of the
-/// socket, so nothing is consumed; pending unread data (a pipelined request) is not a close.
+/// Resolves when the peer has closed (EOF/FIN) or reset the connection. Watches a duplicate of
+/// the socket, so nothing is consumed. Close readiness (`EPOLLRDHUP` / `EV_EOF`) stays observable
+/// while unread bytes are queued in front of the FIN, which a peek cannot see: a peek keeps
+/// returning the same unread byte. Unread data is therefore not a close; the peek only
+/// recognises an orderly EOF or an error, and is re-polled at a bounded rate.
 async fn peer_closed(watcher: TcpStream) {
     let mut byte = [0u8; 1];
     loop {
+        match watcher.ready(Interest::READABLE).await {
+            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
         match watcher.peek(&mut byte).await {
             Ok(0) | Err(_) => return,
             Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -186,11 +224,16 @@ impl Server {
     }
 }
 
-/// Serve `router` on `listener`.
+/// Serve `router` on `listener` with the default bounds.
 pub fn spawn(listener: TcpListener, router: Router) -> Server {
+    spawn_with(listener, router, TransportConfig::default())
+}
+
+/// Serve `router` on `listener`.
+pub fn spawn_with(listener: TcpListener, router: Router, config: TransportConfig) -> Server {
     let local_addr = listener.local_addr().expect("listener address");
     let (stop, stop_rx) = watch::channel::<Option<Instant>>(None);
-    let task = tokio::spawn(accept_loop(listener, router, stop_rx));
+    let task = tokio::spawn(accept_loop(listener, router, stop_rx, config));
     Server {
         stop,
         task,
@@ -202,31 +245,60 @@ async fn accept_loop(
     listener: TcpListener,
     router: Router,
     mut stop: watch::Receiver<Option<Instant>>,
+    config: TransportConfig,
 ) -> usize {
     let mut conns: JoinSet<()> = JoinSet::new();
-    let deadline = loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => {
-                    let _ = stream.set_nodelay(true);
-                    conns.spawn(serve_connection(stream, router.clone(), stop.clone()));
-                    debug!(%peer, "connection accepted");
+    let slots = Arc::new(Semaphore::new(config.max_connections.max(1)));
+    let deadline = 'accepting: loop {
+        // A connection slot first: at the bound nothing is accepted.
+        let permit = loop {
+            tokio::select! {
+                p = Arc::clone(&slots).acquire_owned() => break p.expect("slots stay open"),
+                changed = stop.changed() => {
+                    if changed.is_err() {
+                        break 'accepting Instant::now();
+                    }
+                    if let Some(d) = *stop.borrow() {
+                        break 'accepting d;
+                    }
                 }
-                Err(e) => {
-                    // EMFILE and friends: back off instead of spinning.
-                    warn!(err = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            },
-            changed = stop.changed() => {
-                if changed.is_err() {
-                    break Instant::now();
-                }
-                if let Some(d) = *stop.borrow() {
-                    break d;
-                }
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
             }
-            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+        };
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        if let Some(n) = config.send_buffer {
+                            let _ = socket2::SockRef::from(&stream).set_send_buffer_size(n);
+                        }
+                        conns.spawn(serve_connection(
+                            stream,
+                            router.clone(),
+                            stop.clone(),
+                            config,
+                            permit,
+                        ));
+                        debug!(%peer, "connection accepted");
+                        break;
+                    }
+                    Err(e) => {
+                        // EMFILE and friends: back off instead of spinning.
+                        warn!(err = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
+                changed = stop.changed() => {
+                    if changed.is_err() {
+                        break 'accepting Instant::now();
+                    }
+                    if let Some(d) = *stop.borrow() {
+                        break 'accepting d;
+                    }
+                }
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            }
         }
     };
     drop(listener);
@@ -248,6 +320,8 @@ async fn serve_connection(
     stream: TcpStream,
     router: Router,
     mut stop: watch::Receiver<Option<Instant>>,
+    config: TransportConfig,
+    _slot: OwnedSemaphorePermit,
 ) {
     let ctx = Arc::new(ConnCtx::default());
     // A duplicate descriptor for the close watcher (the original belongs to hyper).
@@ -273,7 +347,7 @@ async fn serve_connection(
     let service = TowerToHyperService::new(router.layer(Extension(Arc::clone(&ctx))));
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .header_read_timeout(config.header_read_timeout)
         .serve_connection(io, service);
     tokio::pin!(conn);
     let closed = peer_closed(watcher);

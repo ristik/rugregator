@@ -102,6 +102,8 @@ pub type Gate = Pool;
 /// One unit of a [`Pool`]; released (and capacity-freed signalled) on drop.
 pub struct Permit {
     pool: Arc<Pool>,
+    /// A rolled-back tentative grant: the unit goes back without a capacity-freed signal.
+    silent: bool,
 }
 
 /// A request's unit of the global budget; shared so a worker can outlive the request.
@@ -110,16 +112,18 @@ pub type ActiveHandle = Arc<Permit>;
 impl Drop for Permit {
     fn drop(&mut self) {
         self.pool.used.fetch_sub(1, Ordering::AcqRel);
-        self.pool.freed.notify_waiters();
+        if !self.silent {
+            self.pool.freed.notify_waiters();
+        }
     }
 }
 
 impl Permit {
     /// Return a tentatively granted unit without announcing freed capacity: nobody else could
     /// have used it, and waking contenders for it would make them retry against nothing.
-    pub fn rollback(self) {
-        self.pool.used.fetch_sub(1, Ordering::AcqRel);
-        std::mem::forget(self);
+    pub fn rollback(mut self) {
+        self.silent = true;
+        // dropped here: the unit returns and the owning `Arc<Pool>` is released normally
     }
 }
 
@@ -152,6 +156,7 @@ impl Pool {
                 Ok(_) => {
                     return Some(Permit {
                         pool: Arc::clone(self),
+                        silent: false,
                     })
                 }
                 Err(seen) => cur = seen,
@@ -294,6 +299,10 @@ pub struct Registry {
     gate: Arc<Gate>,
     /// Signalled whenever a unit of the budget, a batch slot or a proof slot is really released.
     freed: Arc<Notify>,
+    /// Serializes the multi-pool resume admission decision, so no resumer ever observes another's
+    /// tentative occupancy (a tentative unit would hide capacity from a contender which then
+    /// sleeps with nothing left to wake it).
+    admit_lock: Mutex<()>,
     quota: Arc<Semaphore>,
     quota_cap: AtomicUsize,
     batch_class: Arc<Semaphore>,
@@ -323,6 +332,7 @@ impl Registry {
             generation: watch::channel(0).0,
             gate: Pool::new(DEFAULT_CONCURRENCY, Arc::clone(&freed)),
             freed,
+            admit_lock: Mutex::new(()),
             quota: Arc::new(Semaphore::new(0)),
             quota_cap: AtomicUsize::new(0),
             batch_class: Arc::new(Semaphore::new(0)),
@@ -372,6 +382,13 @@ impl Registry {
         } else if cap < current {
             let _ = self.batch_class.forget_permits(current - cap);
         }
+    }
+
+    /// The lock under which every tentative multi-pool transaction (a resumer's HTTP + method
+    /// grant, a fresh batch's batch + proof grant) is made, so a silent rollback is never visible
+    /// to a competing waiter. Hold it only across synchronous attempts.
+    pub fn admission_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.admit_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn gate(&self) -> &Arc<Gate> {
@@ -905,18 +922,23 @@ async fn resume_grant(
     loop {
         let notified = reg.freed.notified();
         tokio::pin!(notified);
-        // Registered before the attempt: a release between the attempt and the sleep is not lost.
-        notified.as_mut().enable();
-        if let Some(active) = reg.gate.try_acquire(1) {
-            if let Some(mut permits) = try_pools() {
-                let active = Arc::new(active);
-                permits.keepalive = Some(Arc::clone(&active));
-                let quota = Arc::new(held);
-                permits.holds.push(Box::new(Arc::clone(&quota)));
-                slot.set(Some(active));
-                return Some((permits, quota));
+        {
+            // The whole decision is made under one lock: HTTP unit, then the method pools, with a
+            // silent rollback on refusal. Registered for the wake-up before the attempt (still
+            // under the lock), so a real release between the attempt and the sleep is not lost.
+            let _decision = reg.admission_lock();
+            notified.as_mut().enable();
+            if let Some(active) = reg.gate.try_acquire(1) {
+                if let Some(mut permits) = try_pools() {
+                    let active = Arc::new(active);
+                    permits.keepalive = Some(Arc::clone(&active));
+                    let quota = Arc::new(held);
+                    permits.holds.push(Box::new(Arc::clone(&quota)));
+                    slot.set(Some(active));
+                    return Some((permits, quota));
+                }
+                active.rollback();
             }
-            active.rollback();
         }
         if tokio::time::timeout_at(until, notified).await.is_err() {
             return None;
@@ -1669,5 +1691,86 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
         assert_eq!(reg.request_count("t", "drained"), 1);
         assert_eq!(reg.reserved(), 0);
+    }
+
+    /// A batch resumer which tentatively takes an HTTP unit and then fails its method pool must
+    /// not hide that unit from a concurrent v2 resumer: with two units free the v2 read is
+    /// granted, every time, instead of sleeping until its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_batch_resumer_does_not_starve_a_v2_resumer() {
+        for round in 0..40 {
+            let reg = Arc::new(Registry::new());
+            reg.set_concurrency(8);
+            let batch = reg.new_pool(8);
+            let proof = reg.new_pool(16);
+            let _fresh: Vec<_> = (0..6)
+                .map(|_| reg.gate().acquire_handle().unwrap())
+                .collect();
+            let _batch_full: Vec<_> = (0..8).map(|_| batch.try_acquire(0).unwrap()).collect();
+            let (b2, p2) = (Arc::clone(&batch), Arc::clone(&proof));
+            let try_pools = Arc::new(move || {
+                let b = b2.try_acquire(1)?;
+                let Some(p) = p2.try_acquire(1) else {
+                    b.rollback();
+                    return None;
+                };
+                Some(ReadPermits {
+                    batch: Some(b),
+                    proof: Some(p),
+                    ..Default::default()
+                })
+            });
+            let ready = Arc::new(AtomicBool::new(false));
+            let mk = |class: Class, pools: bool| {
+                let (reg, ready, tp) =
+                    (Arc::clone(&reg), Arc::clone(&ready), Arc::clone(&try_pools));
+                tokio::spawn(async move {
+                    let none_pools = || Some(ReadPermits::default());
+                    let tp2 = move || tp();
+                    let pools_fn: &(dyn Fn() -> Option<ReadPermits> + Send + Sync) =
+                        if pools { &tp2 } else { &none_pools };
+                    run(
+                        &reg,
+                        "t",
+                        class,
+                        Instant::now(),
+                        10_000,
+                        &ActiveSlot::default(),
+                        pools_fn,
+                        || "busy",
+                        |p| {
+                            let ready = Arc::clone(&ready);
+                            async move {
+                                drop(p);
+                                if ready.load(Ordering::SeqCst) {
+                                    Read {
+                                        pending: false,
+                                        value: "done",
+                                    }
+                                } else {
+                                    Read {
+                                        pending: true,
+                                        value: "pending",
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    .0
+                })
+            };
+            let b_task = mk(Class::Batch, true);
+            let v_task = mk(Class::V2, false);
+            until(|| reg.reserved() == 2).await;
+            ready.store(true, Ordering::SeqCst);
+            reg.notify();
+            let v = tokio::time::timeout(Duration::from_millis(1500), v_task)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the v2 resumer starved"))
+                .unwrap();
+            assert_eq!(v, "done", "round {round}");
+            b_task.abort();
+        }
     }
 }

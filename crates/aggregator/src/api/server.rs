@@ -92,34 +92,6 @@ fn set_cors(headers: &mut axum::http::HeaderMap, methods: &'static str) {
     );
 }
 
-/// A response body which keeps the request's unit of the global budget until the transport has
-/// written it: hyper drops the body once it is framed, and the connection (`transport.rs`) then
-/// releases the unit when the socket write has completed (or the write deadline passed).
-struct HeldBody {
-    data: Option<Bytes>,
-    held: Option<ActiveHandle>,
-    conn: Option<Arc<ConnCtx>>,
-    write_deadline: Instant,
-}
-
-impl futures::Stream for HeldBody {
-    type Item = Result<Bytes, std::convert::Infallible>;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        std::task::Poll::Ready(self.data.take().map(Ok))
-    }
-}
-
-impl Drop for HeldBody {
-    fn drop(&mut self) {
-        if let (Some(handle), Some(conn)) = (self.held.take(), self.conn.as_ref()) {
-            conn.arm_write(handle, self.write_deadline);
-        }
-    }
-}
-
 /// One complete JSON body with its `Content-Length`, `Cache-Control: no-store` (proof, status and
 /// error answers change over time: proxies and caches must not keep them), and the CORS headers;
 /// every `503` also carries `Retry-After: 1`. The single response path of the JSON-RPC route.
@@ -131,12 +103,12 @@ fn json_response(
     write_deadline: Instant,
 ) -> Response {
     let length = text.len();
-    let mut response = Response::new(axum::body::Body::from_stream(HeldBody {
-        data: Some(Bytes::from(text)),
-        held,
-        conn,
-        write_deadline,
-    }));
+    // Armed before the first byte is framed or flushed: the write deadline applies to a large
+    // chunk in socket backpressure and to replies which hold no budget unit alike.
+    if let Some(conn) = conn.as_ref() {
+        conn.arm_write(held, write_deadline);
+    }
+    let mut response = Response::new(axum::body::Body::from(Bytes::from(text)));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(
@@ -348,56 +320,67 @@ pub async fn dispatch_with(
     let mut v2_wait = None;
     if env.method == "get_inclusion_proof.v2" {
         let raw_params = env.params.map(|p| p.get()).unwrap_or("");
-        let scan = scan_wait_ms(raw_params);
-        // Once the params object is recognised as wait-bearing (a `waitMs` member is present,
-        // valid or not), its handled errors carry `error.data.waitedMs: 0`.
-        let wait_error = |id: serde_json::Value, e: JsonRpcError| {
-            (StatusCode::OK, error_text(id, echo_zero(e, scan)))
+        // A cheap substring test first: requests which cannot carry the member are not scanned.
+        let scan = if raw_params.contains("waitMs") || raw_params.contains("\\u") {
+            scan_wait_ms(raw_params)
+        } else {
+            WaitScan::Absent
         };
-        match scan {
-            WaitScan::Absent => {}
-            WaitScan::Invalid => {
-                // Not a wait, but a wait-bearing object: the validation code, with the echo.
-                return wait_error(
-                    id,
-                    JsonRpcError::validation(format!(
-                        "Invalid parameters: waitMs must be a non-negative integer no greater than {}",
-                        crate::longpoll::MAX_WAIT_MS
-                    )),
-                );
-            }
-            WaitScan::Valid(w) => {
-                // Opt-in requests are bounded like the batch method: 64 KiB request, 32 KiB
-                // params, 128 encoded ID bytes.
-                if body.len() > batch_limits::MAX_REQUEST_BYTES {
-                    return wait_error(
+        if scan != WaitScan::Absent {
+            // Opt-in requests (valid wait or not) are bounded like the batch method, before any
+            // value validation: 64 KiB request, 32 KiB params, 128 encoded ID bytes. A preflight
+            // rejection carries no echo.
+            if body.len() > batch_limits::MAX_REQUEST_BYTES {
+                return (
+                    StatusCode::OK,
+                    error_text(
                         serde_json::Value::Null,
                         JsonRpcError::limit_exceeded(
                             "request_bytes",
                             batch_limits::MAX_REQUEST_BYTES,
                         ),
-                    );
-                }
-                if !valid_raw_id(env.id) {
-                    return (
-                        StatusCode::OK,
-                        error_text(
-                            serde_json::Value::Null,
-                            JsonRpcError::invalid_request_detail("invalid_id"),
-                        ),
-                    );
-                }
-                if raw_params.len() > batch_limits::MAX_PARAMS_BYTES {
-                    return wait_error(
+                    ),
+                );
+            }
+            if !valid_raw_id(env.id) {
+                return (
+                    StatusCode::OK,
+                    error_text(
+                        serde_json::Value::Null,
+                        JsonRpcError::invalid_request_detail("invalid_id"),
+                    ),
+                );
+            }
+            if raw_params.len() > batch_limits::MAX_PARAMS_BYTES {
+                return (
+                    StatusCode::OK,
+                    error_text(
                         id,
                         JsonRpcError::limit_exceeded(
                             "request_bytes",
                             batch_limits::MAX_PARAMS_BYTES,
                         ),
-                    );
-                }
-                v2_wait = Some(w);
+                    ),
+                );
             }
+        }
+        match scan {
+            WaitScan::Absent => {}
+            WaitScan::Invalid => {
+                // Not a wait, but a wait-bearing object: the validation code, with the zero echo.
+                return (
+                    StatusCode::OK,
+                    error_text(
+                        id,
+                        JsonRpcError::validation(format!(
+                            "Invalid parameters: waitMs must be a non-negative integer no greater than {}",
+                            crate::longpoll::MAX_WAIT_MS
+                        ))
+                        .with_waited(0),
+                    ),
+                );
+            }
+            WaitScan::Valid(w) => v2_wait = Some(w),
         }
     }
 
@@ -474,18 +457,15 @@ async fn dispatch_batch(
     if env.jsonrpc != "2.0" || env.method.is_empty() || trailing {
         return invalid_envelope();
     }
-    // A `waitMs` member makes the params object wait-bearing: method-level rejections echo 0.
+    // Request, ID and params-size preflight rejections never carry the long-poll echo, whatever
+    // the params hold; the echo starts with value validation, inside the handler.
     let raw_params = env.params.map(|p| p.get()).unwrap_or("");
-    let scan = scan_wait_ms(raw_params);
     if body.len() > batch_limits::MAX_REQUEST_BYTES {
         return (
             StatusCode::OK,
             error_text(
                 id,
-                echo_zero(
-                    JsonRpcError::limit_exceeded("request_bytes", batch_limits::MAX_REQUEST_BYTES),
-                    scan,
-                ),
+                JsonRpcError::limit_exceeded("request_bytes", batch_limits::MAX_REQUEST_BYTES),
             ),
         );
     }
@@ -503,10 +483,7 @@ async fn dispatch_batch(
             StatusCode::OK,
             error_text(
                 id,
-                echo_zero(
-                    JsonRpcError::limit_exceeded("request_bytes", batch_limits::MAX_PARAMS_BYTES),
-                    scan,
-                ),
+                JsonRpcError::limit_exceeded("request_bytes", batch_limits::MAX_PARAMS_BYTES),
             ),
         );
     }
@@ -856,10 +833,9 @@ mod tests {
         )
         .await;
         assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
-        assert_eq!(
-            r["error"]["data"]["waitedMs"],
-            json!(0),
-            "method-level size rejection of a wait-bearing request echoes"
+        assert!(
+            r["error"]["data"].get("waitedMs").is_none(),
+            "preflight rejections carry no echo"
         );
         assert_eq!(r["id"], Value::Null);
         let (_, r) = call(&state, json!({"jsonrpc":"2.0","id":{"a":1},"method":"get_inclusion_proof.v2","params":{"stateId": id, "waitMs": 1}})).await;
@@ -873,8 +849,26 @@ mod tests {
             r["error"]["data"]["limit"],
             json!(batch_limits::MAX_PARAMS_BYTES)
         );
-        assert_eq!(r["error"]["data"]["waitedMs"], json!(0));
-        // the same limits on the batch method echo for a wait-bearing object, and only then
+        assert!(r["error"]["data"].get("waitedMs").is_none());
+        // an invalid wait is bounded by the same preflight, before its value is validated
+        let (_, r) = call(
+            &state,
+            v2(json!({"stateId": id, "waitMs": -1, "pad": "a".repeat(40_000)})),
+        )
+        .await;
+        assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
+        assert!(r["error"]["data"].get("waitedMs").is_none());
+        let (_, r) = call(
+            &state,
+            v2(json!({"stateId": id, "waitMs": "x", "pad": "a".repeat(70_000)})),
+        )
+        .await;
+        assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
+        assert!(r["error"]["data"].get("waitedMs").is_none());
+        // ... and an invalid wait inside the limits still echoes zero (validation, not preflight)
+        let (_, r) = call(&state, v2(json!({"stateId": id, "waitMs": -1}))).await;
+        assert_eq!(r["error"]["data"], json!({"waitedMs": 0}));
+        // the same limits on the batch method never echo
         let big = |extra: Value| {
             let mut p = json!({"stateIds": [id], "pad": "a".repeat(40_000)});
             p.as_object_mut()
@@ -884,7 +878,10 @@ mod tests {
         };
         let (_, r) = call(&state, big(json!({"waitMs": 5}))).await;
         assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
-        assert_eq!(r["error"]["data"]["waitedMs"], json!(0));
+        assert!(r["error"]["data"].get("waitedMs").is_none());
+        let (_, r) = call(&state, big(json!({"waitMs": -1}))).await;
+        assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
+        assert!(r["error"]["data"].get("waitedMs").is_none());
         let (_, r) = call(&state, big(json!({}))).await;
         assert!(r["error"]["data"].get("waitedMs").is_none());
         // without waitMs the legacy path stays unbounded by the opt-in limits
@@ -1415,5 +1412,90 @@ mod tests {
         let (status, text) = dispatch(state, b"{not json").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text.contains("-32700"));
+    }
+
+    /// Replays the stateless error cases of aggregator-go's revision-4 echo corpus (#271): every
+    /// validation error of a wait-bearing call echoes zero (invalid, duplicate, escaped and
+    /// reordered `waitMs` included); preflight rejections do not. Cases which need server state
+    /// (pending, included, busy, ...) are covered by the integration tests.
+    #[tokio::test]
+    async fn echo_corpus_validation_and_preflight_cases_match_the_server() {
+        let corpus: Value =
+            serde_json::from_str(include_str!("../../testdata/longpoll/echo.json")).unwrap();
+        let (state, root) = serving_state(&[0x11]);
+        state.finalize_block(BlockInfo {
+            block_number: 1,
+            root_hash: Some(root),
+            uc_cbor: test_uc_cbor(Some(root), &[0x80], 0),
+        });
+        let stateless = |name: &str| {
+            name.contains("error-validation")
+                || name.contains("error-invalid-wait")
+                || name.contains("validation-error-with-recognized-wait")
+                || name.contains("unknown-member-with-valid-wait")
+                || name.contains("exact-root-with-wait")
+                || name.contains("batch/invalid-wait")
+        };
+        let mut replayed = 0;
+        for case in corpus["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            if !stateless(name) {
+                continue;
+            }
+            let req = &case["request"];
+            let body = if let Some(raw) = case.get("rawRequest").and_then(|r| r.as_str()) {
+                raw.to_owned()
+            } else if let Some(raw) = case.get("rawParams").and_then(|r| r.as_str()) {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":{},"params":{raw}}}"#,
+                    req["id"], req["method"]
+                )
+            } else {
+                req.to_string()
+            };
+            let (_, text) = dispatch(Arc::clone(&state), body.as_bytes()).await;
+            let got: Value = serde_json::from_str(&text).unwrap();
+            let want = &case["response"];
+            assert_eq!(got["id"], want["id"], "{name}");
+            assert_eq!(
+                got["error"]["code"], want["error"]["code"],
+                "{name}: {text}"
+            );
+            assert_eq!(
+                got["error"]["data"], want["error"]["data"],
+                "{name}: {text}"
+            );
+            if req["method"] == json!("get_inclusion_proofs.v1") {
+                assert_eq!(got["error"]["message"], want["error"]["message"], "{name}");
+            }
+            replayed += 1;
+        }
+        // the exact intended set: 5 v2 validation/invalid-wait echoes + 4 more v2 spellings, the
+        // batch validation cases and the two no-echo preflight cases (19 in revision 4)
+        assert_eq!(replayed, 19, "corpus cases replayed");
+    }
+
+    /// The write deadline is armed when the response is built, whether or not the request holds a
+    /// budget unit (an overload refusal holds none) and before anything is framed or flushed.
+    #[test]
+    fn every_response_arms_its_write_deadline_with_or_without_a_unit() {
+        let ctx = Arc::new(ConnCtx::default());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let _r = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}".into(),
+            None,
+            Some(Arc::clone(&ctx)),
+            deadline,
+        );
+        assert_eq!(ctx.armed_deadline(), Some(deadline));
+        let ctx2 = Arc::new(ConnCtx::default());
+        let big = "x".repeat(2 << 20);
+        let _r = json_response(StatusCode::OK, big, None, Some(Arc::clone(&ctx2)), deadline);
+        assert_eq!(
+            ctx2.armed_deadline(),
+            Some(deadline),
+            "a large body is armed before it is polled"
+        );
     }
 }

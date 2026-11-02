@@ -107,6 +107,8 @@ fn request_t(seed: u8, timeout: u64) -> ValidatedRequest {
 struct Net {
     state: Arc<AggregatorState>,
     bft: Arc<Gated>,
+    rm_stop: Arc<tokio::sync::Notify>,
+    rm: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// A running round manager over an in-memory SMT; the first block is already certified.
@@ -129,11 +131,17 @@ async fn net_with(round_ms: u64) -> Net {
         Arc::clone(&state),
         Arc::clone(&bft) as Arc<dyn BftCommitter>,
     );
-    tokio::spawn(rm.run());
+    let rm_stop = rm.shutdown_notify();
+    let rm = tokio::spawn(rm.run());
     state.submit_request(request(0x01)).await.unwrap();
     bft.permits.add_permits(1);
     until(|| state.longpoll().notify_count() >= 1).await;
-    Net { state, bft }
+    Net {
+        state,
+        bft,
+        rm_stop,
+        rm: Some(rm),
+    }
 }
 
 async fn until(mut f: impl FnMut() -> bool) {
@@ -298,6 +306,23 @@ async fn timeout_returns_the_ordinary_pending_answer_with_the_echo() {
 
 // ─── HTTP over TCP ───────────────────────────────────────────────────────────
 
+fn tuned_listener(rcv: usize, snd: usize) -> tokio::net::TcpListener {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    sock.set_recv_buffer_size(rcv).unwrap();
+    sock.set_send_buffer_size(snd).unwrap();
+    sock.bind(
+        &"127.0.0.1:0"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+    )
+    .unwrap();
+    sock.listen(128).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    tokio::net::TcpListener::from_std(sock.into()).unwrap()
+}
+
 async fn serve(
     state: Arc<AggregatorState>,
 ) -> (
@@ -306,6 +331,17 @@ async fn serve(
     tokio::task::JoinHandle<()>,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_on(listener, state).await
+}
+
+async fn serve_on(
+    listener: tokio::net::TcpListener,
+    state: Arc<AggregatorState>,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let server = uni_aggregator::api::transport::spawn(listener, build_router(state));
     let addr = server.local_addr;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -676,4 +712,329 @@ async fn legacy_batch_busy_stays_200_and_a_wait_bearing_one_is_503() {
     drop(h);
     let _ = stop.send(());
     server.await.unwrap();
+}
+
+// ─── response write deadline, pipelined close, transport bounds, shutdown failure paths ────────
+
+fn fd_count() -> usize {
+    std::fs::read_dir(if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    })
+    .map(|d| d.count())
+    .unwrap_or(0)
+}
+
+fn request16(i: u16) -> ValidatedRequest {
+    let mut r = request(0);
+    let mut sid = [0u8; 32];
+    sid[..2].copy_from_slice(&i.to_be_bytes());
+    sid[2] = 0xee;
+    r.state_id = sid.to_vec();
+    r.state_id_hex = hex::encode(sid);
+    r
+}
+
+/// Certify many states with 2-byte ids: a deeper tree, so larger proofs.
+async fn certify16(n: &Net, count: u16) {
+    for i in 0..count {
+        n.state.submit_request(request16(i)).await.unwrap();
+    }
+    n.bft.permits.add_permits(64);
+    for i in 0..count {
+        let id = hex::decode(request16(i).state_id_hex).unwrap();
+        until(|| n.state.proof_status_hint(&id) == "included").await;
+    }
+}
+
+fn batch_body16(count: u16) -> String {
+    let ids: Vec<String> = (0..count).map(|i| request16(i).state_id_hex).collect();
+    json!({"jsonrpc":"2.0","id":2,"method":"get_inclusion_proofs.v1","params":{"stateIds": ids}})
+        .to_string()
+}
+
+/// Certify `seeds` (many at once) so a batch response can be large.
+async fn certify(n: &Net, seeds: &[u8]) {
+    for &s in seeds {
+        n.state.submit_request(request(s)).await.unwrap();
+    }
+    n.bft.permits.add_permits(32);
+    for &s in seeds {
+        let id = [s; 32];
+        until(|| n.state.proof_status_hint(&id) == "included").await;
+    }
+}
+
+fn client_socket(addr: std::net::SocketAddr, rcvbuf: usize) -> tokio::net::TcpSocket {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(rcvbuf as u32).unwrap();
+    let _ = addr;
+    sock
+}
+
+#[tokio::test]
+async fn a_large_response_to_a_slow_reader_is_cut_at_its_write_deadline() {
+    let n = net().await;
+    let reg = Arc::clone(n.state.longpoll());
+    certify16(&n, 600).await;
+    let (_, probe) = dispatch(Arc::clone(&n.state), batch_body16(256).as_bytes()).await;
+    // one body chunk larger than hyper's 417,792-byte write-buffer threshold
+    assert!(
+        probe.len() > 417_792,
+        "the answer must exceed hyper's write buffer: {} bytes: {}",
+        probe.len(),
+        &probe[..probe.len().min(200)]
+    );
+    reg.set_budget(Duration::from_millis(1500));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = uni_aggregator::api::transport::spawn_with(
+        listener,
+        build_router(Arc::clone(&n.state)),
+        uni_aggregator::api::transport::TransportConfig {
+            send_buffer: Some(4096),
+            ..Default::default()
+        },
+    );
+    let addr = server.local_addr;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let _ = rx.await;
+        server.shutdown(Duration::from_secs(5)).await;
+    });
+    // A reader which never reads, with a tiny receive window and a 4 KiB send buffer: the answer
+    // (one body chunk above hyper's write-buffer threshold) blocks in socket backpressure before
+    // the body is ever dropped. The write deadline was armed when the response was built.
+    let mut s = client_socket(addr, 1024).connect(addr).await.unwrap();
+    let body = batch_body16(256);
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let t0 = std::time::Instant::now();
+    until(|| reg.gate().in_use() == 1).await;
+    until(|| reg.gate().in_use() == 0).await;
+    let held = t0.elapsed();
+    assert!(
+        held >= Duration::from_millis(800) && held < Duration::from_secs(6),
+        "the unit is held through the blocked write and released at the deadline: {held:?}"
+    );
+    // The connection was closed by the server: reading ends before the whole answer arrived.
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 65536];
+    while let Ok(Ok(k)) = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf)).await {
+        if k == 0 {
+            break;
+        }
+        total += k;
+    }
+    assert!(total < probe.len(), "{total} of {} bytes", probe.len());
+    let _ = stop.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn pipelined_data_beyond_a_read_buffer_does_not_hide_a_fin_or_an_rst() {
+    for rst in [false, true] {
+        let n = net().await;
+        let reg = Arc::clone(n.state.longpoll());
+        n.state.submit_request(request(0xa1)).await.unwrap();
+        // The server's receive buffer (inherited by accepted sockets) holds everything the client
+        // sends, so the FIN really reaches the server behind bytes it has not read: TCP delivers
+        // a FIN only after the data before it, and a full window would keep it on the client.
+        let (addr, stop, server) =
+            serve_on(tuned_listener(4 << 20, 1 << 16), Arc::clone(&n.state)).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let one = v2_body(0xa1, json!({"waitMs": 15000}));
+        let one = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{one}",
+            one.len()
+        );
+        s.write_all(one.as_bytes()).await.unwrap();
+        until(|| reg.reserved() == 1).await;
+        // Far more pipelined requests than hyper buffers (about 400 KiB) or the socket holds.
+        let more = (0..4_000).map(|_| one.as_str()).collect::<String>();
+        assert!(more.len() > 800_000);
+        tokio::time::timeout(Duration::from_secs(5), s.write_all(more.as_bytes()))
+            .await
+            .expect("the data fits the server's receive buffer")
+            .unwrap();
+        if rst {
+            socket2::SockRef::from(&s)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(s);
+        } else {
+            // FIN behind unread bytes; the socket stays open
+            socket2::SockRef::from(&s)
+                .shutdown(std::net::Shutdown::Write)
+                .unwrap();
+        }
+        until(|| reg.reserved() == 0).await;
+        assert_eq!(reg.gate().in_use(), 0, "rst={rst}");
+        let _ = stop.send(());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transport_returns_descriptors_keeps_alive_and_bounds_connections() {
+    let n = net().await;
+    let reg = Arc::clone(n.state.longpoll());
+    let base = fd_count();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = uni_aggregator::api::transport::spawn_with(
+        listener,
+        build_router(Arc::clone(&n.state)),
+        uni_aggregator::api::transport::TransportConfig {
+            header_read_timeout: Duration::from_millis(1500),
+            max_connections: 3,
+            send_buffer: None,
+        },
+    );
+    let addr = server.local_addr;
+    let height = r#"{"jsonrpc":"2.0","id":9,"method":"get_block_height","params":{}}"#;
+    let post = |body: &str| {
+        format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+
+    // sequential keep-alive on one connection
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    for _ in 0..3 {
+        s.write_all(post(height).as_bytes()).await.unwrap();
+        let (st, body) = read_one(&mut s).await;
+        assert_eq!(st, 200, "{body}");
+    }
+    // early rejection (global budget exhausted: refused before its body is read), then reuse
+    let h: Vec<_> = (0..reg.gate().limit())
+        .map(|_| reg.gate().acquire_handle().unwrap())
+        .collect();
+    s.write_all(post(height).as_bytes()).await.unwrap();
+    assert_eq!(read_one(&mut s).await.0, 503);
+    drop(h);
+    s.write_all(post(height).as_bytes()).await.unwrap();
+    assert_eq!(
+        read_one(&mut s).await.0,
+        200,
+        "the connection is reusable after an early rejection"
+    );
+
+    // the connection bound: with 3 slots taken (s and two idle ones), a fourth waits in the backlog
+    let idle = TcpStream::connect(addr).await.unwrap();
+    let idle2 = TcpStream::connect(addr).await.unwrap();
+    until(|| true).await;
+    let mut fourth = TcpStream::connect(addr).await.unwrap();
+    fourth.write_all(post(height).as_bytes()).await.unwrap();
+    let waited = tokio::time::timeout(Duration::from_millis(400), read_one(&mut fourth)).await;
+    assert!(waited.is_err(), "not served while the bound is reached");
+    drop(idle);
+    let (st, _) = tokio::time::timeout(Duration::from_secs(5), read_one(&mut fourth))
+        .await
+        .expect("served once a slot is free");
+    assert_eq!(st, 200);
+    drop((idle2, s, fourth));
+
+    // slow headers are cut by the header timeout
+    let mut slow = TcpStream::connect(addr).await.unwrap();
+    slow.write_all(b"POST / HTTP/1.1\r\nHost:").await.unwrap();
+    let mut buf = [0u8; 64];
+    let r = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut buf)).await;
+    assert!(
+        matches!(r, Ok(Ok(_)) | Ok(Err(_))),
+        "closed or answered, not hanging: {r:?}"
+    );
+    drop(slow);
+
+    // descriptors come back on close, and the listener's on shutdown
+    server.shutdown(Duration::from_secs(2)).await;
+    let mut back = false;
+    for _ in 0..100 {
+        if fd_count() <= base + 2 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(back, "descriptors {} vs baseline {base}", fd_count());
+}
+
+async fn read_one(s: &mut TcpStream) -> (u16, String) {
+    let mut buf = Vec::new();
+    loop {
+        let mut chunk = [0u8; 4096];
+        let k = s.read(&mut chunk).await.unwrap();
+        if k == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..k]);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if let Some(i) = text.find("\r\n\r\n") {
+            let len: usize = text[..i]
+                .to_lowercase()
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            if text.len() >= i + 4 + len {
+                let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+                return (status, text[i + 4..].to_string());
+            }
+        }
+    }
+    panic!("connection closed before a full response");
+}
+
+#[tokio::test]
+async fn shutdown_failure_paths_do_not_claim_success_or_close_storage_under_work() {
+    use uni_aggregator::lifecycle::{
+        drain_http, stop_round_manager, ShutdownError, ShutdownLimits,
+    };
+    let mut n = net().await;
+    let limits = ShutdownLimits {
+        grace: Duration::from_millis(200),
+        workers: Duration::from_millis(300),
+        round_manager: Duration::from_millis(300),
+    };
+    // Work which has not acknowledged completion: a batch slot is still held when the grace
+    // has passed. The sequence fails and the round manager is left running (storage stays up).
+    let held = n.state.batch_pool().try_acquire(0).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server =
+        uni_aggregator::api::transport::spawn(listener, build_router(Arc::clone(&n.state)));
+    let err = drain_http(server, &n.state, limits).await.unwrap_err();
+    assert!(
+        matches!(err, ShutdownError::WorkersBusy { batches: 1, .. }),
+        "{err:?}"
+    );
+    assert!(
+        !n.rm.as_ref().unwrap().is_finished(),
+        "the round manager is not stopped under busy workers"
+    );
+    // ... and completes once the work acknowledges.
+    drop(held);
+    assert!(
+        n.state
+            .wait_workers_idle(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+    );
+
+    // A round manager which does not stop: a timeout is an error, the task stays with the caller.
+    let mut stuck = tokio::spawn(std::future::pending::<()>());
+    let err = stop_round_manager(&n.rm_stop, &mut stuck, Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    assert_eq!(err, ShutdownError::RoundManagerStuck);
+    assert!(!stuck.is_finished());
+    stuck.abort();
+    // The real one stops and persists.
+    let mut rm = n.rm.take().unwrap();
+    stop_round_manager(&n.rm_stop, &mut rm, Duration::from_secs(5))
+        .await
+        .unwrap();
 }

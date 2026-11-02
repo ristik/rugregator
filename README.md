@@ -270,8 +270,10 @@ final read (v2: the empty proof; batch: `-32008 state_pending`).
 * Without `waitMs` every byte is as before (including HTTP 200 for the batch method's `-32006`).
   With it, v2 returns `{"proof","waitedMs"}` (plus `"status"` iff `includeStatus:true`); the batch
   result gains `waitedMs`, and handled errors carry `error.data.waitedMs`. Once a params object
-  carries a `waitMs` member (valid or not) its validation errors and method-level size rejections
-  echo `0`. A present `0` returns the echo without waiting. `waitedMs` is the ceiling of the time
+  carries a `waitMs` member (valid or not: null, negative, duplicate, escaped spelling, any order)
+  every validation error of the method echoes `0`. The request-size (64 KiB), params-size (32 KiB)
+  and ID (128-byte) preflight runs first, also for an invalid wait, and its rejections carry no
+  echo (corpus: aggregator-go#271, `crates/aggregator/testdata/longpoll/echo.json`). A present `0` returns the echo without waiting. `waitedMs` is the ceiling of the time
   spent waiting and is unauthenticated metadata: always verify the proof.
 * A batch waits for all entries; any unknown or expired entry ends the wait at once. An exact
   `stateRoot` with any `waitMs` is `-32602 malformed_params`. Opt-in requests are bounded to
@@ -292,12 +294,23 @@ final read (v2: the empty proof; batch: `-32008 state_pending`).
   for fresh requests. Batch and non-inclusion proof work runs on a dedicated worker which owns the
   slots and the request's budget unit until it has stopped: a client that disconnects, or a request
   whose deadline passes, only cancels the work (the worker stops at the next key or node read).
-* **Disconnects.** A closed connection (EOF or RST, also with a pipelined request buffered behind
-  the waiting one) drops all its requests at once. HTTP/2 is not enabled; its stream-reset
-  cancellation must be tested before it is.
+* **Disconnects.** A watcher on a duplicate of each socket reacts to the kernel's close/hangup
+  readiness (not to a peek), so an EOF or RST cancels the connection's requests also while a
+  pipelined request is buffered behind the waiting one and unread bytes are queued in front of the
+  FIN. Limit: TCP delivers a FIN only after the data before it, so a peer whose unsent data cannot
+  enter a full receive window is not seen as closed until the window opens (a RST always is); the
+  30 s lifetime bounds that case. HTTP/2 is not enabled; its stream-reset cancellation must be
+  tested before it is.
+* **Connections.** The custom loop costs two descriptors per connection (the socket and the
+  watcher's duplicate); `--max-connections` (default 10,000) bounds both: at the bound nothing is
+  accepted until a connection closes. Request heads are bounded by hyper (10 s header timeout,
+  about 400 KiB buffer, 100 headers).
 * SIGINT or a fatal certification shutdown: refuse new waits, wake all to a final read, let requests
-  finish for 30 s, then cancel and join the remaining connections and the proof workers, then stop
-  and join the round manager.
+  finish for 30 s, then cut and join the remaining connections, wait up to 30 s until every proof
+  worker has dropped its accounting, then stop the round manager and join it (up to 60 s). A step
+  which does not complete is not a clean shutdown: the later steps are skipped (storage is not
+  stopped under unacknowledged work), the error is logged and the process exits with status 1; the
+  WAL recovers the state on the next start. A single disk node read is not interruptible.
 * Queued requests (not yet in a round) whose deadline the consensus reference time has reached are
   expired even while a round is stalled in flight; requests in a round are exempt.
 * `GET /metrics` (Prometheus text): `aggregator_longpoll_reservations`, `_resume_queued`,

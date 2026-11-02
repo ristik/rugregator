@@ -107,6 +107,11 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_CONCURRENCY_LIMIT", default_value_t = 1000)]
     pub concurrency_limit: usize,
 
+    /// Connections served at once (each costs two file descriptors). At the bound the server stops
+    /// accepting until one closes; the descriptor limit is raised to the hard limit at startup.
+    #[arg(long, env = "AGGREGATOR_MAX_CONNECTIONS", default_value_t = 10000)]
+    pub max_connections: usize,
+
     /// BFT Core mode: "stub" (no real BFT Core) or "live".
     #[arg(long, env = "AGGREGATOR_BFT_MODE", default_value = "stub")]
     pub bft_mode: String,

@@ -793,8 +793,9 @@ impl AggregatorState {
         self.longpoll.set_batch_resume_cap(cap);
     }
 
-    /// Wait until no request, batch slot or proof slot is held any more: the dedicated workers
-    /// have really stopped (shutdown join). `false` if the deadline passes first.
+    /// Wait until no request, batch slot or proof slot is held any more: all proof work has
+    /// acknowledged completion (work quiescence; worker threads are not joined). `false` if the
+    /// deadline passes first.
     pub async fn wait_workers_idle(&self, until: tokio::time::Instant) -> bool {
         let a = self.longpoll.gate().wait_idle(until).await;
         let b = self.batch_pool.wait_idle(until).await;
@@ -951,6 +952,29 @@ impl AggregatorState {
             .await
     }
 
+    /// A fresh request's two-pool grant (batch slot, then proof slot). It is a tentative
+    /// transaction like a resumer's, so it is made under the same lock: its silent rollback can
+    /// then never hide capacity from a parked resumer which would sleep with nothing to wake it.
+    pub fn grant_fresh_batch_pools(
+        &self,
+        batch: Option<longpoll::Permit>,
+        proof: Option<longpoll::Permit>,
+    ) -> Result<(longpoll::Permit, longpoll::Permit), BatchProofError> {
+        let _decision = self.longpoll.admission_lock();
+        let busy = |this: &Self| {
+            this.catalog().stats.rejected_busy += 1;
+            BatchProofError::Busy(BusyKind::ActiveRequests)
+        };
+        let Some(b) = batch.or_else(|| self.batch_pool.try_acquire(0)) else {
+            return Err(busy(self));
+        };
+        let Some(p) = proof.or_else(|| self.proof_pool.try_acquire(0)) else {
+            b.rollback();
+            return Err(busy(self));
+        };
+        Ok((b, p))
+    }
+
     /// Non-blocking grant of the batch slot and the shared proof slot together, leaving at least
     /// one unit of each free for fresh requests. Each pool reserves atomically (compare-and-swap
     /// with the headroom), so racing fresh and resumed requests cannot both take the last unit;
@@ -1012,23 +1036,9 @@ impl AggregatorState {
         }
         // Admission: concurrent batches first, then the proof-work budget shared
         // with single non-inclusion lookups.
-        let batch_permit = match batch {
-            Some(p) => p,
-            None => self.batch_pool.try_acquire(0).ok_or_else(|| {
-                self.catalog().stats.rejected_busy += 1;
-                BatchProofError::Busy(BusyKind::ActiveRequests)
-            })?,
-        };
-        let proof_permit = match proof {
-            Some(p) => p,
-            None => match self.proof_pool.try_acquire(0) {
-                Some(p) => p,
-                None => {
-                    batch_permit.rollback();
-                    self.catalog().stats.rejected_busy += 1;
-                    return Err(BatchProofError::Busy(BusyKind::ActiveRequests));
-                }
-            },
+        let (batch_permit, proof_permit) = match (batch, proof) {
+            (Some(b), Some(p)) => (b, p),
+            (b, p) => self.grant_fresh_batch_pools(b, p)?,
         };
 
         let deadline = Instant::now() + limits.batch_timeout;
@@ -1820,6 +1830,12 @@ mod tests {
             (2, 2, 2)
         );
 
+        // The shutdown join sees the unacknowledged work: it does not report idle.
+        assert!(
+            !state
+                .wait_workers_idle(tokio::time::Instant::now() + Duration::from_millis(200))
+                .await
+        );
         // The worker comes back, finds both requests cancelled and acknowledges them.
         release.send(()).unwrap();
         until(|| {
@@ -1902,5 +1918,72 @@ mod tests {
         assert!(state.try_batch_pools().is_none());
         assert!(state.batch_pool().try_acquire(0).is_some());
         drop(held);
+    }
+
+    /// Fresh batch admissions which fail on the proof pool and roll back silently must not hide
+    /// capacity from a parked resumer: once the system is quiescent with room for it, it is granted
+    /// instead of sleeping to its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_batch_rollbacks_do_not_starve_a_parked_resumer() {
+        for round in 0..15 {
+            let state = new_state();
+            state.proof_pool().set_limit(3);
+            let reg = Arc::clone(state.longpoll());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // fresh traffic: grants (often failing on the small proof pool) and releases
+            let mut threads = vec![];
+            for _ in 0..4 {
+                let (state, stop) = (Arc::clone(&state), Arc::clone(&stop));
+                threads.push(std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(p) = state.grant_fresh_batch_pools(None, None) {
+                            std::thread::yield_now();
+                            drop(p);
+                        }
+                    }
+                }));
+            }
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (d2, s2, r2) = (Arc::clone(&done), Arc::clone(&state), Arc::clone(&reg));
+            let resumer = tokio::spawn(async move {
+                let pools = move || s2.try_batch_pools();
+                longpoll::run(
+                    &r2,
+                    "t",
+                    longpoll::Class::Batch,
+                    tokio::time::Instant::now(),
+                    10_000,
+                    &longpoll::ActiveSlot::default(),
+                    &pools,
+                    || "busy",
+                    |p| {
+                        let d = Arc::clone(&d2);
+                        async move {
+                            drop(p);
+                            let ready = d.load(std::sync::atomic::Ordering::SeqCst);
+                            longpoll::Read {
+                                pending: !ready,
+                                value: "done",
+                            }
+                        }
+                    },
+                )
+                .await
+                .0
+            });
+            until(|| reg.reserved() == 1).await;
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reg.notify();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for t in threads {
+                t.join().unwrap();
+            }
+            let v = tokio::time::timeout(Duration::from_millis(1500), resumer)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the resumer starved"))
+                .unwrap();
+            assert_eq!(v, "done", "round {round}");
+        }
     }
 }

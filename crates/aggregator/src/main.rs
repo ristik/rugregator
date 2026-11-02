@@ -254,7 +254,14 @@ async fn main() -> anyhow::Result<()> {
     // let in-flight requests finish for the grace period, then really cancel and join the
     // remaining connections, wait for the proof workers (which own their accounting) to stop,
     // and only then stop and join the round manager.
-    let mut server = uni_aggregator::api::transport::spawn(listener, router);
+    let mut server = uni_aggregator::api::transport::spawn_with(
+        listener,
+        router,
+        uni_aggregator::api::transport::TransportConfig {
+            max_connections: cfg.max_connections.max(1),
+            ..Default::default()
+        },
+    );
     tokio::select! {
         _ = server.wait() => {
             warn!("HTTP accept loop ended");
@@ -266,29 +273,27 @@ async fn main() -> anyhow::Result<()> {
             warn!("round manager requested shutdown, draining");
         }
     }
-    const GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-    state.longpoll().drain();
-    let cut = server.shutdown(GRACE).await;
-    if cut > 0 {
-        warn!(
-            connections = cut,
-            "drain deadline reached: connections cancelled"
-        );
-    } else {
-        info!("HTTP server drained");
-    }
-    if !state
-        .wait_workers_idle(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
-        .await
+    let mut rm_handle = rm_handle;
+    let mut shutdown_failed = false;
+    match uni_aggregator::lifecycle::shutdown(
+        server,
+        &state,
+        &shutdown_notify,
+        &mut rm_handle,
+        uni_aggregator::lifecycle::ShutdownLimits::default(),
+    )
+    .await
     {
-        warn!("proof workers still running after the drain");
+        Ok(()) => info!("shutdown complete"),
+        Err(e) => {
+            // Not a clean shutdown: storage is left as it is (the WAL recovers it on the next
+            // start) and the process exits with an error instead of claiming success.
+            tracing::error!(err = %e, "shutdown did not complete");
+            shutdown_failed = true;
+        }
     }
-
-    // Stop the round manager (persists SMT state if needed) and join it.
-    shutdown_notify.notify_one();
-    match tokio::time::timeout(std::time::Duration::from_secs(20), rm_handle).await {
-        Ok(_) => info!("round manager stopped"),
-        Err(_) => warn!("round manager did not stop in time"),
+    if shutdown_failed {
+        std::process::exit(1);
     }
 
     Ok(())
