@@ -436,6 +436,11 @@ pub struct AggregatorState {
     default_request_ttl: AtomicU64,
     /// Long-poll waiter registry, the global active-work budget and the wake generation.
     longpoll: Arc<longpoll::Registry>,
+    /// Test-only: whether fresh batch grants take the admission lock, and a barrier hook.
+    #[cfg(test)]
+    fresh_lock: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fresh_hook: StdMutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl AggregatorState {
@@ -458,6 +463,10 @@ impl AggregatorState {
             batch_pool: registry.new_pool(RetentionLimits::default().max_active_batches),
             expired: StdMutex::new(ExpiredSet::default()),
             longpoll: registry,
+            #[cfg(test)]
+            fresh_lock: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            fresh_hook: StdMutex::new(None),
         })
     }
 
@@ -960,19 +969,42 @@ impl AggregatorState {
         batch: Option<longpoll::Permit>,
         proof: Option<longpoll::Permit>,
     ) -> Result<(longpoll::Permit, longpoll::Permit), BatchProofError> {
-        let _decision = self.longpoll.admission_lock();
-        let busy = |this: &Self| {
-            this.catalog().stats.rejected_busy += 1;
+        let granted = {
+            #[cfg(test)]
+            let _decision = self
+                .fresh_lock
+                .load(Ordering::SeqCst)
+                .then(|| self.longpoll.admission_lock());
+            #[cfg(not(test))]
+            let _decision = self.longpoll.admission_lock();
+            match batch.or_else(|| self.batch_pool.try_acquire(0)) {
+                None => None,
+                Some(b) => match proof.or_else(|| self.proof_pool.try_acquire(0)) {
+                    Some(p) => Some((b, p)),
+                    None => {
+                        #[cfg(test)]
+                        self.fresh_pause();
+                        b.rollback();
+                        None
+                    }
+                },
+            }
+        };
+        // The statistics are updated outside the admission critical section.
+        granted.ok_or_else(|| {
+            self.catalog().stats.rejected_busy += 1;
             BatchProofError::Busy(BusyKind::ActiveRequests)
-        };
-        let Some(b) = batch.or_else(|| self.batch_pool.try_acquire(0)) else {
-            return Err(busy(self));
-        };
-        let Some(p) = proof.or_else(|| self.proof_pool.try_acquire(0)) else {
-            b.rollback();
-            return Err(busy(self));
-        };
-        Ok((b, p))
+        })
+    }
+
+    /// Test hook: pause a fresh grant between the proof refusal and the batch rollback.
+    #[cfg(test)]
+    fn fresh_pause(&self) {
+        let hook = self.fresh_hook.lock().unwrap().take();
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.recv();
+        }
     }
 
     /// Non-blocking grant of the batch slot and the shared proof slot together, leaving at least
@@ -1920,70 +1952,97 @@ mod tests {
         drop(held);
     }
 
-    /// Fresh batch admissions which fail on the proof pool and roll back silently must not hide
-    /// capacity from a parked resumer: once the system is quiescent with room for it, it is granted
-    /// instead of sleeping to its deadline.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fresh_batch_rollbacks_do_not_starve_a_parked_resumer() {
-        for round in 0..15 {
-            let state = new_state();
-            state.proof_pool().set_limit(3);
-            let reg = Arc::clone(state.longpoll());
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            // fresh traffic: grants (often failing on the small proof pool) and releases
-            let mut threads = vec![];
-            for _ in 0..4 {
-                let (state, stop) = (Arc::clone(&state), Arc::clone(&stop));
-                threads.push(std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        if let Ok(p) = state.grant_fresh_batch_pools(None, None) {
-                            std::thread::yield_now();
-                            drop(p);
+    /// The interleaving a fresh batch grant used to lose a wake in. Six batch slots are occupied
+    /// and the proof pool is full. A fresh grant takes the seventh batch slot, is refused by the
+    /// proof pool and is paused before its rollback. A resumer is woken and refused (it sees the
+    /// tentative slot), then two proof releases come and go; finally the rollback proceeds. With
+    /// the admission lock the resumer cannot decide against the tentative state and is granted;
+    /// without it, it has already gone back to sleep and nothing wakes it.
+    async fn paused_fresh_rollback(locked: bool) -> bool {
+        let state = new_state();
+        state.fresh_lock.store(locked, Ordering::SeqCst);
+        state.proof_pool().set_limit(2);
+        let reg = Arc::clone(state.longpoll());
+        let _occupants: Vec<_> = (0..6)
+            .map(|_| state.batch_pool().try_acquire(0).unwrap())
+            .collect();
+        let proofs: Vec<_> = (0..2)
+            .map(|_| state.proof_pool().try_acquire(0).unwrap())
+            .collect();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r2, s2, rd2) = (Arc::clone(&reg), Arc::clone(&state), Arc::clone(&ready));
+        let resumer = tokio::spawn(async move {
+            let pools = move || s2.try_batch_pools();
+            longpoll::run(
+                &r2,
+                "t",
+                longpoll::Class::Batch,
+                tokio::time::Instant::now(),
+                10_000,
+                &longpoll::ActiveSlot::default(),
+                &pools,
+                || "busy",
+                |p| {
+                    let rd = Arc::clone(&rd2);
+                    async move {
+                        drop(p);
+                        longpoll::Read {
+                            pending: !rd.load(Ordering::SeqCst),
+                            value: "done",
                         }
                     }
-                }));
-            }
-            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (d2, s2, r2) = (Arc::clone(&done), Arc::clone(&state), Arc::clone(&reg));
-            let resumer = tokio::spawn(async move {
-                let pools = move || s2.try_batch_pools();
-                longpoll::run(
-                    &r2,
-                    "t",
-                    longpoll::Class::Batch,
-                    tokio::time::Instant::now(),
-                    10_000,
-                    &longpoll::ActiveSlot::default(),
-                    &pools,
-                    || "busy",
-                    |p| {
-                        let d = Arc::clone(&d2);
-                        async move {
-                            drop(p);
-                            let ready = d.load(std::sync::atomic::Ordering::SeqCst);
-                            longpoll::Read {
-                                pending: !ready,
-                                value: "done",
-                            }
-                        }
-                    },
-                )
-                .await
-                .0
-            });
-            until(|| reg.reserved() == 1).await;
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            reg.notify();
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            for t in threads {
-                t.join().unwrap();
-            }
-            let v = tokio::time::timeout(Duration::from_millis(1500), resumer)
-                .await
-                .unwrap_or_else(|_| panic!("round {round}: the resumer starved"))
-                .unwrap();
-            assert_eq!(v, "done", "round {round}");
-        }
+                },
+            )
+            .await
+            .0
+        });
+        until(|| reg.reserved() == 1).await;
+        // the fresh grant, paused between the proof refusal and the batch rollback
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *state.fresh_hook.lock().unwrap() = Some((reached_tx, resume_rx));
+        let s3 = Arc::clone(&state);
+        let fresh = std::thread::spawn(move || s3.grant_fresh_batch_pools(None, None).is_err());
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fresh grant is paused");
+        assert_eq!(
+            state.batch_pool().in_use(),
+            7,
+            "the tentative slot is visible"
+        );
+        // wake the resumer; it decides while the rollback is pending
+        ready.store(true, Ordering::SeqCst);
+        reg.notify();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // two proof releases come and go while the rollback is paused
+        let mut proofs = proofs;
+        drop(proofs.pop());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(proofs.pop());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // now the rollback proceeds (silent)
+        resume_tx.send(()).unwrap();
+        assert!(fresh.join().unwrap(), "the fresh grant was refused");
+        let granted = tokio::time::timeout(Duration::from_millis(700), resumer).await;
+        matches!(granted, Ok(Ok("done")))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_fresh_rollback_cannot_starve_a_parked_resumer() {
+        assert!(
+            paused_fresh_rollback(true).await,
+            "granted promptly under the admission lock"
+        );
+    }
+
+    /// The same interleaving with the fresh-path lock switched off loses the wake: the resumer
+    /// sleeps with two batch and two proof slots free. This is what the lock prevents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_the_fresh_path_lock_the_same_interleaving_loses_the_wake() {
+        assert!(
+            !paused_fresh_rollback(false).await,
+            "the resumer must be left sleeping when the fresh grant is not serialized"
+        );
     }
 }
