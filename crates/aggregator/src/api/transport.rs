@@ -106,9 +106,26 @@ struct Io {
 }
 
 impl Io {
-    /// A write which cannot make progress is bounded by the armed response's deadline. The timer
-    /// exists only while the socket is in backpressure: a write which completes (the normal case)
-    /// never creates or polls one.
+    /// The armed response's deadline is absolute and checked before every write and flush is
+    /// forwarded: a write which becomes possible only after the deadline (backpressure which
+    /// clears late) fails like one that never clears. Cheap: one clock read per call; no timer.
+    fn check_expired(&mut self) -> io::Result<()> {
+        if let Some(deadline) = self.ctx.deadline() {
+            if Instant::now() >= deadline {
+                self.sleep = None;
+                self.ctx.release();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "response write deadline exceeded",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A write which cannot make progress is also woken at the deadline. The timer exists only
+    /// while the socket is in backpressure: a write which completes (the normal case) never
+    /// creates or polls one.
     fn bound<T>(&mut self, cx: &mut Context<'_>, r: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
         if r.is_ready() {
             self.sleep = None;
@@ -150,6 +167,7 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.check_expired()?;
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
         self.bound(cx, r)
     }
@@ -159,6 +177,7 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        self.check_expired()?;
         let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         self.bound(cx, r)
     }
@@ -168,6 +187,7 @@ impl AsyncWrite for Io {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check_expired()?;
         let r = Pin::new(&mut self.inner).poll_flush(cx);
         if matches!(r, Poll::Ready(Ok(()))) {
             // Every framed byte has been handed to the socket: the response is written.
@@ -251,6 +271,9 @@ mod hangup {
         next: AtomicU64,
     }
 
+    /// The process-wide monitor: created on first use and never torn down. It belongs to the
+    /// process, not to a `Server`: a server's shutdown does not join the thread (it only
+    /// removes its own connections' entries), and the thread ends with the process.
     fn monitor() -> Option<&'static Monitor> {
         static M: OnceLock<Option<&'static Monitor>> = OnceLock::new();
         *M.get_or_init(|| {
@@ -264,10 +287,15 @@ mod hangup {
                 flags: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
             }));
-            std::thread::Builder::new()
+            if std::thread::Builder::new()
                 .name("hangup-monitor".into())
                 .spawn(move || m.run())
-                .ok()?;
+                .is_err()
+            {
+                // SAFETY: `epfd` was created above and is not shared yet (the thread never ran).
+                unsafe { libc::close(epfd) };
+                return None;
+            }
             Some(m)
         })
     }
@@ -565,5 +593,97 @@ mod linux_tests {
         tokio::time::timeout(Duration::from_secs(2), w.closed())
             .await
             .expect("RST is seen");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn pair(send: usize, recv: usize) -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(recv as u32).unwrap();
+        let c = sock.connect(l.local_addr().unwrap()).await.unwrap();
+        let (s, _) = l.accept().await.unwrap();
+        socket2::SockRef::from(&s)
+            .set_send_buffer_size(send)
+            .unwrap();
+        (s, c)
+    }
+
+    /// Fill the socket until a write would block (the write future is abandoned there).
+    async fn fill(io: &mut Io) {
+        let chunk = [1u8; 16384];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(150), io.write(&chunk)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("unexpected {e}"),
+                Err(_) => return, // pending: backpressure
+            }
+        }
+    }
+
+    async fn drain(c: &mut TcpStream) {
+        let mut buf = vec![0u8; 65536];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(100), c.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Backpressure which clears only after the deadline must not let the expired response
+    /// continue: the write, the vectored write and the flush all fail with `TimedOut`, and the
+    /// budget unit is released. A control with a far deadline continues normally.
+    #[tokio::test]
+    async fn writability_after_the_deadline_is_not_a_reprieve() {
+        // (deadline passed, operation after the socket became writable again)
+        for (expired, op) in [
+            (true, "write"),
+            (true, "vectored"),
+            (true, "flush"),
+            (false, "write"),
+        ] {
+            let (s, mut c) = pair(4096, 1024).await;
+            let ctx = Arc::new(ConnCtx::default());
+            let mut io = Io {
+                inner: s,
+                ctx: Arc::clone(&ctx),
+                sleep: None,
+            };
+            let deadline = Instant::now()
+                + if expired {
+                    Duration::from_millis(1500)
+                } else {
+                    Duration::from_secs(60)
+                };
+            ctx.arm_write(None, deadline);
+            fill(&mut io).await; // Pending: the write is in backpressure before the deadline
+            if expired {
+                tokio::time::sleep_until(deadline + Duration::from_millis(100)).await;
+            }
+            drain(&mut c).await; // now writable, and (if `expired`) past the deadline
+            let r = match op {
+                "write" => io.write(&[2u8; 1024]).await.map(|_| ()),
+                "vectored" => io
+                    .write_vectored(&[io::IoSlice::new(&[2u8; 1024])])
+                    .await
+                    .map(|_| ()),
+                _ => io.flush().await,
+            };
+            if expired {
+                let e = r.expect_err("an expired response must not continue");
+                assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{op}");
+                assert!(ctx.armed_deadline().is_none(), "{op}: the unit is released");
+            } else {
+                r.unwrap();
+                io.flush().await.unwrap();
+                assert!(ctx.armed_deadline().is_none(), "released by the flush");
+            }
+        }
     }
 }
