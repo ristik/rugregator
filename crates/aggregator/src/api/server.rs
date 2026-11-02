@@ -106,14 +106,30 @@ async fn jsonrpc_handler(
 ) -> Response {
     // The body is read here, not by an extractor, so that an oversized one gets the same JSON
     // `limit_exceeded` answer (and headers) as every other error instead of a plain-text 413.
-    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => {
+    // Only the length limit is a 413; any other read failure (client abort, bad chunking) is a
+    // parse error, as in aggregator-go.
+    use http_body_util::{BodyExt, LengthLimitError, Limited};
+    let body = match Limited::new(body, MAX_BODY_BYTES).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 error_text(
                     serde_json::Value::Null,
                     JsonRpcError::limit_exceeded("request_bytes", MAX_BODY_BYTES),
+                ),
+            )
+        }
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                error_text(
+                    serde_json::Value::Null,
+                    JsonRpcError {
+                        code: JsonRpcError::PARSE_ERROR,
+                        message: "parse error".into(),
+                        data: None,
+                    },
                 ),
             )
         }
@@ -714,6 +730,34 @@ mod tests {
             "a".repeat(3 << 20)
         );
         assert_eq!(http(&state, "POST", body).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fails_while_reading_is_a_parse_error_not_a_413() {
+        use tower::ServiceExt;
+        let (state, _) = serving_state(&[0x11]);
+        let stream = futures::stream::iter(vec![
+            Ok(axum::body::Bytes::from_static(b"{\"jsonrpc\"")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client abort",
+            )),
+        ]);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let headers = response.headers().clone();
+        let bytes = read_body(response).await;
+        assert_rpc_headers(&headers, bytes.len());
+        let r: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r["error"]["code"], json!(-32700));
     }
 
     #[tokio::test]
