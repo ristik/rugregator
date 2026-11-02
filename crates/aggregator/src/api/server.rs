@@ -1,7 +1,6 @@
 //! axum HTTP server and JSON-RPC dispatch.
 
 use axum::{
-    body::Bytes,
     extract::State,
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -97,7 +96,28 @@ fn json_response(status: StatusCode, text: String) -> Response {
     response
 }
 
-async fn jsonrpc_handler(State(state): State<Arc<AggregatorState>>, body: Bytes) -> Response {
+/// Request body ceiling (aggregator-go's JSON-RPC server accepts up to 16 MiB; the methods that
+/// have their own, smaller limits enforce them after this one).
+const MAX_BODY_BYTES: usize = 16 << 20;
+
+async fn jsonrpc_handler(
+    State(state): State<Arc<AggregatorState>>,
+    body: axum::body::Body,
+) -> Response {
+    // The body is read here, not by an extractor, so that an oversized one gets the same JSON
+    // `limit_exceeded` answer (and headers) as every other error instead of a plain-text 413.
+    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error_text(
+                    serde_json::Value::Null,
+                    JsonRpcError::limit_exceeded("request_bytes", MAX_BODY_BYTES),
+                ),
+            )
+        }
+    };
     let (status, text) = dispatch(state, &body).await;
     json_response(status, text)
 }
@@ -560,7 +580,10 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body))
             .unwrap();
-        build_router(Arc::clone(state)).oneshot(request).await.unwrap()
+        build_router(Arc::clone(state))
+            .oneshot(request)
+            .await
+            .unwrap()
     }
 
     async fn read_body(response: axum::http::Response<axum::body::Body>) -> Vec<u8> {
@@ -593,13 +616,18 @@ mod tests {
             assert_eq!(headers.get("cache-control").unwrap(), "no-store");
             assert_eq!(headers.get("content-type").unwrap(), "application/json");
             assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
-            assert_eq!(headers.get("access-control-expose-headers").unwrap(), "Retry-After");
-            assert!(headers
-                .get("access-control-allow-headers")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("X-State-ID"));
+            assert_eq!(
+                headers.get("access-control-expose-headers").unwrap(),
+                "Retry-After"
+            );
+            assert_eq!(
+                headers.get("access-control-allow-methods").unwrap(),
+                "POST, OPTIONS"
+            );
+            assert_eq!(
+                headers.get("access-control-allow-headers").unwrap(),
+                "Content-Type, Authorization, X-API-Key, X-State-ID"
+            );
         }
     }
 
@@ -611,21 +639,122 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let headers = response.headers();
         assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
-        assert!(headers
-            .get("access-control-allow-methods")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("POST"));
-        assert_eq!(headers.get("access-control-expose-headers").unwrap(), "Retry-After");
+        assert_eq!(
+            headers.get("access-control-allow-methods").unwrap(),
+            "GET, POST, OPTIONS"
+        );
+        assert_eq!(
+            headers.get("access-control-allow-headers").unwrap(),
+            "Content-Type, Authorization, X-API-Key, X-State-ID"
+        );
+        assert_eq!(
+            headers.get("access-control-expose-headers").unwrap(),
+            "Retry-After"
+        );
         // CORS is for the JSON-RPC route only (health is not a browser API)
         let request = axum::http::Request::builder()
             .uri("/health")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = build_router(Arc::clone(&state)).oneshot(request).await.unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+    }
+
+    /// The headers every answer carries, whatever its status.
+    fn assert_rpc_headers(headers: &axum::http::HeaderMap, body_len: usize) {
+        assert_eq!(
+            headers.get("content-length").unwrap().to_str().unwrap(),
+            body_len.to_string()
+        );
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            headers.get("access-control-allow-methods").unwrap(),
+            "POST, OPTIONS"
+        );
+        assert_eq!(
+            headers.get("access-control-allow-headers").unwrap(),
+            "Content-Type, Authorization, X-API-Key, X-State-ID"
+        );
+        assert_eq!(
+            headers.get("access-control-expose-headers").unwrap(),
+            "Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_a_json_413_with_the_same_headers() {
+        let (state, _) = serving_state(&[0x11]);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{{"pad":"{}"}}}}"#,
+            "a".repeat(MAX_BODY_BYTES)
+        );
+        let response = http(&state, "POST", body).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let headers = response.headers().clone();
+        let bytes = read_body(response).await;
+        assert_rpc_headers(&headers, bytes.len());
+        let r: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r["error"]["code"], json!(-32007));
+        assert_eq!(r["error"]["data"]["reason"], json!("limit_exceeded"));
+        assert_eq!(r["error"]["data"]["detail"], json!("request_bytes"));
+        assert_eq!(r["error"]["data"]["limit"], json!(MAX_BODY_BYTES));
+        assert_eq!(r["id"], Value::Null);
+        // a body above axum's old 2 MiB default but under the ceiling is served
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{{"pad":"{}"}}}}"#,
+            "a".repeat(3 << 20)
+        );
+        assert_eq!(http(&state, "POST", body).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_inclusion_errors_keep_their_status_and_carry_headers_and_data() {
+        let (tx, _rx) = mpsc::channel(1);
+        let empty = AggregatorState::new(tx, None); // no finalized view yet
+        let ni = |id: u64| {
+            json!({"jsonrpc":"2.0","id":id,"method":"get_non_inclusion_proof.v1",
+                   "params":{"stateId": hex::encode([0x77; 32])}})
+            .to_string()
+        };
+        // -32020: no certified snapshot -> 404
+        let response = http(&empty, "POST", ni(1)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let headers = response.headers().clone();
+        let bytes = read_body(response).await;
+        assert_rpc_headers(&headers, bytes.len());
+        let r: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r["error"]["code"], json!(-32020));
+        assert_eq!(r["error"]["data"]["reason"], json!("proof_unavailable"));
+        assert_eq!(r["error"]["data"]["detail"], json!("no_finalized_view"));
+        assert_eq!(r["error"]["data"]["retryable"], json!(true));
+        // -32023: the proof service is busy -> 429
+        let (state, _) = serving_state(&[0x11]);
+        let held: Vec<_> = (0..smt_store::CERTIFIED_PROOF_MAX_IN_FLIGHT)
+            .map(|_| {
+                Arc::clone(&state.proof_permits)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        let response = http(&state, "POST", ni(2)).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers().clone();
+        let bytes = read_body(response).await;
+        assert_rpc_headers(&headers, bytes.len());
+        let r: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r["error"]["code"], json!(-32023));
+        assert_eq!(r["error"]["data"]["reason"], json!("busy"));
+        assert_eq!(r["error"]["data"]["detail"], json!("active_requests"));
+        drop(held);
     }
 
     #[tokio::test]

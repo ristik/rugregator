@@ -160,13 +160,37 @@ impl JsonRpcError {
     }
     /// No certified snapshot yet (aggregator-go: `proof_unavailable`, structured data).
     pub fn not_found() -> Self {
-        Self::detailed(Self::NOT_FOUND, "No certified snapshot", "proof_unavailable", "no_finalized_view", true, None, None)
+        Self::detailed(
+            Self::NOT_FOUND,
+            "No certified snapshot",
+            "proof_unavailable",
+            "no_finalized_view",
+            true,
+            None,
+            None,
+        )
     }
     pub fn state_included() -> Self {
-        Self::detailed(Self::STATE_INCLUDED, "State included", "state_included", "state_included", false, None, None)
+        Self::detailed(
+            Self::STATE_INCLUDED,
+            "State included",
+            "state_included",
+            "state_included",
+            false,
+            None,
+            None,
+        )
     }
     pub fn server_busy() -> Self {
-        Self::detailed(Self::SERVER_BUSY, "Server busy", "busy", "active_requests", true, None, None)
+        Self::detailed(
+            Self::SERVER_BUSY,
+            "Server busy",
+            "busy",
+            "active_requests",
+            true,
+            None,
+            None,
+        )
     }
     pub fn is_not_found(&self) -> bool {
         self.code == Self::NOT_FOUND
@@ -246,7 +270,12 @@ mod tests {
     fn non_inclusion_errors_carry_the_structured_data_of_aggregator_go() {
         for (e, code, reason, retryable) in [
             (JsonRpcError::not_found(), -32020, "proof_unavailable", true),
-            (JsonRpcError::state_included(), -32022, "state_included", false),
+            (
+                JsonRpcError::state_included(),
+                -32022,
+                "state_included",
+                false,
+            ),
             (JsonRpcError::server_busy(), -32023, "busy", true),
         ] {
             assert_eq!(e.code, code);

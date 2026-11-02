@@ -404,7 +404,7 @@ pub struct AggregatorState {
     /// Admission control in front of the bounded proof worker queues, shared by
     /// single non-inclusion lookups and batches so more retained views cannot
     /// multiply proof concurrency.
-    proof_permits: Arc<Semaphore>,
+    pub(crate) proof_permits: Arc<Semaphore>,
     /// Concurrent batch requests (each pins one view).
     batch_permits: Arc<Semaphore>,
     batch_permit_limit: std::sync::atomic::AtomicUsize,
