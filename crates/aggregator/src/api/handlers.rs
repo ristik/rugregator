@@ -116,6 +116,7 @@ pub async fn handle_certification_request(
 pub async fn handle_get_non_inclusion_proof_v1(
     params: serde_json::Value,
     state: Arc<AggregatorState>,
+    slot: &crate::longpoll::ActiveSlot,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let p: GetNonInclusionProofParams = serde_json::from_value(params)
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid params: {e}")))?;
@@ -129,7 +130,7 @@ pub async fn handle_get_non_inclusion_proof_v1(
     })?;
 
     let lookup = state
-        .get_non_inclusion_proof(state_id)
+        .get_non_inclusion_proof_with(state_id, slot.get())
         .await
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
     match lookup {
@@ -160,8 +161,9 @@ pub async fn handle_get_inclusion_proof_v2(
     let p: GetInclusionProofParams = serde_json::from_value(params)
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid params: {e}")))?;
 
-    let state_id_bytes = hex::decode(&p.state_id)
-        .map_err(|e| JsonRpcError::validation(format!("Invalid parameters: invalid hex string: {e}")))?;
+    let state_id_bytes = hex::decode(&p.state_id).map_err(|e| {
+        JsonRpcError::validation(format!("Invalid parameters: invalid hex string: {e}"))
+    })?;
     // Like aggregator-go: a state id is exactly 32 raw bytes. Anything else can never be a state,
     // so it is an error (terminal for clients), not a pollable "not certified" answer.
     if state_id_bytes.len() != 32 {
@@ -171,19 +173,31 @@ pub async fn handle_get_inclusion_proof_v2(
         )));
     }
 
-    // The hint is read before the proof: a state that finalizes in between returns its proof
-    // (included wins), never "unknown" for a state that has one.
-    let hint = p
-        .include_status
-        .then(|| state.proof_status_hint(&state_id_bytes));
+    let (hex_cbor, status, _) = read_v2(&state, &state_id_bytes, p.include_status).await?;
+    if p.include_status {
+        Ok(serde_json::json!({ "proof": hex_cbor, "status": status }))
+    } else {
+        Ok(serde_json::Value::String(hex_cbor))
+    }
+}
 
+/// One complete read of `get_inclusion_proof.v2`: `(proof hex, status, pending)`.
+///
+/// The hint is read before the proof: a state that finalizes in between returns its proof
+/// (included wins), never "unknown" for a state that has one. `pending` is true only for a state
+/// that is known pending and not included; `no_finalized_view` stays an immediate error.
+async fn read_v2(
+    state: &Arc<AggregatorState>,
+    state_id: &[u8],
+    want_hint: bool,
+) -> Result<(String, &'static str, bool), JsonRpcError> {
+    let hint = want_hint.then(|| state.proof_status_hint(state_id));
     let proof = state
-        .get_inclusion_proof(&state_id_bytes)
+        .get_inclusion_proof(state_id)
         .await
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-
-    let (hex_cbor, status) = match proof {
-        InclusionProofLookup::Proof(p) => (
+    match proof {
+        InclusionProofLookup::Proof(p) => Ok((
             encode_inclusion_proof_response(
                 p.block_number,
                 p.cert_data.as_ref(),
@@ -193,7 +207,8 @@ pub async fn handle_get_inclusion_proof_v2(
             )
             .map_err(|e| JsonRpcError::internal(e.to_string()))?,
             "included",
-        ),
+            false,
+        )),
         // Pending, unknown and expired states get aggregator-go's answer: a normal result
         // with the empty proof (no certificate) under the latest finalized block's UC. The
         // client polls on; only the optional status hint tells the cases apart.
@@ -211,16 +226,83 @@ pub async fn handle_get_inclusion_proof_v2(
                     None,
                 ));
             };
-            (
+            let hint = hint.unwrap_or("unknown");
+            Ok((
                 encode_empty_inclusion_proof_response(block.block_number, &block.uc_cbor)
                     .map_err(|e| JsonRpcError::internal(e.to_string()))?,
-                hint.filter(|h| *h != "included").unwrap_or("unknown"),
-            )
+                if hint == "included" { "unknown" } else { hint },
+                hint == "pending",
+            ))
         }
-    };
-    match hint {
-        None => Ok(serde_json::Value::String(hex_cbor)),
-        Some(_) => Ok(serde_json::json!({ "proof": hex_cbor, "status": status })),
+    }
+}
+
+/// `get_inclusion_proof.v2` carrying a valid `waitMs`: `{proof, [status], waitedMs}`.
+///
+/// Waits only while the state is known pending and not included; unknown, expired, included and
+/// every error end the wait at once. Every handled error echoes `error.data.waitedMs`
+/// (zero for validation errors).
+pub async fn handle_get_inclusion_proof_v2_waited(
+    params: serde_json::Value,
+    wait_ms: u64,
+    state: Arc<AggregatorState>,
+    started: tokio::time::Instant,
+    slot: &crate::longpoll::ActiveSlot,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let p: GetInclusionProofParams = serde_json::from_value(params)
+        .map_err(|e| JsonRpcError::invalid_params(format!("invalid params: {e}")).with_waited(0))?;
+    let state_id = hex::decode(&p.state_id).map_err(|e| {
+        JsonRpcError::validation(format!("Invalid parameters: invalid hex string: {e}"))
+            .with_waited(0)
+    })?;
+    if state_id.len() != 32 {
+        return Err(JsonRpcError::validation(format!(
+            "stateId must be exactly 32 bytes (v2 wire format), got {}",
+            state_id.len()
+        ))
+        .with_waited(0));
+    }
+    let include_status = p.include_status;
+    let reg = Arc::clone(state.longpoll());
+    let (read, waited) = crate::longpoll::run(
+        &reg,
+        "get_inclusion_proof.v2",
+        crate::longpoll::Class::V2,
+        started,
+        wait_ms,
+        slot,
+        &|| Some(crate::longpoll::ReadPermits::default()),
+        || Err(JsonRpcError::busy_deadline()),
+        |_permits| {
+            let state = Arc::clone(&state);
+            let state_id = state_id.clone();
+            async move {
+                // The internal hint is always read: it decides whether waiting may help.
+                match read_v2(&state, &state_id, true).await {
+                    Ok((hex, status, pending)) => crate::longpoll::Read {
+                        pending,
+                        value: Ok((hex, status)),
+                    },
+                    Err(e) => crate::longpoll::Read {
+                        pending: false,
+                        value: Err(e),
+                    },
+                }
+            }
+        },
+    )
+    .await;
+    match read {
+        Ok((hex, status)) => {
+            let mut out = serde_json::Map::new();
+            out.insert("proof".into(), hex.into());
+            if include_status {
+                out.insert("status".into(), status.into());
+            }
+            out.insert("waitedMs".into(), waited.into());
+            Ok(serde_json::Value::Object(out))
+        }
+        Err(e) => Err(e.with_waited(waited)),
     }
 }
 
@@ -462,16 +544,20 @@ mod tests {
                 .unwrap_err();
                 assert_eq!(e.code, JsonRpcError::VALIDATION_ERROR, "{id:?}");
                 assert!(
-                    e.message.starts_with("stateId must be exactly 32 bytes (v2 wire format), got "),
+                    e.message
+                        .starts_with("stateId must be exactly 32 bytes (v2 wire format), got "),
                     "{}",
                     e.message
                 );
             }
         }
         // non-hex text is a validation error too; exactly 32 bytes is accepted
-        let e = handle_get_inclusion_proof_v2(serde_json::json!({ "stateId": "zz" }), Arc::clone(&state))
-            .await
-            .unwrap_err();
+        let e = handle_get_inclusion_proof_v2(
+            serde_json::json!({ "stateId": "zz" }),
+            Arc::clone(&state),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.code, JsonRpcError::VALIDATION_ERROR);
         assert!(v2(&state, [0x22u8; 32], false).await.is_string());
     }

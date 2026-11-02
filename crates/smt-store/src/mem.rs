@@ -182,21 +182,33 @@ impl SmtStore for MemSmt {
             }
             for request in requests {
                 match request {
-                    ProofRequest::NonInclusion { key, respond_to } => {
-                        let result = tree
-                            .get_non_inclusion_proof(&key)
-                            .map_err(|error| anyhow::anyhow!(error));
-                        let _ = respond_to.send(result);
+                    ProofRequest::NonInclusion {
+                        key,
+                        cancel,
+                        hold,
+                        respond_to,
+                    } => {
+                        let result = if cancel.is_cancelled() {
+                            Err(anyhow::anyhow!("certified SMT proof request cancelled"))
+                        } else {
+                            tree.get_non_inclusion_proof(&key)
+                                .map_err(|error| anyhow::anyhow!(error))
+                        };
+                        drop(hold);
+                        respond_to(result);
                     }
                     ProofRequest::InclusionBatch {
                         keys,
                         deadline,
+                        cancel,
+                        hold,
                         respond_to,
                     } => {
-                        let result = answer_inclusion_batch(&keys, deadline, |key| {
+                        let result = answer_inclusion_batch(&keys, deadline, &cancel, |key| {
                             tree.get_inclusion_proof_with_value(key)
                         });
-                        let _ = respond_to.send(result);
+                        drop(hold);
+                        respond_to(result);
                     }
                 }
             }

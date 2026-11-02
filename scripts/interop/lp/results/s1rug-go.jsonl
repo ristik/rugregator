@@ -1,0 +1,6 @@
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":true,"attempts":"2","elapsed":"1.004s","verified":true}
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":true,"attempts":"1","elapsed":"927ms","verified":true}
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":true,"attempts":"1","elapsed":"933ms","verified":true}
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":false,"attempts":"2","elapsed":"1.004s","verified":true}
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":false,"attempts":"2","elapsed":"1.003s","verified":true}
+{"client":"go","server":"s1rug","scenario":"go-commitment","status":"PASS","longPoll":false,"attempts":"2","elapsed":"1.003s","verified":true}

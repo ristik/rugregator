@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Long-poll interop: one server x the Rust driver. Results: $OUT/<tag>-rust.jsonl
 #
-#   run.sh s1lp                     rugregator (reservation-only), started fresh from RUG_TARGET
+#   run.sh s1rug|s1rugcap0          rugregator with real long-poll (cap0: --long-poll-max-waiters 0),
+#                                   started fresh from RUG_TARGET; s1lp = the historical reservation-only run
 #   run.sh s2lp|s2base|s2cap0       aggregator-go already started with ../matrix/s2/s2.sh up
 #                                   (s2base = non-inclusion a3527521; s2lp = long-poll branch;
 #                                    s2cap0 = long-poll branch started with LONG_POLL_MAX_WAITERS=0)
@@ -34,14 +35,15 @@ if [ -e "$DEST" ] && ! cmp -s "$DEST" "$HERE/rust/interop_lp.rs"; then
   echo "refusing to overwrite a different $DEST" >&2; exit 2
 fi
 
-if [ "$server" = s1lp ]; then
+if [ "$server" = s1lp ] || [ "$server" = s1rug ] || [ "$server" = s1rugcap0 ]; then
   target="${RUG_TARGET:-$REPO/target/release}"; port="${S1_PORT:-18080}"
   if curl -fsS -m 2 -X POST "http://127.0.0.1:$port/" -d '{}' >/dev/null 2>&1; then
     echo "port $port already answers: refusing to test an unknown server (set S1_PORT)" >&2; exit 2
   fi
   dir="$(mktemp -d)"
   "$target/stub-anchor" trust-base > "$dir/trust-base.json"
-  "$target/aggregator" --bft-mode stub --listen "127.0.0.1:$port" --round-duration-ms 1000 > "$dir/server.log" 2>&1 &
+  extra=(); [ "$server" = s1rugcap0 ] && extra=(--long-poll-max-waiters 0)
+  "$target/aggregator" --bft-mode stub --listen "127.0.0.1:$port" --round-duration-ms 1000 "${extra[@]}" > "$dir/server.log" 2>&1 &
   pid=$!
   ready=0
   for _ in $(seq 1 50); do

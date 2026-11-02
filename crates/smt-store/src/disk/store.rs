@@ -15,7 +15,8 @@ use super::materializer::{
 use super::overlay::Overlay;
 use super::persister::persist_modified;
 use crate::traits::{
-    answer_inclusion_batch, CertifiedSmtSnapshot, InclusionBatchEntry, ProofRequest, SnapshotError,
+    answer_inclusion_batch, Cancel, CertifiedSmtSnapshot, InclusionBatchEntry, ProofRequest,
+    SnapshotError,
 };
 use std::time::Instant;
 
@@ -177,25 +178,37 @@ impl crate::traits::SmtStore for DiskSmt {
             let empty_overlay = Overlay::new();
             for request in requests {
                 match request {
-                    ProofRequest::NonInclusion { key, respond_to } => {
-                        let result = materialize_for_proof(&reader, &empty_overlay, None, &key)
-                            .and_then(|tree| {
-                                tree.get_non_inclusion_proof(&key)
-                                    .map_err(|error| anyhow::anyhow!(error))
-                            });
-                        let _ = respond_to.send(result);
+                    ProofRequest::NonInclusion {
+                        key,
+                        cancel,
+                        hold,
+                        respond_to,
+                    } => {
+                        let stop = StopReader::new(&reader, &cancel, None);
+                        let result = if cancel.is_cancelled() {
+                            Err(anyhow::anyhow!("certified SMT proof request cancelled"))
+                        } else {
+                            materialize_for_proof(&stop, &empty_overlay, None, &key).and_then(
+                                |tree| {
+                                    tree.get_non_inclusion_proof(&key)
+                                        .map_err(|error| anyhow::anyhow!(error))
+                                },
+                            )
+                        };
+                        drop(hold);
+                        respond_to(result);
                     }
                     ProofRequest::InclusionBatch {
                         keys,
                         deadline,
+                        cancel,
+                        hold,
                         respond_to,
                     } => {
-                        let _ = respond_to.send(disk_inclusion_batch(
-                            &reader,
-                            &empty_overlay,
-                            &keys,
-                            deadline,
-                        ));
+                        let result =
+                            disk_inclusion_batch(&reader, &empty_overlay, &keys, deadline, &cancel);
+                        drop(hold);
+                        respond_to(result);
                     }
                 }
             }
@@ -231,12 +244,63 @@ pub(crate) fn disk_inclusion_batch<R: super::materializer::NodeReader + ?Sized>(
     overlay: &Overlay,
     keys: &[SmtKey],
     deadline: Instant,
+    cancel: &Cancel,
 ) -> Result<Vec<InclusionBatchEntry>, SnapshotError> {
+    if cancel.is_cancelled() {
+        return Err(SnapshotError::Cancelled);
+    }
     if Instant::now() >= deadline {
         return Err(SnapshotError::Deadline);
     }
-    let tree = materialize_for_keys(reader, overlay, None, keys).map_err(SnapshotError::Internal)?;
-    answer_inclusion_batch(keys, deadline, |key| tree.get_inclusion_proof_with_value(key))
+    // The union of the paths is materialized before any key is answered, so cancellation and the
+    // deadline are checked at every node read, not only between keys.
+    let stop = StopReader::new(reader, cancel, Some(deadline));
+    let tree = match materialize_for_keys(&stop, overlay, None, keys) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Err(if cancel.is_cancelled() {
+                SnapshotError::Cancelled
+            } else if Instant::now() >= deadline {
+                SnapshotError::Deadline
+            } else {
+                SnapshotError::Internal(error)
+            })
+        }
+    };
+    answer_inclusion_batch(keys, deadline, cancel, |key| {
+        tree.get_inclusion_proof_with_value(key)
+    })
+}
+
+/// A node reader which refuses further reads once the request is cancelled or past its deadline.
+pub(crate) struct StopReader<'a, R: super::materializer::NodeReader + ?Sized> {
+    inner: &'a R,
+    cancel: &'a Cancel,
+    deadline: Option<Instant>,
+}
+
+impl<'a, R: super::materializer::NodeReader + ?Sized> StopReader<'a, R> {
+    pub(crate) fn new(inner: &'a R, cancel: &'a Cancel, deadline: Option<Instant>) -> Self {
+        Self {
+            inner,
+            cancel,
+            deadline,
+        }
+    }
+}
+
+impl<R: super::materializer::NodeReader + ?Sized> super::materializer::NodeReader
+    for StopReader<'_, R>
+{
+    fn get_node(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.cancel.is_cancelled() {
+            anyhow::bail!("certified SMT proof request cancelled");
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            anyhow::bail!("certified SMT proof deadline exceeded");
+        }
+        self.inner.get_node(key)
+    }
 }
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────

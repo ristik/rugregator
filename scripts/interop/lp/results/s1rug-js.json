@@ -1,0 +1,101 @@
+{
+  "label": "S1-RUG",
+  "url": "http://127.0.0.1:18083",
+  "sdk": "state-transition-sdk-js (this checkout)",
+  "started": "2026-11-02T01:20:49.349Z",
+  "results": {
+    "l2": {
+      "ok": true,
+      "sinceSubmitMs": 175,
+      "totalMs": 224,
+      "proofRequests": 1,
+      "proofRequestsWithWait": 1,
+      "submissions": 1,
+      "echoes": [
+        155
+      ],
+      "minGapMs": null,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l3": {
+      "ok": true,
+      "requestedWaitMs": 5000,
+      "outcome": "included",
+      "waitedMs": 975,
+      "elapsedMs": 978,
+      "withinDeadline": true,
+      "timedOut": false,
+      "proofRequests": 1,
+      "proofRequestsWithWait": 1,
+      "submissions": 1,
+      "echoes": [
+        975
+      ],
+      "minGapMs": null,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l4": {
+      "ok": true,
+      "requestedWaitMs": 5000,
+      "pendingAll": {
+        "kind": "success",
+        "proofs": 3,
+        "waitedMs": 969,
+        "requests": 1,
+        "elapsedMs": 974
+      },
+      "withUnknown": {
+        "kind": "error",
+        "errorKind": "unavailable",
+        "code": -32008,
+        "detail": "state_unknown",
+        "waitedMs": 0,
+        "requests": 1,
+        "elapsedMs": 3
+      },
+      "proofRequests": 2,
+      "proofRequestsWithWait": 2,
+      "submissions": 3,
+      "echoes": [
+        969,
+        0
+      ],
+      "minGapMs": 973,
+      "httpStatuses": [
+        200
+      ]
+    },
+    "l5": {
+      "ok": true,
+      "helper": {
+        "ok": true,
+        "sinceSubmitMs": 976,
+        "totalMs": 979,
+        "proofRequests": 1,
+        "proofRequestsWithWait": 1,
+        "submissions": 1,
+        "echoes": [
+          965
+        ],
+        "minGapMs": null,
+        "httpStatuses": [
+          200
+        ]
+      },
+      "batchParserProbe": {
+        "kind": "error",
+        "errorKind": "unavailable",
+        "code": -32008,
+        "detail": "state_unknown",
+        "requests": 1,
+        "httpRequests": 1,
+        "expectOneRetryOnlyAgainstAStrictParser": true
+      },
+      "intervalMs": 1000
+    }
+  }
+}

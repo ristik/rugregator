@@ -1,0 +1,6 @@
+echo.json: aggregator-go testdata/longpoll/echo.json revision 4 (echo-ruling), copied byte for byte
+  source: unicitynetwork/aggregator-go#271, head 09ed2d5c0f88500e004473c9d3e581a762246241
+  sha256: a9dad238857c6953b3f65b5c8680cd8dda2786bccb85a6c633b47644b6c4cd86
+To be refreshed to the merge commit of #271 once it is merged.
+The stateless validation and preflight cases are replayed against the server by
+`api::server::tests::echo_corpus_validation_and_preflight_cases_match_the_server`.

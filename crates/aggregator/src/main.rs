@@ -7,9 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use smt_store::{mem, SmtStore as _};
+use smt_store::SmtStore as _;
 use uni_aggregator::{
-    api::build_router,
     config::{Config, ConsistencyProofMode, RoundConfig},
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::{AggregatorState, WalStore},
@@ -145,14 +144,14 @@ async fn main() -> anyhow::Result<()> {
                 $rm
             };
             let notify = rm.shutdown_notify();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 rm.run().await;
             });
-            ($state, notify)
+            ($state, notify, handle)
         }};
     }
 
-    let (state, shutdown_notify) = if cfg.db_path.is_empty() {
+    let (state, shutdown_notify, rm_handle) = if cfg.db_path.is_empty() {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
@@ -235,25 +234,74 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let router = build_router(Arc::clone(&state));
+    // Long-poll limits and the global active-work budget.
+    uni_aggregator::longpoll::validate_limits(
+        cfg.long_poll_max_wait_ms,
+        cfg.long_poll_max_waiters,
+        cfg.retention_limits().batch_timeout,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    anyhow::ensure!(
+        cfg.concurrency_limit >= 1,
+        "--concurrency-limit must be positive"
+    );
+    state.longpoll().configure(
+        cfg.long_poll_max_wait_ms,
+        cfg.long_poll_max_waiters,
+        cfg.retention_limits().batch_timeout,
+    );
+    state.longpoll().set_concurrency(cfg.concurrency_limit);
+
     // let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let listener = bind_listener(&cfg.listen, 4096)?;
     info!(listen = %cfg.listen, "HTTP server ready");
 
-    // Run HTTP server until SIGINT (ctrl+c).
+    // Run the HTTP server until SIGINT or a fatal certification shutdown, then drain in order,
+    // while storage is still open: refuse new waits and wake the parked ones to a final read,
+    // let in-flight requests finish for the grace period, then really cancel and join the
+    // remaining connections, wait for the proof workers (which own their accounting) to stop,
+    // and only then stop and join the round manager.
+    let mut server = uni_aggregator::api::transport::spawn_with(
+        listener,
+        Arc::clone(&state),
+        uni_aggregator::api::transport::TransportConfig {
+            max_connections: cfg.max_connections.max(1),
+            ..Default::default()
+        },
+    );
     tokio::select! {
-        result = axum::serve(listener, router) => {
-            result?;
+        _ = server.wait() => {
+            warn!("HTTP accept loop ended");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, initiating graceful shutdown");
         }
+        _ = shutdown_notify.notified() => {
+            warn!("round manager requested shutdown, draining");
+        }
     }
-
-    // Signal the round manager to shut down (persists SMT state if needed).
-    shutdown_notify.notify_one();
-    // Give the round manager a moment to persist and exit.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut rm_handle = rm_handle;
+    let mut shutdown_failed = false;
+    match uni_aggregator::lifecycle::shutdown(
+        server,
+        &state,
+        &shutdown_notify,
+        &mut rm_handle,
+        uni_aggregator::lifecycle::ShutdownLimits::default(),
+    )
+    .await
+    {
+        Ok(()) => info!("shutdown complete"),
+        Err(e) => {
+            // Not a clean shutdown: storage is left as it is (the WAL recovers it on the next
+            // start) and the process exits with an error instead of claiming success.
+            tracing::error!(err = %e, "shutdown did not complete");
+            shutdown_failed = true;
+        }
+    }
+    if shutdown_failed {
+        std::process::exit(1);
+    }
 
     Ok(())
 }

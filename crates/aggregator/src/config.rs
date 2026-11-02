@@ -116,6 +116,32 @@ pub struct Config {
     #[arg(long, env = "AGGREGATOR_BATCH_TIMEOUT_SECS", default_value_t = 5)]
     pub batch_timeout_secs: u64,
 
+    /// Longest `waitMs` the server honours on `get_inclusion_proof.v2` and the latest form of
+    /// `get_inclusion_proofs.v1`, in milliseconds. Zero answers every read immediately (with the
+    /// zero echo). The wait plus the 8 s response reserve must stay below the 30 s request budget.
+    #[arg(
+        long,
+        env = "AGGREGATOR_LONG_POLL_MAX_WAIT_MS",
+        default_value_t = 20000
+    )]
+    pub long_poll_max_wait_ms: u64,
+
+    /// Global cap on admitted long-poll waits (parked and resuming). Over the cap a request is
+    /// served immediately with a zero echo, never refused. Zero is supported.
+    #[arg(long, env = "AGGREGATOR_LONG_POLL_MAX_WAITERS", default_value_t = 1024)]
+    pub long_poll_max_waiters: usize,
+
+    /// Global budget C of active HTTP/RPC requests. Parked long-poll requests hold none. When it
+    /// is exhausted the answer is HTTP 503 + `Retry-After: 1` with a `-32006 busy` body. Below 2,
+    /// long-poll requests are not parked.
+    #[arg(long, env = "AGGREGATOR_CONCURRENCY_LIMIT", default_value_t = 1000)]
+    pub concurrency_limit: usize,
+
+    /// Connections served at once (each costs two file descriptors). At the bound the server stops
+    /// accepting until one closes; the descriptor limit is raised to the hard limit at startup.
+    #[arg(long, env = "AGGREGATOR_MAX_CONNECTIONS", default_value_t = 10000)]
+    pub max_connections: usize,
+
     /// BFT Core mode: "stub" (no real BFT Core) or "live".
     #[arg(long, env = "AGGREGATOR_BFT_MODE", default_value = "stub")]
     pub bft_mode: String,

@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 /// Default request lifetime in seconds when the deployment sets none.
 pub const DEFAULT_REQUEST_TTL_SECS: u64 = 3600;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tracing::debug;
 
 use crate::api::cbor::CertDataFields;
+use crate::longpoll;
 use crate::smt::AGGREGATION_TREE_VALUE_SIZE;
 use crate::validation::ValidatedRequest;
 
@@ -258,9 +259,8 @@ impl Catalog {
 
     fn evict(&mut self, now: Instant) {
         let latest = self.latest.clone();
-        let is_latest = |v: &Arc<CertifiedProofState>| {
-            latest.as_ref().is_some_and(|l| Arc::ptr_eq(l, v))
-        };
+        let is_latest =
+            |v: &Arc<CertifiedProofState>| latest.as_ref().is_some_and(|l| Arc::ptr_eq(l, v));
         let max_age = self.limits.max_age;
         let before = self.retained.len();
         self.retained
@@ -294,6 +294,15 @@ pub enum BusyKind {
     PinnedViews,
     /// The execution budget elapsed.
     Deadline,
+}
+
+/// Capacity and options of one batch read of a long-poll request.
+#[derive(Default)]
+pub struct BatchRead {
+    /// Capacity granted to a resumed read, transferred into it.
+    pub permits: longpoll::ReadPermits,
+    /// Snapshot the pending/expired/unknown hints before any proof or record read.
+    pub hints_first: bool,
 }
 
 /// Typed failure of a batch inclusion lookup.
@@ -410,10 +419,13 @@ pub struct AggregatorState {
     /// Admission control in front of the bounded proof worker queues, shared by
     /// single non-inclusion lookups and batches so more retained views cannot
     /// multiply proof concurrency.
-    pub(crate) proof_permits: Arc<Semaphore>,
+    ///
+    /// Atomic pools: fresh requests take a unit with no headroom, resumed long-poll reads keep
+    /// one unit free, and the unit travels into the dedicated proof worker, which releases it
+    /// only when it has really stopped.
+    proof_pool: Arc<longpoll::Pool>,
     /// Concurrent batch requests (each pins one view).
-    batch_permits: Arc<Semaphore>,
-    batch_permit_limit: std::sync::atomic::AtomicUsize,
+    batch_pool: Arc<longpoll::Pool>,
     /// Requests dropped at their deadline (hint only, bounded).
     expired: StdMutex<ExpiredSet>,
     /// Reference time a round starting now would pin, published by the round
@@ -425,6 +437,13 @@ pub struct AggregatorState {
     /// The configured shard (canonical end-marker encoding); state ids outside its prefix are
     /// refused at admission. Unset (or `0x80`) restricts nothing.
     shard_id: std::sync::OnceLock<Vec<u8>>,
+    /// Long-poll waiter registry, the global active-work budget and the wake generation.
+    longpoll: Arc<longpoll::Registry>,
+    /// Test-only: whether fresh batch grants take the admission lock, and a barrier hook.
+    #[cfg(test)]
+    fresh_lock: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fresh_hook: StdMutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl AggregatorState {
@@ -432,6 +451,7 @@ impl AggregatorState {
         request_tx: mpsc::Sender<ValidatedRequest>,
         store: Option<Arc<dyn Store>>,
     ) -> Arc<Self> {
+        let registry = Arc::new(longpoll::Registry::new());
         Arc::new(Self {
             reference_time: AtomicU64::new(0),
             shard_id: std::sync::OnceLock::new(),
@@ -443,13 +463,27 @@ impl AggregatorState {
             request_tx,
             store,
             catalog: StdMutex::new(Catalog::new(RetentionLimits::default())),
-            proof_permits: Arc::new(Semaphore::new(CERTIFIED_PROOF_MAX_IN_FLIGHT)),
-            batch_permits: Arc::new(Semaphore::new(RetentionLimits::default().max_active_batches)),
-            batch_permit_limit: std::sync::atomic::AtomicUsize::new(
-                RetentionLimits::default().max_active_batches,
-            ),
+            proof_pool: registry.new_pool(CERTIFIED_PROOF_MAX_IN_FLIGHT),
+            batch_pool: registry.new_pool(RetentionLimits::default().max_active_batches),
             expired: StdMutex::new(ExpiredSet::default()),
+            longpoll: registry,
+            #[cfg(test)]
+            fresh_lock: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            fresh_hook: StdMutex::new(None),
         })
+    }
+
+    /// The long-poll registry (waiters, generation, active-work budget, metrics).
+    pub fn longpoll(&self) -> &Arc<longpoll::Registry> {
+        &self.longpoll
+    }
+
+    /// Ask waiters to re-read: a certified commit finished serving, a request left the pending
+    /// set for good, or a request expired. Call it with no lock held. A wake asserts nothing:
+    /// every waiter performs a fresh ordinary read.
+    pub fn notify_waiters(&self) {
+        self.longpoll.notify();
     }
 
     // ── Block number ──────────────────────────────────────────────────────────
@@ -553,6 +587,7 @@ impl AggregatorState {
             Ok(()) => Ok(()),
             Err(_) => {
                 self.resolve_state_id_hex(&state_id_hex);
+                self.notify_waiters();
                 Err(anyhow::anyhow!("round manager channel closed"))
             }
         }
@@ -771,18 +806,34 @@ impl AggregatorState {
         catalog.evict(Instant::now());
         drop(catalog);
         // Permits are only replaced while idle at startup.
-        self.batch_permits_resize(limits.max_active_batches);
+        self.batch_pool.set_limit(limits.max_active_batches);
+        // Resumed batch reads: min(B-1, S-1), so one batch slot and one proof slot stay free for
+        // fresh requests. Fewer than two of either disables batch parking.
+        let cap = limits
+            .max_active_batches
+            .saturating_sub(1)
+            .min(CERTIFIED_PROOF_MAX_IN_FLIGHT.saturating_sub(1));
+        self.longpoll.set_batch_resume_cap(cap);
     }
 
-    fn batch_permits_resize(&self, target: usize) {
-        // Startup only: grow or shrink the idle semaphore to the configured size.
-        let current = self.batch_permit_limit.load(Ordering::Acquire);
-        if target > current {
-            self.batch_permits.add_permits(target - current);
-        } else if target < current {
-            let _ = self.batch_permits.forget_permits(current - target);
-        }
-        self.batch_permit_limit.store(target, Ordering::Release);
+    /// Wait until no request, batch slot or proof slot is held any more: all proof work has
+    /// acknowledged completion (work quiescence; worker threads are not joined). `false` if the
+    /// deadline passes first.
+    pub async fn wait_workers_idle(&self, until: tokio::time::Instant) -> bool {
+        let a = self.longpoll.gate().wait_idle(until).await;
+        let b = self.batch_pool.wait_idle(until).await;
+        let c = self.proof_pool.wait_idle(until).await;
+        a && b && c
+    }
+
+    /// The batch slots (tests, metrics).
+    pub fn batch_pool(&self) -> &Arc<longpoll::Pool> {
+        &self.batch_pool
+    }
+
+    /// The shared proof slots (tests, metrics).
+    pub fn proof_pool(&self) -> &Arc<longpoll::Pool> {
+        &self.proof_pool
     }
 
     pub fn retention_limits(&self) -> RetentionLimits {
@@ -804,21 +855,41 @@ impl AggregatorState {
         &self,
         state_id: [u8; 32],
     ) -> anyhow::Result<NonInclusionProofLookup> {
+        self.get_non_inclusion_proof_with(state_id, None).await
+    }
+
+    /// [`Self::get_non_inclusion_proof`] where the request's HTTP budget unit travels into the
+    /// proof worker and is released only when the worker has stopped (also after a disconnect).
+    pub async fn get_non_inclusion_proof_with(
+        &self,
+        state_id: [u8; 32],
+        keepalive: Option<longpoll::ActiveHandle>,
+    ) -> anyhow::Result<NonInclusionProofLookup> {
         let Some(certified) = self.latest_view() else {
             return Ok(NonInclusionProofLookup::CertifiedStateUnavailable);
         };
 
-        let permit = match Arc::clone(&self.proof_permits).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return Ok(NonInclusionProofLookup::Busy),
+        let Some(permit) = self.proof_pool.try_acquire(0) else {
+            return Ok(NonInclusionProofLookup::Busy);
         };
-        let worker = certified.smt.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            worker.get_non_inclusion_proof(state_id)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("non-inclusion proof task failed: {error}"))??;
+        let cancel = smt_store::Cancel::default();
+        let _stop = CancelOnDrop(cancel.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let hold: smt_store::Hold = Box::new((permit, keepalive));
+        certified
+            .smt
+            .submit_non_inclusion(
+                state_id,
+                cancel,
+                hold,
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            )
+            .map_err(|e| anyhow::anyhow!("non-inclusion proof: {e}"))?;
+        let outcome = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("certified SMT proof worker dropped the response"))??;
 
         match outcome {
             rsmt::NonInclusionProofOutcome::StateIncluded => {
@@ -854,7 +925,7 @@ impl AggregatorState {
 
     /// Requests dropped because their deadline passed: remember them (bounded,
     /// best effort) and stop counting them pending.
-    pub(crate) fn drop_expired_requests(&self, requests: &[ValidatedRequest]) {
+    pub fn drop_expired_requests(&self, requests: &[ValidatedRequest]) {
         {
             let now = Instant::now();
             let mut expired = self
@@ -866,6 +937,8 @@ impl AggregatorState {
             }
         }
         self.resolve_requests(requests);
+        // After the tombstones and the pending resolution: a waiter now reads `expired`.
+        self.notify_waiters();
     }
 
     /// Unauthenticated, node-local hint about a state with no certified proof.
@@ -898,6 +971,93 @@ impl AggregatorState {
         state_ids: &[[u8; 32]],
         selector: ViewSelector,
     ) -> Result<BatchProofs, BatchProofError> {
+        self.get_inclusion_proofs_batch_with(state_ids, selector, BatchRead::default())
+            .await
+    }
+
+    /// A fresh request's two-pool grant (batch slot, then proof slot). It is a tentative
+    /// transaction like a resumer's, so it is made under the same lock: its silent rollback can
+    /// then never hide capacity from a parked resumer which would sleep with nothing to wake it.
+    pub fn grant_fresh_batch_pools(
+        &self,
+        batch: Option<longpoll::Permit>,
+        proof: Option<longpoll::Permit>,
+    ) -> Result<(longpoll::Permit, longpoll::Permit), BatchProofError> {
+        let granted = {
+            #[cfg(test)]
+            let _decision = self
+                .fresh_lock
+                .load(Ordering::SeqCst)
+                .then(|| self.longpoll.admission_lock());
+            #[cfg(not(test))]
+            let _decision = self.longpoll.admission_lock();
+            match batch.or_else(|| self.batch_pool.try_acquire(0)) {
+                None => None,
+                Some(b) => match proof.or_else(|| self.proof_pool.try_acquire(0)) {
+                    Some(p) => Some((b, p)),
+                    None => {
+                        #[cfg(test)]
+                        self.fresh_pause();
+                        b.rollback();
+                        None
+                    }
+                },
+            }
+        };
+        // The statistics are updated outside the admission critical section.
+        granted.ok_or_else(|| {
+            self.catalog().stats.rejected_busy += 1;
+            BatchProofError::Busy(BusyKind::ActiveRequests)
+        })
+    }
+
+    /// Test hook: pause a fresh grant between the proof refusal and the batch rollback.
+    #[cfg(test)]
+    fn fresh_pause(&self) {
+        let hook = self.fresh_hook.lock().unwrap().take();
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.recv();
+        }
+    }
+
+    /// Non-blocking grant of the batch slot and the shared proof slot together, leaving at least
+    /// one unit of each free for fresh requests. Each pool reserves atomically (compare-and-swap
+    /// with the headroom), so racing fresh and resumed requests cannot both take the last unit;
+    /// a refusal by the second pool rolls the first back without announcing freed capacity.
+    pub fn try_batch_pools(&self) -> Option<longpoll::ReadPermits> {
+        let batch = self.batch_pool.try_acquire(1)?;
+        let Some(proof) = self.proof_pool.try_acquire(1) else {
+            batch.rollback();
+            return None;
+        };
+        Some(longpoll::ReadPermits {
+            batch: Some(batch),
+            proof: Some(proof),
+            ..Default::default()
+        })
+    }
+
+    /// [`Self::get_inclusion_proofs_batch`] with granted capacity and optional hint snapshot.
+    pub async fn get_inclusion_proofs_batch_with(
+        &self,
+        state_ids: &[[u8; 32]],
+        selector: ViewSelector,
+        read: BatchRead,
+    ) -> Result<BatchProofs, BatchProofError> {
+        // Opt-in reads snapshot every hint before any view, record or proof read.
+        let hints: Option<Vec<&'static str>> = read.hints_first.then(|| {
+            state_ids
+                .iter()
+                .map(|id| self.absence_class(&hex::encode(id)))
+                .collect()
+        });
+        let longpoll::ReadPermits {
+            batch,
+            proof,
+            keepalive,
+            holds,
+        } = read.permits;
         let (limits, view) = {
             let catalog = self.catalog();
             let view = match selector {
@@ -922,38 +1082,42 @@ impl AggregatorState {
         }
         // Admission: concurrent batches first, then the proof-work budget shared
         // with single non-inclusion lookups.
-        let batch_permit = Arc::clone(&self.batch_permits)
-            .try_acquire_owned()
-            .map_err(|_| {
-                self.catalog().stats.rejected_busy += 1;
-                BatchProofError::Busy(BusyKind::ActiveRequests)
-            })?;
-        let proof_permit = Arc::clone(&self.proof_permits)
-            .try_acquire_owned()
-            .map_err(|_| {
-                self.catalog().stats.rejected_busy += 1;
-                BatchProofError::Busy(BusyKind::ActiveRequests)
-            })?;
+        let (batch_permit, proof_permit) = match (batch, proof) {
+            (Some(b), Some(p)) => (b, p),
+            (b, p) => self.grant_fresh_batch_pools(b, p)?,
+        };
 
         let deadline = Instant::now() + limits.batch_timeout;
         let keys: Vec<rsmt::SmtKey> = state_ids.to_vec();
-        let worker = view.smt.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            // Held until the worker answered or gave up, not until the caller
-            // stopped waiting.
-            let _permits = (batch_permit, proof_permit);
-            worker.get_inclusion_batch(keys, deadline)
-        })
-        .await
-        .map_err(|e| BatchProofError::Internal(anyhow::anyhow!("batch task failed: {e}")))?
-        .map_err(|e| match e {
-            SnapshotError::QueueFull => {
-                self.catalog().stats.rejected_busy += 1;
-                BatchProofError::Busy(BusyKind::PinnedViews)
-            }
-            SnapshotError::Deadline => BatchProofError::Busy(BusyKind::Deadline),
-            other => BatchProofError::Internal(anyhow::anyhow!(other.to_string())),
-        })?;
+        // The worker owns every unit of accounting (batch and proof slots, the request's HTTP
+        // unit, the waiter reservation, the resume quota) until it has stopped. Dropping this
+        // future (client gone) or running past the deadline only sets `cancel`: the worker
+        // stops at the next key or node read and releases the holds itself.
+        let cancel = smt_store::Cancel::default();
+        let _stop = CancelOnDrop(cancel.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let hold: smt_store::Hold = Box::new((batch_permit, proof_permit, keepalive, holds));
+        view.smt
+            .submit_inclusion_batch(
+                keys,
+                deadline,
+                cancel.clone(),
+                hold,
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            )
+            .map_err(|e| self.snapshot_error(e))?;
+        let answer =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(SnapshotError::Stopped),
+                Err(_) => {
+                    cancel.cancel();
+                    Err(SnapshotError::Deadline)
+                }
+            };
+        let entries = answer.map_err(|e| self.snapshot_error(e))?;
         if entries.len() != state_ids.len() {
             return Err(BatchProofError::Internal(anyhow::anyhow!(
                 "snapshot worker returned {} entries for {} keys",
@@ -976,6 +1140,8 @@ impl AggregatorState {
                     } else if record.is_some() {
                         // Finalized after the pinned latest view.
                         "pending"
+                    } else if let Some(hints) = &hints {
+                        hints[i]
                     } else {
                         self.absence_class(&hex_id)
                     };
@@ -1030,11 +1196,31 @@ impl AggregatorState {
         })
     }
 
+    fn snapshot_error(&self, e: SnapshotError) -> BatchProofError {
+        match e {
+            SnapshotError::QueueFull => {
+                self.catalog().stats.rejected_busy += 1;
+                BatchProofError::Busy(BusyKind::PinnedViews)
+            }
+            SnapshotError::Deadline => BatchProofError::Busy(BusyKind::Deadline),
+            other => BatchProofError::Internal(anyhow::anyhow!(other.to_string())),
+        }
+    }
+
     /// Latest certified block, used to publish a proof snapshot on startup.
     pub(crate) async fn latest_certified_block(&self) -> Option<BlockInfo> {
         let next = *self.block_number.read().await;
         let latest = next.checked_sub(1)?;
         self.blocks.get(&latest).map(|block| block.clone())
+    }
+}
+
+/// Sets the cancellation of a worker request when the awaiting future ends or is dropped.
+struct CancelOnDrop(smt_store::Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1055,6 +1241,7 @@ pub struct FinalizedRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     /// Omitting the deadline delegates assignment to the service: the deadline
     /// is the default lifetime added to the consensus reference time, so the
@@ -1176,11 +1363,7 @@ mod tests {
         ));
 
         let held_permits: Vec<_> = (0..CERTIFIED_PROOF_MAX_IN_FLIGHT)
-            .map(|_| {
-                Arc::clone(&state.proof_permits)
-                    .try_acquire_owned()
-                    .unwrap()
-            })
+            .map(|_| state.proof_pool.try_acquire(0).unwrap())
             .collect();
         assert!(matches!(
             state.get_non_inclusion_proof(absent_key).await.unwrap(),
@@ -1230,10 +1413,7 @@ mod tests {
         let mut mutation = smt.create_snapshot();
         for &seed in seeds {
             mutation
-                .add_leaf(
-                    key(seed),
-                    rsmt::leaf_value(&txh(seed), REF_TIME).to_vec(),
-                )
+                .add_leaf(key(seed), rsmt::leaf_value(&txh(seed), REF_TIME).to_vec())
                 .unwrap();
         }
         mutation.commit(smt).unwrap();
@@ -1418,7 +1598,11 @@ mod tests {
         for i in 0..(EXPIRED_MAX_ENTRIES + 10) {
             set.insert(&format!("{i:08}"), t0);
         }
-        assert_eq!(set.at.len(), EXPIRED_MAX_ENTRIES, "count cap evicts the oldest");
+        assert_eq!(
+            set.at.len(),
+            EXPIRED_MAX_ENTRIES,
+            "count cap evicts the oldest"
+        );
         assert!(!set.contains("00000000", t0));
         assert!(set.contains(&format!("{:08}", EXPIRED_MAX_ENTRIES + 9), t0));
         // After the TTL everything is forgotten.
@@ -1447,9 +1631,16 @@ mod tests {
         assert_eq!(stats.retained_views, 3);
         assert_eq!(stats.evicted_by_count, 2);
         let catalog = state.catalog();
-        let retained: Vec<_> = catalog.retained.iter().filter_map(|v| v.block.root_hash).collect();
+        let retained: Vec<_> = catalog
+            .retained
+            .iter()
+            .filter_map(|v| v.block.root_hash)
+            .collect();
         assert_eq!(retained, roots[2..].to_vec());
-        assert_eq!(catalog.latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
+        assert_eq!(
+            catalog.latest.as_ref().unwrap().block.root_hash,
+            Some(roots[4])
+        );
         drop(catalog);
 
         // Age: with a zero budget every superseded view goes at the next publish,
@@ -1462,7 +1653,10 @@ mod tests {
         let stats = state.catalog_stats();
         assert_eq!(stats.retained_views, 1);
         assert_eq!(stats.evicted_by_age, 2);
-        assert_eq!(state.catalog().latest.as_ref().unwrap().block.root_hash, Some(roots[4]));
+        assert_eq!(
+            state.catalog().latest.as_ref().unwrap().block.root_hash,
+            Some(roots[4])
+        );
     }
 
     #[test]
@@ -1536,7 +1730,7 @@ mod tests {
         round(&state, &mut smt, &[0x11], 1, &[0x80]);
         let limit = state.retention_limits().max_active_batches;
         let held: Vec<_> = (0..limit)
-            .map(|_| Arc::clone(&state.batch_permits).try_acquire_owned().unwrap())
+            .map(|_| state.batch_pool.try_acquire(0).unwrap())
             .collect();
         assert!(matches!(
             state
@@ -1547,7 +1741,7 @@ mod tests {
         drop(held);
         // The shared proof-work budget also binds batches.
         let held: Vec<_> = (0..CERTIFIED_PROOF_MAX_IN_FLIGHT)
-            .map(|_| Arc::clone(&state.proof_permits).try_acquire_owned().unwrap())
+            .map(|_| state.proof_pool.try_acquire(0).unwrap())
             .collect();
         assert!(matches!(
             state
@@ -1560,8 +1754,8 @@ mod tests {
             .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
             .await
             .unwrap();
-        assert_eq!(state.batch_permits.available_permits(), limit);
-        assert_eq!(state.proof_permits.available_permits(), CERTIFIED_PROOF_MAX_IN_FLIGHT);
+        assert_eq!(state.batch_pool.available(), limit);
+        assert_eq!(state.proof_pool.available(), CERTIFIED_PROOF_MAX_IN_FLIGHT);
         assert!(state.catalog_stats().rejected_busy >= 2);
     }
 
@@ -1572,11 +1766,297 @@ mod tests {
             max_active_batches: 2,
             ..RetentionLimits::default()
         });
-        assert_eq!(state.batch_permits.available_permits(), 2);
+        assert_eq!(state.batch_pool.available(), 2);
         state.set_retention_limits(RetentionLimits {
             max_active_batches: 5,
             ..RetentionLimits::default()
         });
-        assert_eq!(state.batch_permits.available_permits(), 5);
+        assert_eq!(state.batch_pool.available(), 5);
+    }
+
+    /// Stall the dedicated worker of the latest view: its responder blocks the worker thread until
+    /// the returned sender is used. Returns once the worker is really stuck.
+    fn stall_worker(state: &AggregatorState) -> std::sync::mpsc::Sender<()> {
+        let view = state.latest_view().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        view.smt
+            .submit_inclusion_batch(
+                vec![key(0x11)],
+                Instant::now() + Duration::from_secs(60),
+                smt_store::Cancel::default(),
+                Box::new(()),
+                Box::new(move |_| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                }),
+            )
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker stalled");
+        release_tx
+    }
+
+    async fn until(mut f: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    /// Worker completion, not the caller, owns the accounting: a disconnect (the awaiting future
+    /// dropped) and a deadline which expires while the dedicated worker is stalled both leave the
+    /// batch slot, the proof slot and the request's budget unit held until the worker
+    /// acknowledges (it finds the request cancelled and skips it).
+    #[tokio::test]
+    async fn disconnect_and_deadline_keep_the_accounting_until_the_worker_acknowledges() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+        state.set_retention_limits(RetentionLimits {
+            batch_timeout: Duration::from_millis(300),
+            ..RetentionLimits::default()
+        });
+        let release = stall_worker(&state);
+        let gate = Arc::clone(state.longpoll().gate());
+        let read = |state: &Arc<AggregatorState>, handle| {
+            let state = Arc::clone(state);
+            async move {
+                state
+                    .get_inclusion_proofs_batch_with(
+                        &[key(0x11)],
+                        ViewSelector::Latest,
+                        BatchRead {
+                            permits: longpoll::ReadPermits {
+                                keepalive: Some(handle),
+                                ..Default::default()
+                            },
+                            hints_first: false,
+                        },
+                    )
+                    .await
+            }
+        };
+
+        // Disconnect while the worker is stuck.
+        let handle = gate.acquire_handle().unwrap();
+        let task = tokio::spawn(read(&state, handle));
+        until(|| state.batch_pool().in_use() == 1).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            (
+                state.batch_pool().in_use(),
+                state.proof_pool().in_use(),
+                gate.in_use()
+            ),
+            (1, 1, 1),
+            "an aborted request gives nothing back while the worker may still be running"
+        );
+
+        // A deadline which expires meanwhile: the caller gets the busy answer, the units stay.
+        let handle = gate.acquire_handle().unwrap();
+        let t0 = std::time::Instant::now();
+        let got = read(&state, handle).await;
+        assert!(matches!(
+            got,
+            Err(BatchProofError::Busy(BusyKind::Deadline))
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(250));
+        assert_eq!(
+            (
+                state.batch_pool().in_use(),
+                state.proof_pool().in_use(),
+                gate.in_use()
+            ),
+            (2, 2, 2)
+        );
+
+        // The shutdown join sees the unacknowledged work: it does not report idle.
+        assert!(
+            !state
+                .wait_workers_idle(tokio::time::Instant::now() + Duration::from_millis(200))
+                .await
+        );
+        // The worker comes back, finds both requests cancelled and acknowledges them.
+        release.send(()).unwrap();
+        until(|| {
+            (
+                state.batch_pool().in_use(),
+                state.proof_pool().in_use(),
+                gate.in_use(),
+            ) == (0, 0, 0)
+        })
+        .await;
+        // And ordinary traffic is served again.
+        state
+            .get_inclusion_proofs_batch(&[key(0x11)], ViewSelector::Latest)
+            .await
+            .unwrap();
+    }
+
+    /// The same for the non-inclusion path, and no-wait traffic gets the keepalive too.
+    #[tokio::test]
+    async fn non_inclusion_worker_owns_its_accounting_as_well() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+        let release = stall_worker(&state);
+        let gate = Arc::clone(state.longpoll().gate());
+        let handle = gate.acquire_handle().unwrap();
+        let s2 = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            s2.get_non_inclusion_proof_with(key(0x99), Some(handle))
+                .await
+        });
+        until(|| state.proof_pool().in_use() == 1).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!((state.proof_pool().in_use(), gate.in_use()), (1, 1));
+        release.send(()).unwrap();
+        until(|| (state.proof_pool().in_use(), gate.in_use()) == (0, 0)).await;
+    }
+
+    /// Simultaneous fresh and resumed admissions on a multi-threaded runtime never let the
+    /// resumed ones take the last unit of either pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_fresh_and_resumed_batch_admissions_keep_the_headroom() {
+        let state = new_state();
+        let mut tasks = vec![];
+        for i in 0..32usize {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                let mut resumed_max = 0usize;
+                for _ in 0..2_000 {
+                    if i % 2 == 0 {
+                        if let Some(p) = state.try_batch_pools() {
+                            resumed_max = resumed_max.max(state.batch_pool().in_use());
+                            drop(p);
+                        }
+                    } else if let Some(b) = state.batch_pool().try_acquire(0) {
+                        drop(b);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                resumed_max
+            }));
+        }
+        let mut worst = 0;
+        for t in tasks {
+            worst = worst.max(t.await.unwrap());
+        }
+        // Fresh holders may fill the pool; what must never happen is a resumed grant when fewer
+        // than two units were free, which the compare-and-swap rules out: with up to 16 fresh
+        // threads the observed use at a resumed grant is bounded by the limit.
+        assert!(worst <= state.batch_pool().limit());
+        assert_eq!(
+            (state.batch_pool().in_use(), state.proof_pool().in_use()),
+            (0, 0)
+        );
+        // Deterministic form: resumed grants stop at limit - 1, fresh still passes.
+        let held: Vec<_> = (0..state.batch_pool().limit() - 1)
+            .map(|_| state.try_batch_pools().unwrap())
+            .collect();
+        assert!(state.try_batch_pools().is_none());
+        assert!(state.batch_pool().try_acquire(0).is_some());
+        drop(held);
+    }
+
+    /// The interleaving a fresh batch grant used to lose a wake in. Six batch slots are occupied
+    /// and the proof pool is full. A fresh grant takes the seventh batch slot, is refused by the
+    /// proof pool and is paused before its rollback. A resumer is woken and refused (it sees the
+    /// tentative slot), then two proof releases come and go; finally the rollback proceeds. With
+    /// the admission lock the resumer cannot decide against the tentative state and is granted;
+    /// without it, it has already gone back to sleep and nothing wakes it.
+    async fn paused_fresh_rollback(locked: bool) -> bool {
+        let state = new_state();
+        state.fresh_lock.store(locked, Ordering::SeqCst);
+        state.proof_pool().set_limit(2);
+        let reg = Arc::clone(state.longpoll());
+        let _occupants: Vec<_> = (0..6)
+            .map(|_| state.batch_pool().try_acquire(0).unwrap())
+            .collect();
+        let proofs: Vec<_> = (0..2)
+            .map(|_| state.proof_pool().try_acquire(0).unwrap())
+            .collect();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r2, s2, rd2) = (Arc::clone(&reg), Arc::clone(&state), Arc::clone(&ready));
+        let resumer = tokio::spawn(async move {
+            let pools = move || s2.try_batch_pools();
+            longpoll::run(
+                &r2,
+                "t",
+                longpoll::Class::Batch,
+                tokio::time::Instant::now(),
+                10_000,
+                &longpoll::ActiveSlot::default(),
+                &pools,
+                || "busy",
+                |p| {
+                    let rd = Arc::clone(&rd2);
+                    async move {
+                        drop(p);
+                        longpoll::Read {
+                            pending: !rd.load(Ordering::SeqCst),
+                            value: "done",
+                        }
+                    }
+                },
+            )
+            .await
+            .0
+        });
+        until(|| reg.reserved() == 1).await;
+        // the fresh grant, paused between the proof refusal and the batch rollback
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *state.fresh_hook.lock().unwrap() = Some((reached_tx, resume_rx));
+        let s3 = Arc::clone(&state);
+        let fresh = std::thread::spawn(move || s3.grant_fresh_batch_pools(None, None).is_err());
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fresh grant is paused");
+        assert_eq!(
+            state.batch_pool().in_use(),
+            7,
+            "the tentative slot is visible"
+        );
+        // wake the resumer; it decides while the rollback is pending
+        ready.store(true, Ordering::SeqCst);
+        reg.notify();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // two proof releases come and go while the rollback is paused
+        let mut proofs = proofs;
+        drop(proofs.pop());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(proofs.pop());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // now the rollback proceeds (silent)
+        resume_tx.send(()).unwrap();
+        assert!(fresh.join().unwrap(), "the fresh grant was refused");
+        let granted = tokio::time::timeout(Duration::from_millis(700), resumer).await;
+        matches!(granted, Ok(Ok("done")))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_fresh_rollback_cannot_starve_a_parked_resumer() {
+        assert!(
+            paused_fresh_rollback(true).await,
+            "granted promptly under the admission lock"
+        );
+    }
+
+    /// The same interleaving with the fresh-path lock switched off loses the wake: the resumer
+    /// sleeps with two batch and two proof slots free. This is what the lock prevents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_the_fresh_path_lock_the_same_interleaving_loses_the_wake() {
+        assert!(
+            !paused_fresh_rollback(false).await,
+            "the resumer must be left sleeping when the fresh grant is not serialized"
+        );
     }
 }

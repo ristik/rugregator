@@ -8,7 +8,7 @@
 //! and `L1` raw-response lines {"scenario":"L1","kind":..,"http":..,"body":<normalized>} that
 //! `report.py` compares between two servers.
 //!
-//! Environment: IX_URL, IX_TRUSTBASE, IX_SERVER (s2lp|s2base|s1lp|s2cap0), IX_SCEN (comma list of
+//! Environment: IX_URL, IX_TRUSTBASE, IX_SERVER (s2lp|s2base|s1lp|s1rug|s1rugcap0|s2cap0), IX_SCEN (comma list of
 //! L1,L2,L3,L4,L5,L6,L7; default depends on the server), IX_ROUND_MS (default 1000), IX_CASES
 //! (envelope_cases.json), L7: IX_N (states per variant, default 200), IX_RATE (open-loop arrivals/s, default 10).
 #![cfg(feature = "http")]
@@ -448,6 +448,11 @@ fn l5(ctx: &Ctx) {
 
 fn l6(ctx: &Ctx) {
     let agg = ctx.http(200);
+    // Warm-up: a fresh server answers every not-certified read with the typed `no_finalized_view`
+    // error until its first block; certify one state first (plain polling, no wait).
+    let w = new_mint(ctx.trust_base.network_id);
+    agg.submit_certification_request(&w.data).unwrap();
+    let _ = agg.wait_for_inclusion_proof(&w.state_id, &WaitOptions::new(Duration::from_secs(60)).with_long_poll(false).with_poll_interval(Duration::from_millis(200)));
     let m = new_mint(ctx.trust_base.network_id);
     agg.submit_certification_request(&m.data).unwrap();
     let t0 = Instant::now();
@@ -617,7 +622,9 @@ fn interop_lp() {
     let default = match ctx.server.as_str() {
         "s2lp" => "L1,L2,L3,L4",
         "s2base" => "L1,L5",
-        "s1lp" => "L5",
+        "s1lp" => "L5", // historical: rugregator with the reservation-only parser
+        "s1rug" => "L1,L2,L3,L4", // rugregator with real long-poll
+        "s1rugcap0" => "L6",      // same, started with --long-poll-max-waiters 0
         "s2cap0" => "L6",
         other => panic!("unknown IX_SERVER {other}"),
     };

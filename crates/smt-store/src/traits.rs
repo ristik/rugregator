@@ -1,5 +1,7 @@
 //! Common trait for SMT store implementations.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsmt::{leaf_value, InclusionProof, NonInclusionProofOutcome, SmtError, SmtHasher, SmtKey};
@@ -27,6 +29,28 @@ pub enum InclusionBatchEntry {
     Absent,
 }
 
+/// Cooperative cancellation of a request owned by a snapshot worker. Setting it makes the worker
+/// stop between keys and between node reads; a request still queued is dropped unexecuted.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Resources (admission permits, budget handles) which travel with a request into the dedicated
+/// worker and are dropped by it when it has finished or abandoned the request, before it answers.
+/// Capacity therefore follows the actual work, not the caller that stopped waiting.
+pub type Hold = Box<dyn std::any::Any + Send>;
+
+/// How a worker delivers its answer (from the worker thread, so it must not block).
+pub type Responder<T> = Box<dyn FnOnce(T) + Send>;
+
 /// Typed failure of a request to a certified snapshot worker.
 #[derive(Debug)]
 pub enum SnapshotError {
@@ -36,6 +60,8 @@ pub enum SnapshotError {
     Stopped,
     /// The deadline passed before the answer was available.
     Deadline,
+    /// The request was cancelled by its owner.
+    Cancelled,
     /// The request is malformed for this API (e.g. too many keys).
     Invalid(&'static str),
     /// Storage or tree failure.
@@ -48,6 +74,7 @@ impl std::fmt::Display for SnapshotError {
             Self::QueueFull => f.write_str("certified SMT proof worker queue is full"),
             Self::Stopped => f.write_str("certified SMT proof worker stopped"),
             Self::Deadline => f.write_str("certified SMT proof deadline exceeded"),
+            Self::Cancelled => f.write_str("certified SMT proof request cancelled"),
             Self::Invalid(m) => write!(f, "invalid snapshot request: {m}"),
             Self::Internal(e) => write!(f, "certified SMT proof failure: {e}"),
         }
@@ -78,21 +105,39 @@ impl CertifiedSmtSnapshot {
     /// it on a blocking executor after applying an admission limit.
     pub fn get_non_inclusion_proof(&self, key: SmtKey) -> anyhow::Result<NonInclusionProofOutcome> {
         let (respond_to, response) = mpsc::sync_channel(1);
-        match self
-            .request_tx
-            .try_send(ProofRequest::NonInclusion { key, respond_to })
-        {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                return Err(anyhow::anyhow!("certified SMT proof worker queue is full"))
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(anyhow::anyhow!("certified SMT proof worker stopped"))
-            }
-        }
+        self.submit_non_inclusion(
+            key,
+            Cancel::default(),
+            Box::new(()),
+            Box::new(move |r| {
+                let _ = respond_to.send(r);
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         response
             .recv()
             .map_err(|_| anyhow::anyhow!("certified SMT proof worker dropped the response"))?
+    }
+
+    /// Queue a non-inclusion lookup. The worker owns `hold` until it has finished (or skipped the
+    /// request because `cancel` was set), then answers through `respond`.
+    pub fn submit_non_inclusion(
+        &self,
+        key: SmtKey,
+        cancel: Cancel,
+        hold: Hold,
+        respond: Responder<anyhow::Result<NonInclusionProofOutcome>>,
+    ) -> Result<(), SnapshotError> {
+        match self.request_tx.try_send(ProofRequest::NonInclusion {
+            key,
+            cancel,
+            hold,
+            respond_to: respond,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SnapshotError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SnapshotError::Stopped),
+        }
     }
 
     /// Look up many keys in this immutable view, in request order.
@@ -112,24 +157,49 @@ impl CertifiedSmtSnapshot {
         keys: Vec<SmtKey>,
         deadline: Instant,
     ) -> Result<Vec<InclusionBatchEntry>, SnapshotError> {
-        if keys.is_empty() || keys.len() > CERTIFIED_BATCH_MAX_KEYS {
-            return Err(SnapshotError::Invalid("batch must hold 1..=256 keys"));
-        }
         let (respond_to, response) = mpsc::sync_channel(1);
-        match self.request_tx.try_send(ProofRequest::InclusionBatch {
+        self.submit_inclusion_batch(
             keys,
             deadline,
-            respond_to,
-        }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Err(SnapshotError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => return Err(SnapshotError::Stopped),
-        }
+            Cancel::default(),
+            Box::new(()),
+            Box::new(move |r| {
+                let _ = respond_to.send(r);
+            }),
+        )?;
         let wait = deadline.saturating_duration_since(Instant::now());
         match response.recv_timeout(wait) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(SnapshotError::Deadline),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(SnapshotError::Stopped),
+        }
+    }
+
+    /// Queue an inclusion batch. The worker owns `hold` until the batch is finished, cancelled or
+    /// skipped (deadline passed or `cancel` set before it started), drops it, then answers through
+    /// `respond`. Callers which stop waiting set `cancel`; the capacity in `hold` is released only
+    /// when the worker really stopped.
+    pub fn submit_inclusion_batch(
+        &self,
+        keys: Vec<SmtKey>,
+        deadline: Instant,
+        cancel: Cancel,
+        hold: Hold,
+        respond: Responder<Result<Vec<InclusionBatchEntry>, SnapshotError>>,
+    ) -> Result<(), SnapshotError> {
+        if keys.is_empty() || keys.len() > CERTIFIED_BATCH_MAX_KEYS {
+            return Err(SnapshotError::Invalid("batch must hold 1..=256 keys"));
+        }
+        match self.request_tx.try_send(ProofRequest::InclusionBatch {
+            keys,
+            deadline,
+            cancel,
+            hold,
+            respond_to: respond,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SnapshotError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SnapshotError::Stopped),
         }
     }
 
@@ -166,21 +236,26 @@ impl CertifiedSmtSnapshot {
 pub(crate) enum ProofRequest {
     NonInclusion {
         key: SmtKey,
-        respond_to: SyncSender<anyhow::Result<NonInclusionProofOutcome>>,
+        cancel: Cancel,
+        hold: Hold,
+        respond_to: Responder<anyhow::Result<NonInclusionProofOutcome>>,
     },
     InclusionBatch {
         keys: Vec<SmtKey>,
         deadline: Instant,
-        respond_to: SyncSender<Result<Vec<InclusionBatchEntry>, SnapshotError>>,
+        cancel: Cancel,
+        hold: Hold,
+        respond_to: Responder<Result<Vec<InclusionBatchEntry>, SnapshotError>>,
     },
 }
 
-/// Answer an inclusion batch key by key with `lookup`, honouring the deadline
-/// before the first key and between keys. Shared by both backends so the
-/// deadline and ordering semantics cannot diverge.
+/// Answer an inclusion batch key by key with `lookup`, honouring the deadline and the
+/// cancellation before the first key and between keys. Shared by both backends so the deadline
+/// and ordering semantics cannot diverge.
 pub(crate) fn answer_inclusion_batch<F>(
     keys: &[SmtKey],
     deadline: Instant,
+    cancel: &Cancel,
     mut lookup: F,
 ) -> Result<Vec<InclusionBatchEntry>, SnapshotError>
 where
@@ -188,6 +263,9 @@ where
 {
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
+        if cancel.is_cancelled() {
+            return Err(SnapshotError::Cancelled);
+        }
         if Instant::now() >= deadline {
             return Err(SnapshotError::Deadline);
         }
