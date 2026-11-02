@@ -6878,6 +6878,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "http-body-util",
  "libc",
  "libp2p",
  "lru",

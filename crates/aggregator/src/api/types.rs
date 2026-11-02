@@ -158,26 +158,39 @@ impl JsonRpcError {
             data: None,
         }
     }
+    /// No certified snapshot yet (aggregator-go: `proof_unavailable`, structured data).
     pub fn not_found() -> Self {
-        Self {
-            code: Self::NOT_FOUND,
-            message: "not found".into(),
-            data: None,
-        }
+        Self::detailed(
+            Self::NOT_FOUND,
+            "No certified snapshot",
+            "proof_unavailable",
+            "no_finalized_view",
+            true,
+            None,
+            None,
+        )
     }
     pub fn state_included() -> Self {
-        Self {
-            code: Self::STATE_INCLUDED,
-            message: "state is already included".into(),
-            data: None,
-        }
+        Self::detailed(
+            Self::STATE_INCLUDED,
+            "State included",
+            "state_included",
+            "state_included",
+            false,
+            None,
+            None,
+        )
     }
     pub fn server_busy() -> Self {
-        Self {
-            code: Self::SERVER_BUSY,
-            message: "proof service is busy".into(),
-            data: None,
-        }
+        Self::detailed(
+            Self::SERVER_BUSY,
+            "Server busy",
+            "busy",
+            "active_requests",
+            true,
+            None,
+            None,
+        )
     }
     pub fn is_not_found(&self) -> bool {
         self.code == Self::NOT_FOUND
@@ -247,4 +260,29 @@ pub struct GetNonInclusionProofParams {
 pub struct BlockHeightResponse {
     #[serde(rename = "blockNumber")]
     pub block_number: String, // decimal string
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_inclusion_errors_carry_the_structured_data_of_aggregator_go() {
+        for (e, code, reason, retryable) in [
+            (JsonRpcError::not_found(), -32020, "proof_unavailable", true),
+            (
+                JsonRpcError::state_included(),
+                -32022,
+                "state_included",
+                false,
+            ),
+            (JsonRpcError::server_busy(), -32023, "busy", true),
+        ] {
+            assert_eq!(e.code, code);
+            let d = e.data.unwrap();
+            assert_eq!(d["reason"], reason);
+            assert_eq!(d["retryable"], retryable);
+            assert!(d["detail"].is_string());
+        }
+    }
 }
