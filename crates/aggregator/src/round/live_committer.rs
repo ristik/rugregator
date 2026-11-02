@@ -356,6 +356,8 @@ pub struct LiveBftConfig {
     /// UC inactivity timeout — re-send handshake after this many milliseconds
     /// without a UC.  Should be ~2× BFT Core's T2 for this partition.
     pub uc_timeout_ms: u64,
+    /// Certification request layout the root decodes (default: bft-core main).
+    pub request_wire: RequestWire,
 }
 
 // ─── LiveBftCommitter ─────────────────────────────────────────────────────────
@@ -412,6 +414,7 @@ impl LiveBftCommitter {
             .map_err(|e| anyhow::anyhow!("sig key (net): {e}"))?;
         let fake_st = cfg.fake_state_transitions;
         let uc_timeout_ms = cfg.uc_timeout_ms;
+        let wire = cfg.request_wire;
 
         tokio::spawn(async move {
             network_loop(
@@ -426,6 +429,7 @@ impl LiveBftCommitter {
                 sig_key2,
                 fake_st,
                 uc_timeout_ms,
+                wire,
             )
             .await;
         });
@@ -543,7 +547,21 @@ impl BftCommitter for LiveBftCommitter {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn cbor_cert_req(req: &BlockCertReq) -> anyhow::Result<Vec<u8>> {
+/// Layout of the certification request on the wire.
+///
+/// `Core` is the request of bft-core main (bft-go-base `BlockCertificationRequest`, 7 elements):
+/// `[PartitionID, ShardID, NodeID, InputRecord, BlockSize, StateSize, Signature]`. `WithZkProof` is
+/// the 8-element request of the bft-core `l1` branch (ZK / RSMT consistency-proof verification),
+/// which carries `ZkProof` after the input record (null when proofs are off). bft-core main decodes
+/// only the seven elements; `l1` decodes either count but rebuilds the eight-element signing
+/// preimage, so a seven-element request fails its signature check. Choose with `--bft-wire`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestWire {
+    Core,
+    WithZkProof,
+}
+
+fn cbor_cert_req(req: &BlockCertReq, wire: RequestWire) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     ciborium::into_writer(req, &mut buf)?;
     let mut val: ciborium::value::Value = ciborium::from_reader(&buf[..])?;
@@ -551,6 +569,10 @@ fn cbor_cert_req(req: &BlockCertReq) -> anyhow::Result<Vec<u8>> {
         if arr.len() >= 4 {
             let ir = arr[3].clone();
             arr[3] = ciborium::value::Value::Tag(INPUT_RECORD_TAG, Box::new(ir));
+        }
+        if wire == RequestWire::Core && arr.len() == 8 {
+            // zk_proof sits at index 4
+            arr.remove(4);
         }
     }
     let mut out = Vec::new();
@@ -993,6 +1015,7 @@ struct UcSession {
     sig_key: SecretKey,
     secp: Secp256k1<secp256k1::All>,
     fake_state_transitions: bool,
+    wire: RequestWire,
     throttle: LogThrottle,
 }
 
@@ -1003,6 +1026,7 @@ impl UcSession {
         node_id: String,
         sig_key: SecretKey,
         fake_state_transitions: bool,
+        wire: RequestWire,
     ) -> Self {
         Self {
             partition_id: intake.partition_id,
@@ -1016,6 +1040,7 @@ impl UcSession {
             sig_key,
             secp: Secp256k1::new(),
             fake_state_transitions,
+            wire,
             throttle: LogThrottle::default(),
         }
     }
@@ -1134,6 +1159,7 @@ impl UcSession {
                     &self.node_id,
                     &self.secp,
                     &self.sig_key,
+                    self.wire,
                 ) {
                     Ok(cbor) => {
                         warn!(
@@ -1232,6 +1258,7 @@ impl UcSession {
                     &self.node_id,
                     &self.secp,
                     &self.sig_key,
+                    self.wire,
                 ) {
                     Ok(cbor) => {
                         info!(
@@ -1274,6 +1301,7 @@ fn make_cert_cbor(
     node_id: &str,
     secp: &Secp256k1<secp256k1::All>,
     sig_key: &SecretKey,
+    wire: RequestWire,
 ) -> anyhow::Result<Vec<u8>> {
     // State changed = new hash differs from the PreviousHash we're sending.
     let state_changed = match &prev_hash_ir {
@@ -1309,10 +1337,10 @@ fn make_cert_cbor(
     };
     // Sign: compute digest of unsigned CBOR, then set signature
     req.signature = None;
-    let raw = cbor_cert_req(&req)?;
+    let raw = cbor_cert_req(&req, wire)?;
     let hash: [u8; 32] = Sha256::digest(&raw).into();
     req.signature = Some(sign_recoverable(secp, sig_key, hash));
-    cbor_cert_req(&req)
+    cbor_cert_req(&req, wire)
 }
 
 /// Sign a 32-byte digest as the 65-byte `r || s || v` recoverable signature that
@@ -1353,6 +1381,7 @@ async fn network_loop(
     sig_key: SecretKey,
     fake_state_transitions: bool,
     uc_timeout_ms: u64,
+    wire: RequestWire,
 ) {
     let _ = swarm.dial(
         libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
@@ -1380,6 +1409,7 @@ async fn network_loop(
         node_id.clone(),
         sig_key,
         fake_state_transitions,
+        wire,
     );
 
     loop {
@@ -1557,7 +1587,7 @@ async fn network_loop(
                         };
 
                         match make_cert_cbor(&p, round, lu.epoch, prev_hash_ir,
-                                             partition_id, &shard_id, &node_id, &core.secp, &core.sig_key) {
+                                             partition_id, &shard_id, &node_id, &core.secp, &core.sig_key, core.wire) {
                             Ok(cbor) => {
                                 info!(round, "sending cert request to BFT Core");
                                 core.pending = Some(p);
@@ -1602,7 +1632,7 @@ mod tests {
             signature: None,
         };
 
-        let encoded = cbor_cert_req(&request).unwrap();
+        let encoded = cbor_cert_req(&request, RequestWire::Core).unwrap();
         let value: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
         let ciborium::Value::Array(fields) = value else {
             panic!("certification request must be an array")
@@ -1611,6 +1641,167 @@ mod tests {
             fields.get(3),
             Some(ciborium::Value::Tag(INPUT_RECORD_TAG, _))
         ));
+    }
+
+    // ─── wire format against bft-go-base ─────────────────────────────────────
+
+    /// Generated by the Go structs, not by this crate: bft-core b9ee3107 (`network/protocol/
+    /// certification/block_certification_request.go`) with bft-go-base d74b498 (the version main pins; cf5d893 gives the same bytes), for
+    ///   BlockCertificationRequest{PartitionID: 7, ShardID: {}, NodeID: "NODE",
+    ///     InputRecord{Version 1, Round 5, Epoch 0, PreviousHash 01 00.., Hash 02 00.., Summary {},
+    ///       Timestamp 1755000000, BlockHash 03 00.., Fees 0, ETHash {}},
+    ///     BlockSize 10, StateSize 20, Signature nil | bytes 00 01 .. 40}
+    /// `Bytes()` (the signature preimage: the same encoding with Signature nil, which is null)
+    /// and the full encoding. Seven elements; there is no `zk_proof`.
+    const GO_PREIMAGE: &str =
+        "87074180644e4f4445d9985a8a0105005820010000000000000000000000000000000000000000000000000000000000000058200200000000000000000000000000000000000000000000000000000000000000401a689b2cc05820030000000000000000000000000000000000000000000000000000000000000000400a14f6";
+    const GO_FULL: &str =
+        "87074180644e4f4445d9985a8a0105005820010000000000000000000000000000000000000000000000000000000000000058200200000000000000000000000000000000000000000000000000000000000000401a689b2cc05820030000000000000000000000000000000000000000000000000000000000000000400a145841000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
+
+    /// Decode a request built by `make_cert_cbor` (7 elements) back into the 8-field struct.
+    fn decode_core(bytes: &[u8]) -> BlockCertReq {
+        let ciborium::Value::Array(mut fields) = ciborium::from_reader(bytes).unwrap() else {
+            panic!("an array")
+        };
+        assert_eq!(fields.len(), 7);
+        fields.insert(4, ciborium::Value::Null);
+        let mut with_zk = Vec::new();
+        ciborium::into_writer(&ciborium::Value::Array(fields), &mut with_zk).unwrap();
+        ciborium::from_reader(with_zk.as_slice()).unwrap()
+    }
+
+    fn golden_request(signature: Option<Vec<u8>>) -> BlockCertReq {
+        let h = |first: u8| {
+            let mut v = vec![first];
+            v.extend_from_slice(&[0u8; 31]);
+            v
+        };
+        BlockCertReq {
+            partition_id: 7,
+            shard_id: vec![0x80],
+            node_id: "NODE".into(),
+            input_record: InputRecord {
+                version: 1,
+                round_number: 5,
+                epoch: 0,
+                previous_hash: Some(h(1)),
+                hash: Some(h(2)),
+                summary_value: Some(vec![]),
+                timestamp: 1_755_000_000,
+                block_hash: Some(h(3)),
+                sum_of_earned_fees: 0,
+                et_hash: Some(vec![]),
+            },
+            zk_proof: None,
+            block_size: 10,
+            state_size: 20,
+            signature,
+        }
+    }
+
+    #[test]
+    fn the_default_request_is_the_seven_element_bft_core_layout_byte_for_byte() {
+        // the signature preimage (Signature nil encodes as null)
+        let preimage = cbor_cert_req(&golden_request(None), RequestWire::Core).unwrap();
+        assert_eq!(hex::encode(&preimage), GO_PREIMAGE);
+        // the full signed request
+        let signature: Vec<u8> = (0u8..65).collect();
+        let full = cbor_cert_req(&golden_request(Some(signature)), RequestWire::Core).unwrap();
+        assert_eq!(hex::encode(&full), GO_FULL);
+        let ciborium::Value::Array(fields) = ciborium::from_reader(full.as_slice()).unwrap() else {
+            panic!("an array")
+        };
+        assert_eq!(fields.len(), 7);
+    }
+
+    #[test]
+    fn l1_with_proofs_off_sends_eight_elements_with_a_null_proof() {
+        let encoded = cbor_cert_req(&golden_request(None), RequestWire::WithZkProof).unwrap();
+        let ciborium::Value::Array(fields) = ciborium::from_reader(encoded.as_slice()).unwrap()
+        else {
+            panic!("an array")
+        };
+        assert_eq!(fields.len(), 8);
+        assert_eq!(fields[4], ciborium::Value::Null);
+        assert_ne!(
+            encoded,
+            cbor_cert_req(&golden_request(None), RequestWire::Core).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_l1_layout_adds_exactly_the_zk_proof_after_the_input_record() {
+        let mut request = golden_request(None);
+        request.zk_proof = Some(vec![0xab; 4]);
+        let core = cbor_cert_req(&request, RequestWire::Core).unwrap();
+        // a proof set but the core layout: the element is dropped, not sent
+        assert_eq!(hex::encode(&core), GO_PREIMAGE);
+        let l1 = cbor_cert_req(&request, RequestWire::WithZkProof).unwrap();
+        let ciborium::Value::Array(fields) = ciborium::from_reader(l1.as_slice()).unwrap() else {
+            panic!("an array")
+        };
+        assert_eq!(fields.len(), 8);
+        assert!(matches!(
+            fields[3],
+            ciborium::Value::Tag(INPUT_RECORD_TAG, _)
+        ));
+        assert_eq!(fields[4], ciborium::Value::Bytes(vec![0xab; 4]));
+        assert_eq!(fields[5], ciborium::Value::Integer(10.into()));
+    }
+
+    #[test]
+    fn a_signed_request_is_seven_elements_and_signs_the_go_preimage() {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let (uc_tx, _rx) = oneshot::channel();
+        let pending = PendingCert {
+            new_hash: vec![0x11; 32],
+            prev_hash: vec![0x22; 32],
+            zk_proof: None,
+            block_size: 1,
+            state_size: 1,
+            reference_time: 1_755_000_000,
+            uc_tx,
+            round_used: 2,
+        };
+        let encoded = make_cert_cbor(
+            &pending,
+            2,
+            0,
+            Some(vec![0x22; 32]),
+            7,
+            &[0x80],
+            "NODE",
+            &secp,
+            &key,
+            RequestWire::Core,
+        )
+        .unwrap();
+        let ciborium::Value::Array(fields) = ciborium::from_reader(encoded.as_slice()).unwrap()
+        else {
+            panic!("an array")
+        };
+        assert_eq!(fields.len(), 7);
+        let ciborium::Value::Bytes(signature) = fields[6].clone() else {
+            panic!("bytes")
+        };
+        assert_eq!(signature.len(), 65);
+        // the digest is over the 7-element encoding with a null signature
+        let mut unsigned = fields.clone();
+        unsigned[6] = ciborium::Value::Null;
+        let mut preimage = Vec::new();
+        ciborium::into_writer(&ciborium::Value::Array(unsigned), &mut preimage).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&preimage).into();
+        let recoverable = secp256k1::ecdsa::RecoverableSignature::from_compact(
+            &signature[..64],
+            secp256k1::ecdsa::RecoveryId::from_i32(signature[64] as i32).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            secp.recover_ecdsa(&Message::from_digest(digest), &recoverable)
+                .unwrap(),
+            secp256k1::PublicKey::from_secret_key(&secp, &key)
+        );
     }
 
     #[test]
@@ -1639,9 +1830,10 @@ mod tests {
             "NODE",
             &secp,
             &signing_key,
+            RequestWire::Core,
         )
         .unwrap();
-        let request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let request = decode_core(&encoded);
 
         assert_eq!(request.input_record.timestamp, pending.reference_time);
     }
@@ -1672,9 +1864,10 @@ mod tests {
                 "NODE",
                 &secp,
                 &signing_key,
+                RequestWire::Core,
             )
             .unwrap();
-            let mut request: BlockCertReq = ciborium::from_reader(encoded.as_slice()).unwrap();
+            let mut request = decode_core(&encoded);
             assert_eq!(request.shard_id, shard_id);
             let sig = request.signature.clone().unwrap();
             assert_eq!(sig.len(), 65);
@@ -1694,7 +1887,8 @@ mod tests {
                 "signature must be low-S"
             );
             request.signature = None;
-            let digest: [u8; 32] = Sha256::digest(cbor_cert_req(&request).unwrap()).into();
+            let digest: [u8; 32] =
+                Sha256::digest(cbor_cert_req(&request, RequestWire::Core).unwrap()).into();
             let recovered = secp
                 .recover_ecdsa(&Message::from_digest(digest), &recoverable)
                 .unwrap();
@@ -1843,6 +2037,7 @@ mod tests {
             "NODE".into(),
             SecretKey::from_slice(&[7; 32]).unwrap(),
             false,
+            RequestWire::Core,
         );
         (session, root, shared)
     }

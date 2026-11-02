@@ -434,6 +434,9 @@ pub struct AggregatorState {
     /// Default request lifetime in seconds, added to the reference time at
     /// admission when a request carries no explicit deadline.
     default_request_ttl: AtomicU64,
+    /// The configured shard (canonical end-marker encoding); state ids outside its prefix are
+    /// refused at admission. Unset (or `0x80`) restricts nothing.
+    shard_id: std::sync::OnceLock<Vec<u8>>,
     /// Long-poll waiter registry, the global active-work budget and the wake generation.
     longpoll: Arc<longpoll::Registry>,
     /// Test-only: whether fresh batch grants take the admission lock, and a barrier hook.
@@ -451,6 +454,7 @@ impl AggregatorState {
         let registry = Arc::new(longpoll::Registry::new());
         Arc::new(Self {
             reference_time: AtomicU64::new(0),
+            shard_id: std::sync::OnceLock::new(),
             default_request_ttl: AtomicU64::new(DEFAULT_REQUEST_TTL_SECS),
             block_number: RwLock::new(1),
             records: DashMap::new(),
@@ -491,6 +495,16 @@ impl AggregatorState {
     /// The reference time a round starting now would pin.
     pub fn reference_time(&self) -> u64 {
         self.reference_time.load(Ordering::Acquire)
+    }
+
+    /// Set the configured shard (startup only; the first value wins).
+    pub fn set_shard_id(&self, shard_id: Vec<u8>) {
+        let _ = self.shard_id.set(shard_id);
+    }
+
+    /// The configured shard id; empty when none was set.
+    pub fn shard_id(&self) -> &[u8] {
+        self.shard_id.get().map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Set the default request lifetime, in seconds.

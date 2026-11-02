@@ -67,14 +67,16 @@ All options can be set via CLI flags or environment variables.
 # CLI
 aggregator \
   --consistency-proof-mode rsmt \
+  --bft-wire l1 \
   --round-duration-ms 1000 \
   ...
 
 # Environment
 AGGREGATOR_CONSISTENCY_PROOF_MODE=rsmt
+AGGREGATOR_BFT_WIRE=l1                       # live mode: rsmt/zk need the l1 request layout
 ```
 
-No additional flags are needed for RSMT mode. Round duration can remain at the default.
+In live mode (`--bft-mode live`) RSMT needs `--bft-wire l1`: the default `core` layout (bft-core main) has no `zk_proof` field, and `core` with a proof mode is a startup error. Beyond that no additional flags are needed; round duration can remain at the default.
 
 #### ZK mode
 
@@ -83,11 +85,13 @@ No additional flags are needed for RSMT mode. Round duration can remain at the d
 aggregator \
   --consistency-proof-mode zk \
   --zk-proof-kind groth16 \
+  --bft-wire l1 \
   --round-duration-ms 60000 \
   ...
 
 # Environment
 AGGREGATOR_CONSISTENCY_PROOF_MODE=zk
+AGGREGATOR_BFT_WIRE=l1                       # live mode: required for zk
 AGGREGATOR_ZK_PROOF_KIND=compressed          # core | compressed | groth16 | plonk
 AGGREGATOR_ROUND_DURATION_MS=60000
 AGGREGATOR_UC_TIMEOUT_MS=1200000

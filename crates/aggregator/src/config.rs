@@ -40,6 +40,36 @@ pub enum ConsistencyProofMode {
     Zk,
 }
 
+/// Certification request layout the BFT root decodes (live mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BftWire {
+    /// bft-core main: 7 elements, no `zk_proof`.
+    Core,
+    /// bft-core `l1` branch: 8 elements, `zk_proof` after the input record (null when the
+    /// consistency proof mode is `off`).
+    L1,
+}
+
+impl BftWire {
+    /// The request layout for this wire and proof mode. A proof mode other than `off` needs the
+    /// `l1` layout: `core` has no field to carry it, so the combination is refused.
+    pub fn request_wire(
+        self,
+        mode: ConsistencyProofMode,
+    ) -> Result<crate::round::live_committer::RequestWire, String> {
+        use crate::round::live_committer::RequestWire;
+        match (self, mode) {
+            (BftWire::Core, ConsistencyProofMode::Off) => Ok(RequestWire::Core),
+            (BftWire::L1, _) => Ok(RequestWire::WithZkProof),
+            (BftWire::Core, _) => Err(
+                "--consistency-proof-mode rsmt/zk needs --bft-wire l1: the bft-core main \
+                 (--bft-wire core) request has no zk_proof field"
+                    .into(),
+            ),
+        }
+    }
+}
+
 /// Unicity Aggregator (Rust implementation).
 #[derive(Debug, Parser, Clone)]
 #[command(
@@ -165,7 +195,7 @@ pub struct Config {
 
     /// Consistency proof mode sent to BFT Core with each round.
     ///
-    /// - `off`  — no proof; `zk_proof` field is null (default).
+    /// - `off`  — no proof; with `--bft-wire l1` the `zk_proof` element is null (default).
     /// - `rsmt` — hash-based envelope (aggregator_rsmt_v1); O(j·d) size.
     /// - `zk`   — SP1 ZK proof; constant size.  Requires the binary to be
     ///            compiled with `--features zk`.
@@ -176,6 +206,14 @@ pub struct Config {
         value_enum
     )]
     pub consistency_proof_mode: ConsistencyProofMode,
+
+    /// Certification request layout of the BFT root (live mode).
+    ///
+    /// - `core` — bft-core main, 7 elements (default).
+    /// - `l1`   — bft-core `l1` branch, 8 elements with `zk_proof` (null when proof mode is
+    ///            `off`); required for proof mode `rsmt` / `zk`.
+    #[arg(long, env = "AGGREGATOR_BFT_WIRE", default_value = "core", value_enum)]
+    pub bft_wire: BftWire,
 
     /// SP1 proof kind (used when consistency-proof-mode = zk).
     ///
@@ -283,5 +321,34 @@ impl From<&Config> for RoundConfig {
             proof_mode: c.consistency_proof_mode,
             zk_proof_kind: c.zk_proof_kind.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod bft_wire_tests {
+    use super::{BftWire, ConsistencyProofMode as M};
+    use crate::round::live_committer::RequestWire;
+
+    #[test]
+    fn wire_and_proof_mode_compatibility() {
+        // bft-core main, no proof
+        assert_eq!(BftWire::Core.request_wire(M::Off), Ok(RequestWire::Core));
+        // bft-core l1 with proof verification off: 8 elements, null proof
+        assert_eq!(
+            BftWire::L1.request_wire(M::Off),
+            Ok(RequestWire::WithZkProof)
+        );
+        // bft-core l1 with a proof
+        assert_eq!(
+            BftWire::L1.request_wire(M::Rsmt),
+            Ok(RequestWire::WithZkProof)
+        );
+        assert_eq!(
+            BftWire::L1.request_wire(M::Zk),
+            Ok(RequestWire::WithZkProof)
+        );
+        // a proof cannot ride the main layout: an error, not a silent drop
+        assert!(BftWire::Core.request_wire(M::Rsmt).is_err());
+        assert!(BftWire::Core.request_wire(M::Zk).is_err());
     }
 }

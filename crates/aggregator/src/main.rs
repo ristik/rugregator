@@ -80,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
             let sig_key = hex::decode(&cfg.sig_key_hex)
                 .map_err(|e| anyhow::anyhow!("invalid sig_key_hex: {e}"))?;
 
+            // The wire is chosen explicitly: proof generation does not select the root's
+            // protocol (l1 with proofs off still wants 8 elements with a null proof).
+            let request_wire = cfg
+                .bft_wire
+                .request_wire(cfg.consistency_proof_mode)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let live_cfg = LiveBftConfig {
                 partition_id: cfg.partition_id,
                 shard_id: cfg.shard_id.as_bytes().to_vec(),
@@ -90,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 sig_key_bytes: sig_key,
                 fake_state_transitions: cfg.fake_state_transitions,
                 uc_timeout_ms: cfg.uc_timeout_ms,
+                request_wire,
             };
             Arc::new(LiveBftCommitter::start(live_cfg)?)
         }
@@ -148,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_shard_id(cfg.shard_id.as_bytes().to_vec());
         state.set_retention_limits(cfg.retention_limits());
         let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
         spawn_rm!(rm, state)
@@ -177,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
             Some(store as Arc<dyn uni_aggregator::storage::Store>),
         );
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_shard_id(cfg.shard_id.as_bytes().to_vec());
         state.set_retention_limits(cfg.retention_limits());
         state.apply_recovered(recovered).await;
 

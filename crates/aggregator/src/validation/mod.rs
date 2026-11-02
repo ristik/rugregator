@@ -23,6 +23,7 @@ pub enum ValidationStatus {
     InvalidPublicKeyFormat,
     InvalidSourceStateHashFormat,
     InvalidTransactionHashFormat,
+    ShardMismatch,
     InvalidOwnerPredicate,
 }
 
@@ -42,6 +43,8 @@ impl std::fmt::Display for ValidationStatus {
             ValidationStatus::InvalidTransactionHashFormat => {
                 write!(f, "INVALID_TRANSACTION_HASH_FORMAT")
             }
+            // aggregator-go's `ValidationStatusShardMismatch` prints as INVALID_SHARD
+            ValidationStatus::ShardMismatch => write!(f, "INVALID_SHARD"),
             ValidationStatus::InvalidOwnerPredicate => write!(f, "INVALID_OWNER_PREDICATE"),
         }
     }
@@ -87,6 +90,27 @@ pub struct ValidatedRequest {
     pub public_key: Vec<u8>,
 }
 
+// ─── Shard prefix ─────────────────────────────────────────────────────────────
+
+/// Whether the state id (a tree key, read MSB first) lies in the shard `shard_id`, given in the
+/// canonical end-marker encoding (`0x80` is the empty prefix: every state id, `0x40` is the bit
+/// 0, `0xc0` the bit 1). An empty or malformed shard id restricts nothing.
+pub fn shard_contains(shard_id: &[u8], state_id: &[u8]) -> bool {
+    let Some(&last) = shard_id.last() else {
+        return true;
+    };
+    if last == 0 {
+        return true;
+    }
+    let prefix_bits = (shard_id.len() - 1) * 8 + (7 - last.trailing_zeros() as usize);
+    (0..prefix_bits).all(|i| {
+        let want = (shard_id[i / 8] >> (7 - i % 8)) & 1;
+        state_id
+            .get(i / 8)
+            .is_some_and(|b| (b >> (7 - i % 8)) & 1 == want)
+    })
+}
+
 // ─── Full validation pipeline ─────────────────────────────────────────────────
 
 /// Validate a certification request and return a `ValidatedRequest` if it
@@ -104,6 +128,7 @@ pub fn validate_request(
     expires_at: Option<u64>,
     effective_timeout: u64,
     witness: &[u8],
+    shard_id: &[u8],
 ) -> Result<ValidatedRequest, ValidationError> {
     // 1. Validate predicate.
     let pred = validate_pay_to_public_key(engine, code, params).map_err(|e| ValidationError {
@@ -127,6 +152,15 @@ pub fn validate_request(
         return Err(ValidationError {
             status: ValidationStatus::StateIdMismatch,
             message: "state ID does not match expected value".into(),
+        });
+    }
+
+    // 3b. The state id must belong to the configured shard (aggregator-go: INVALID_SHARD, checked
+    // after the state id and before the signature).
+    if !shard_contains(shard_id, state_id) {
+        return Err(ValidationError {
+            status: ValidationStatus::ShardMismatch,
+            message: "state ID does not match configured BFT shard prefix".into(),
         });
     }
 
@@ -167,4 +201,31 @@ pub fn validate_request(
         witness: witness.to_vec(),
         public_key: pred.public_key,
     })
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::shard_contains;
+
+    #[test]
+    fn the_end_marker_encoding_selects_the_state_id_prefix() {
+        let low = [0x00u8; 32]; // top bit 0
+        let high = [0x80u8; 32]; // top bit 1
+                                 // 0x80: the empty prefix
+        assert!(shard_contains(&[0x80], &low) && shard_contains(&[0x80], &high));
+        // 0x40: prefix "0"; 0xc0: prefix "1"
+        assert!(shard_contains(&[0x40], &low) && !shard_contains(&[0x40], &high));
+        assert!(!shard_contains(&[0xc0], &low) && shard_contains(&[0xc0], &high));
+        // two bits: 0x60 = "01", 0xa0 = "10"
+        let one = [0x40u8; 32];
+        assert!(shard_contains(&[0x60], &one) && !shard_contains(&[0x60], &low));
+        // across a byte boundary: 0x00 0x80 the first 8 bits are zero
+        let mut k = [0xffu8; 32];
+        k[0] = 0;
+        assert!(shard_contains(&[0x00, 0x80], &k));
+        k[0] = 1;
+        assert!(!shard_contains(&[0x00, 0x80], &k));
+        // no restriction when unset
+        assert!(shard_contains(&[], &high));
+    }
 }

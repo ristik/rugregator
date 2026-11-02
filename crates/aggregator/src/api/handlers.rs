@@ -66,6 +66,7 @@ pub async fn handle_certification_request(
         parsed.expires_at,
         effective_timeout,
         &parsed.witness,
+        state.shard_id(),
     )
     .map_err(|e| {
         info!(status = %e.status, "certification_request rejected");
