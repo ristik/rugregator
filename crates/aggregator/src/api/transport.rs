@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::{Extension, Router};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -33,6 +32,7 @@ use tokio::time::{Instant, Sleep};
 use tracing::{debug, warn};
 
 use crate::longpoll::ActiveHandle;
+use crate::storage::AggregatorState;
 
 /// Transport bounds. Each connection costs two descriptors (the socket and the duplicate used by
 /// the close watcher), so `max_connections` also bounds descriptor use.
@@ -106,26 +106,31 @@ struct Io {
 }
 
 impl Io {
-    /// Fail the write once the armed response's deadline has passed.
-    fn check_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        match self.ctx.deadline() {
-            None => self.sleep = None,
-            Some(deadline) => {
-                if self.sleep.as_ref().map(|(d, _)| *d) != Some(deadline) {
-                    self.sleep = Some((deadline, Box::pin(tokio::time::sleep_until(deadline))));
-                }
-                if let Some((_, sleep)) = self.sleep.as_mut() {
-                    if sleep.as_mut().poll(cx).is_ready() {
-                        self.ctx.release();
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "response write deadline exceeded",
-                        ));
-                    }
-                }
+    /// A write which cannot make progress is bounded by the armed response's deadline. The timer
+    /// exists only while the socket is in backpressure: a write which completes (the normal case)
+    /// never creates or polls one.
+    fn bound<T>(&mut self, cx: &mut Context<'_>, r: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        if r.is_ready() {
+            self.sleep = None;
+            return r;
+        }
+        let Some(deadline) = self.ctx.deadline() else {
+            self.sleep = None;
+            return r;
+        };
+        if self.sleep.as_ref().map(|(d, _)| *d) != Some(deadline) {
+            self.sleep = Some((deadline, Box::pin(tokio::time::sleep_until(deadline))));
+        }
+        if let Some((_, sleep)) = self.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_ready() {
+                self.ctx.release();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "response write deadline exceeded",
+                )));
             }
         }
-        Ok(())
+        r
     }
 }
 
@@ -145,8 +150,8 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.check_deadline(cx)?;
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.bound(cx, r)
     }
 
     fn poll_write_vectored(
@@ -154,8 +159,8 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.check_deadline(cx)?;
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.bound(cx, r)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -163,13 +168,12 @@ impl AsyncWrite for Io {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.check_deadline(cx)?;
         let r = Pin::new(&mut self.inner).poll_flush(cx);
         if matches!(r, Poll::Ready(Ok(()))) {
             // Every framed byte has been handed to the socket: the response is written.
             self.ctx.release();
         }
-        r
+        self.bound(cx, r)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -183,12 +187,36 @@ impl Drop for Io {
     }
 }
 
-/// Resolves when the peer has closed (EOF/FIN) or reset the connection. Watches a duplicate of
-/// the socket, so nothing is consumed. Close readiness (`EPOLLRDHUP` / `EV_EOF`) stays observable
-/// while unread bytes are queued in front of the FIN, which a peek cannot see: a peek keeps
-/// returning the same unread byte. Unread data is therefore not a close; the peek only
-/// recognises an orderly EOF or an error, and is re-polled at a bounded rate.
-async fn peer_closed(watcher: TcpStream) {
+type Closed = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A future that resolves when the peer has closed (FIN) or reset the connection, and the stream
+/// to serve. Unread bytes in front of a FIN do not hide it, and the watch costs nothing per
+/// request.
+///
+/// * **Linux.** One shared epoll instance, served by one thread, watches the connection's own
+///   descriptor for `EPOLLRDHUP | EPOLLHUP | EPOLLERR` only (edge-triggered; no read interest, so
+///   arriving request data wakes nobody). No second descriptor and no per-request work.
+/// * **Elsewhere.** A watcher on a duplicate of the socket (two descriptors per connection):
+///   readiness `is_read_closed()`, plus a bounded-rate peek for an orderly EOF.
+fn watch_close(stream: TcpStream) -> io::Result<(TcpStream, Closed)> {
+    #[cfg(target_os = "linux")]
+    if let Some(w) = hangup::watch(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
+        return Ok((stream, Box::pin(async move { w.closed().await })));
+    }
+    let std = stream.into_std()?;
+    let dup = std.try_clone()?;
+    dup.set_nonblocking(true)?;
+    Ok((
+        TcpStream::from_std(std)?,
+        Box::pin(peer_closed_dup(TcpStream::from_std(dup)?)),
+    ))
+}
+
+/// Fallback watcher on a duplicate descriptor. Close readiness (`EV_EOF` / `EPOLLRDHUP`) stays
+/// observable while unread bytes are queued in front of the FIN, which a peek cannot see (a peek
+/// keeps returning the same unread byte); the peek only recognises an orderly EOF or an error,
+/// and is re-polled at a bounded rate.
+async fn peer_closed_dup(watcher: TcpStream) {
     let mut byte = [0u8; 1];
     loop {
         match watcher.ready(Interest::READABLE).await {
@@ -199,6 +227,133 @@ async fn peer_closed(watcher: TcpStream) {
         match watcher.peek(&mut byte).await {
             Ok(0) | Err(_) => return,
             Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod hangup {
+    use std::collections::HashMap;
+    use std::os::fd::RawFd;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Flag {
+        closed: AtomicBool,
+        notify: Notify,
+    }
+
+    struct Monitor {
+        epfd: RawFd,
+        flags: Mutex<HashMap<u64, Arc<Flag>>>,
+        next: AtomicU64,
+    }
+
+    fn monitor() -> Option<&'static Monitor> {
+        static M: OnceLock<Option<&'static Monitor>> = OnceLock::new();
+        *M.get_or_init(|| {
+            // SAFETY: plain syscall.
+            let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if epfd < 0 {
+                return None;
+            }
+            let m: &'static Monitor = Box::leak(Box::new(Monitor {
+                epfd,
+                flags: Mutex::new(HashMap::new()),
+                next: AtomicU64::new(1),
+            }));
+            std::thread::Builder::new()
+                .name("hangup-monitor".into())
+                .spawn(move || m.run())
+                .ok()?;
+            Some(m)
+        })
+    }
+
+    impl Monitor {
+        fn run(&self) {
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 256];
+            loop {
+                // SAFETY: `events` is a valid buffer of 256 entries.
+                let n = unsafe { libc::epoll_wait(self.epfd, events.as_mut_ptr(), 256, -1) };
+                if n < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                for ev in &events[..n as usize] {
+                    let token = ev.u64;
+                    let flag = self
+                        .flags
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&token)
+                        .cloned();
+                    if let Some(flag) = flag {
+                        flag.closed.store(true, Ordering::Release);
+                        flag.notify.notify_one();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A registered connection; deregistered when dropped (closing the socket removes it from
+    /// the epoll set by itself, the token map entry is what must not outlive the connection).
+    pub struct Watch {
+        flag: Arc<Flag>,
+        token: u64,
+        mon: &'static Monitor,
+    }
+
+    pub fn watch(fd: RawFd) -> Option<Watch> {
+        let mon = monitor()?;
+        let token = mon.next.fetch_add(1, Ordering::Relaxed);
+        let flag = Arc::new(Flag {
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        mon.flags
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(token, Arc::clone(&flag));
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR | libc::EPOLLET) as u32,
+            u64: token,
+        };
+        // SAFETY: `ev` is valid; `fd` is an open socket owned by the caller.
+        let rc = unsafe { libc::epoll_ctl(mon.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if rc < 0 {
+            mon.flags
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&token);
+            return None;
+        }
+        Some(Watch { flag, token, mon })
+    }
+
+    impl Watch {
+        pub async fn closed(&self) {
+            loop {
+                if self.flag.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                self.flag.notify.notified().await;
+            }
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            self.mon
+                .flags
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.token);
         }
     }
 }
@@ -225,15 +380,19 @@ impl Server {
 }
 
 /// Serve `router` on `listener` with the default bounds.
-pub fn spawn(listener: TcpListener, router: Router) -> Server {
-    spawn_with(listener, router, TransportConfig::default())
+pub fn spawn(listener: TcpListener, state: Arc<AggregatorState>) -> Server {
+    spawn_with(listener, state, TransportConfig::default())
 }
 
 /// Serve `router` on `listener`.
-pub fn spawn_with(listener: TcpListener, router: Router, config: TransportConfig) -> Server {
+pub fn spawn_with(
+    listener: TcpListener,
+    state: Arc<AggregatorState>,
+    config: TransportConfig,
+) -> Server {
     let local_addr = listener.local_addr().expect("listener address");
     let (stop, stop_rx) = watch::channel::<Option<Instant>>(None);
-    let task = tokio::spawn(accept_loop(listener, router, stop_rx, config));
+    let task = tokio::spawn(accept_loop(listener, state, stop_rx, config));
     Server {
         stop,
         task,
@@ -243,7 +402,7 @@ pub fn spawn_with(listener: TcpListener, router: Router, config: TransportConfig
 
 async fn accept_loop(
     listener: TcpListener,
-    router: Router,
+    state: Arc<AggregatorState>,
     mut stop: watch::Receiver<Option<Instant>>,
     config: TransportConfig,
 ) -> usize {
@@ -275,7 +434,7 @@ async fn accept_loop(
                         }
                         conns.spawn(serve_connection(
                             stream,
-                            router.clone(),
+                            Arc::clone(&state),
                             stop.clone(),
                             config,
                             permit,
@@ -318,40 +477,31 @@ async fn accept_loop(
 
 async fn serve_connection(
     stream: TcpStream,
-    router: Router,
+    state: Arc<AggregatorState>,
     mut stop: watch::Receiver<Option<Instant>>,
     config: TransportConfig,
     _slot: OwnedSemaphorePermit,
 ) {
     let ctx = Arc::new(ConnCtx::default());
-    // A duplicate descriptor for the close watcher (the original belongs to hyper).
-    let watcher = match stream
-        .into_std()
-        .and_then(|std| Ok((std.try_clone()?, std)))
-        .and_then(|(dup, std)| {
-            dup.set_nonblocking(true)?;
-            Ok((TcpStream::from_std(dup)?, TcpStream::from_std(std)?))
-        }) {
-        Ok((watcher, stream)) => (watcher, stream),
+    let (stream, mut closed) = match watch_close(stream) {
+        Ok(v) => v,
         Err(e) => {
             warn!(err = %e, "cannot set up connection");
             return;
         }
     };
-    let (watcher, stream) = watcher;
     let io = TokioIo::new(Io {
         inner: stream,
         ctx: Arc::clone(&ctx),
         sleep: None,
     });
-    let service = TowerToHyperService::new(router.layer(Extension(Arc::clone(&ctx))));
+    let service =
+        TowerToHyperService::new(super::server::build_router_for(state, Arc::clone(&ctx)));
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(config.header_read_timeout)
         .serve_connection(io, service);
     tokio::pin!(conn);
-    let closed = peer_closed(watcher);
-    tokio::pin!(closed);
     let mut graceful = false;
     loop {
         tokio::select! {
@@ -362,7 +512,7 @@ async fn serve_connection(
                 return;
             }
             // The peer is gone: dropping the connection drops every in-flight request future.
-            _ = &mut closed => {
+            _ = closed.as_mut() => {
                 debug!("peer closed; cancelling the connection's requests");
                 return;
             }
@@ -373,5 +523,47 @@ async fn serve_connection(
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncWriteExt;
+
+    async fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (s, _) = l.accept().await.unwrap();
+        (s, c)
+    }
+
+    /// The shared epoll monitor sees a FIN even with unread bytes queued in front of it, a RST,
+    /// and nothing else (arriving data is not a close).
+    #[tokio::test]
+    async fn hangup_monitor_sees_fin_behind_unread_bytes_and_rst() {
+        let (s, mut c) = pair().await;
+        let w = hangup::watch(s.as_raw_fd()).expect("monitor");
+        c.write_all(&[7u8; 1000]).await.unwrap();
+        let quiet = tokio::time::timeout(Duration::from_millis(200), w.closed()).await;
+        assert!(quiet.is_err(), "data alone is not a close");
+        socket2::SockRef::from(&c)
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), w.closed())
+            .await
+            .expect("FIN behind unread bytes is seen");
+        drop((s, c, w));
+
+        let (s, c) = pair().await;
+        let w = hangup::watch(s.as_raw_fd()).expect("monitor");
+        socket2::SockRef::from(&c)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(c);
+        tokio::time::timeout(Duration::from_secs(2), w.closed())
+            .await
+            .expect("RST is seen");
     }
 }

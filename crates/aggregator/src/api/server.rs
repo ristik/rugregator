@@ -6,7 +6,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, Json, Router,
+    Json, Router,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -25,12 +25,40 @@ use tokio::time::Instant;
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
+/// Handler state: the service state and, for a connection served by the transport loop, its
+/// per-connection write accounting. Carried as router state (built once per connection) rather
+/// than a per-request `Extension` layer, which would cost an allocation and a boxed clone of the
+/// whole router on every request.
+#[derive(Clone)]
+pub struct AppState {
+    pub state: Arc<AggregatorState>,
+    pub conn: Option<Arc<ConnCtx>>,
+}
+
+impl axum::extract::FromRef<AppState> for Arc<AggregatorState> {
+    fn from_ref(app: &AppState) -> Self {
+        Arc::clone(&app.state)
+    }
+}
+
 pub fn build_router(state: Arc<AggregatorState>) -> Router {
+    build_router_with(AppState { state, conn: None })
+}
+
+/// The router of one connection of the transport loop.
+pub fn build_router_for(state: Arc<AggregatorState>, conn: Arc<ConnCtx>) -> Router {
+    build_router_with(AppState {
+        state,
+        conn: Some(conn),
+    })
+}
+
+fn build_router_with(app: AppState) -> Router {
     Router::new()
         .route("/", post(jsonrpc_handler).options(preflight_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(state)
+        .with_state(app)
 }
 
 // ─── Health endpoint ──────────────────────────────────────────────────────────
@@ -135,14 +163,13 @@ const MAX_BODY_BYTES: usize = 16 << 20;
 /// transport write are each bounded inside that lifetime, and the budget unit stays held (or
 /// travels into a proof worker) until the response has been written to the socket.
 async fn jsonrpc_handler(
-    State(state): State<Arc<AggregatorState>>,
-    conn: Option<Extension<Arc<ConnCtx>>>,
+    State(app): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Response {
     use http_body_util::{BodyExt, LengthLimitError, Limited};
     let started = Instant::now();
+    let AppState { state, conn } = app;
     let reg = Arc::clone(state.longpoll());
-    let conn = conn.map(|Extension(c)| c);
     let hard = started + reg.budget();
     let write_deadline = hard;
     // The global budget C. When it is exhausted the request is refused before anything is read

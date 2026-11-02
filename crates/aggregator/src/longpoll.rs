@@ -87,11 +87,43 @@ pub fn validate_limits(
 
 // ─── Atomic capacity pools ───────────────────────────────────────────────────
 
+/// "Capacity was really freed" announcements. A release only touches the `Notify` (a lock) when
+/// someone is waiting for it, which is the exception: the common request path pays one atomic
+/// load. A waiter counts itself in *before* it re-checks capacity, and a release counts down
+/// *before* it looks for waiters (both `SeqCst`), so a release is never missed.
+#[derive(Default)]
+pub struct Freed {
+    notify: Notify,
+    waiters: AtomicUsize,
+}
+
+/// Registers a waiter for [`Freed`] announcements while alive.
+pub struct Waiting<'a>(&'a Freed);
+
+impl Freed {
+    fn announce(&self) {
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn waiting(&self) -> Waiting<'_> {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        Waiting(self)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A counted capacity pool (the global budget C, the batch slots, the proof slots).
 pub struct Pool {
     limit: AtomicUsize,
     used: AtomicUsize,
-    freed: Arc<Notify>,
+    freed: Arc<Freed>,
     /// Successful and failed `try_acquire` calls which asked for headroom (resume admission).
     resume_attempts: AtomicU64,
 }
@@ -111,9 +143,9 @@ pub type ActiveHandle = Arc<Permit>;
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.pool.used.fetch_sub(1, Ordering::AcqRel);
+        self.pool.used.fetch_sub(1, Ordering::SeqCst);
         if !self.silent {
-            self.pool.freed.notify_waiters();
+            self.pool.freed.announce();
         }
     }
 }
@@ -128,7 +160,7 @@ impl Permit {
 }
 
 impl Pool {
-    pub fn new(limit: usize, freed: Arc<Notify>) -> Arc<Self> {
+    pub fn new(limit: usize, freed: Arc<Freed>) -> Arc<Self> {
         Arc::new(Self {
             limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
@@ -144,14 +176,14 @@ impl Pool {
             self.resume_attempts.fetch_add(1, Ordering::Relaxed);
         }
         let limit = self.limit.load(Ordering::Acquire);
-        let mut cur = self.used.load(Ordering::Acquire);
+        let mut cur = self.used.load(Ordering::SeqCst);
         loop {
             if cur + 1 + headroom > limit {
                 return None;
             }
             match self
                 .used
-                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
                     return Some(Permit {
@@ -174,7 +206,7 @@ impl Pool {
     }
 
     pub fn in_use(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+        self.used.load(Ordering::SeqCst)
     }
 
     pub fn limit(&self) -> usize {
@@ -193,7 +225,8 @@ impl Pool {
     /// Wait until nothing is held (shutdown join) or the deadline passes.
     pub async fn wait_idle(&self, until: Instant) -> bool {
         loop {
-            let notified = self.freed.notified();
+            let _waiting = self.freed.waiting();
+            let notified = self.freed.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.in_use() == 0 {
@@ -298,7 +331,7 @@ pub struct Registry {
     generation: watch::Sender<u64>,
     gate: Arc<Gate>,
     /// Signalled whenever a unit of the budget, a batch slot or a proof slot is really released.
-    freed: Arc<Notify>,
+    freed: Arc<Freed>,
     /// Serializes the multi-pool resume admission decision, so no resumer ever observes another's
     /// tentative occupancy (a tentative unit would hide capacity from a contender which then
     /// sleeps with nothing left to wake it).
@@ -318,7 +351,7 @@ impl Default for Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        let freed = Arc::new(Notify::new());
+        let freed = Arc::new(Freed::default());
         let r = Self {
             max_wait_ms: AtomicU64::new(DEFAULT_MAX_WAIT_MS),
             capacity: AtomicUsize::new(DEFAULT_MAX_WAITERS),
@@ -920,7 +953,9 @@ async fn resume_grant(
             .ok()?,
     );
     loop {
-        let notified = reg.freed.notified();
+        // Counted in before the capacity is re-checked: a release after the check announces.
+        let _waiting = reg.freed.waiting();
+        let notified = reg.freed.notify.notified();
         tokio::pin!(notified);
         {
             // The whole decision is made under one lock: HTTP unit, then the method pools, with a

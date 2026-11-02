@@ -294,16 +294,19 @@ final read (v2: the empty proof; batch: `-32008 state_pending`).
   for fresh requests. Batch and non-inclusion proof work runs on a dedicated worker which owns the
   slots and the request's budget unit until it has stopped: a client that disconnects, or a request
   whose deadline passes, only cancels the work (the worker stops at the next key or node read).
-* **Disconnects.** A watcher on a duplicate of each socket reacts to the kernel's close/hangup
-  readiness (not to a peek), so an EOF or RST cancels the connection's requests also while a
-  pipelined request is buffered behind the waiting one and unread bytes are queued in front of the
-  FIN. Limit: TCP delivers a FIN only after the data before it, so a peer whose unsent data cannot
-  enter a full receive window is not seen as closed until the window opens (a RST always is); the
-  30 s lifetime bounds that case. HTTP/2 is not enabled; its stream-reset cancellation must be
-  tested before it is.
-* **Connections.** The custom loop costs two descriptors per connection (the socket and the
-  watcher's duplicate); `--max-connections` (default 10,000) bounds both: at the bound nothing is
-  accepted until a connection closes. Request heads are bounded by hyper (10 s header timeout,
+* **Disconnects.** On Linux one shared epoll instance watches every connection's own descriptor
+  for `EPOLLRDHUP | EPOLLHUP | EPOLLERR` only (edge-triggered, no read interest, so request data
+  wakes nobody); elsewhere a watcher on a duplicate socket does the same with close readiness. An
+  EOF or RST therefore cancels the connection's requests also while a pipelined request is buffered
+  behind the waiting one and unread bytes are queued in front of the FIN. Limit: TCP delivers a FIN
+  only after the data before it, so a peer whose unsent data cannot enter a full receive window
+  (hyper reads one buffer ahead, the rest waits in the kernel) is not seen as closed until the
+  window opens (a RST always is); the 30 s lifetime bounds that case. HTTP/2 is not enabled; its
+  stream-reset cancellation must be tested before it is.
+* **Connections.** One descriptor per connection on Linux (two elsewhere: the socket and the
+  watcher's duplicate); `--max-connections` (default 10,000) bounds them: at the bound nothing is
+  accepted until a connection closes, so raise it together with `--long-poll-max-waiters` when more
+  than 10,000 waits may park. Request heads are bounded by hyper (10 s header timeout,
   about 400 KiB buffer, 100 headers).
 * SIGINT or a fatal certification shutdown: refuse new waits, wake all to a final read, let requests
   finish for 30 s, then cut and join the remaining connections, wait up to 30 s until every proof

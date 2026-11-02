@@ -11,7 +11,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Semaphore};
 
-use uni_aggregator::api::build_router;
 use uni_aggregator::api::server::dispatch;
 use uni_aggregator::config::{ConsistencyProofMode, RoundConfig};
 use uni_aggregator::round::{BftCommitter, BftCommitterStub, RoundManager};
@@ -342,7 +341,7 @@ async fn serve_on(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let server = uni_aggregator::api::transport::spawn(listener, build_router(state));
+    let server = uni_aggregator::api::transport::spawn(listener, state);
     let addr = server.local_addr;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let h = tokio::spawn(async move {
@@ -563,7 +562,7 @@ async fn a_stuck_connection_is_cancelled_and_joined_at_the_grace_deadline() {
     n.state.submit_request(request(0x81)).await.unwrap();
     let state = Arc::clone(&n.state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = uni_aggregator::api::transport::spawn(listener, build_router(state));
+    let server = uni_aggregator::api::transport::spawn(listener, state);
     let addr = server.local_addr;
     // A parked wait, and a client which never finishes its request body.
     let parked = send(addr, &v2_body(0x81, json!({"waitMs": 15000}))).await;
@@ -641,14 +640,24 @@ async fn a_slow_reader_cannot_hold_the_budget_past_the_write_deadline() {
     let n = net().await;
     let reg = Arc::clone(n.state.longpoll());
     reg.set_budget(Duration::from_millis(1500));
-    // a large answer: many included ids in one batch so the response exceeds the socket buffers
-    let (addr, stop, server) = serve(Arc::clone(&n.state)).await;
-    let mut s = TcpStream::connect(addr).await.unwrap();
-    // 256 batches of the one included id would not be bigger; use a big error body instead: an
-    // oversized-but-valid request is answered with a small body, so shrink the buffers.
-    socket2::SockRef::from(&s)
-        .set_recv_buffer_size(1024)
-        .unwrap();
+    // Pipelined small replies to a reader that never reads: with a small send buffer on the
+    // server and a small receive window on the client they back up in the kernel on any OS.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = uni_aggregator::api::transport::spawn_with(
+        listener,
+        Arc::clone(&n.state),
+        uni_aggregator::api::transport::TransportConfig {
+            send_buffer: Some(4096),
+            ..Default::default()
+        },
+    );
+    let addr = server.local_addr;
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let _ = rx.await;
+        server.shutdown(Duration::from_secs(5)).await;
+    });
+    let mut s = client_socket(addr, 1024).connect(addr).await.unwrap();
     let big = json!({"jsonrpc":"2.0","id":1,"method":"get_block_height","params":{}}).to_string();
     let req = format!(
         "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{big}",
@@ -656,7 +665,7 @@ async fn a_slow_reader_cannot_hold_the_budget_past_the_write_deadline() {
     );
     // pipeline many requests and never read: the responses back up in the kernel buffers
     let mut all = String::new();
-    for _ in 0..4000 {
+    for _ in 0..20_000 {
         all.push_str(&req);
     }
     let _ = tokio::time::timeout(Duration::from_millis(500), s.write_all(all.as_bytes())).await;
@@ -790,7 +799,7 @@ async fn a_large_response_to_a_slow_reader_is_cut_at_its_write_deadline() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = uni_aggregator::api::transport::spawn_with(
         listener,
-        build_router(Arc::clone(&n.state)),
+        Arc::clone(&n.state),
         uni_aggregator::api::transport::TransportConfig {
             send_buffer: Some(4096),
             ..Default::default()
@@ -854,8 +863,17 @@ async fn pipelined_data_beyond_a_read_buffer_does_not_hide_a_fin_or_an_rst() {
         s.write_all(one.as_bytes()).await.unwrap();
         until(|| reg.reserved() == 1).await;
         // Far more pipelined requests than hyper buffers (about 400 KiB) or the socket holds.
-        let more = (0..4_000).map(|_| one.as_str()).collect::<String>();
-        assert!(more.len() > 800_000);
+        // Hyper reads one buffer ahead while a request is in flight; the rest of the pipelined
+        // data stays in the kernel's receive queue, in front of the FIN. (Linux caps SO_RCVBUF at
+        // rmem_max, so the total is smaller there than on macOS: all of it must be delivered for
+        // the FIN behind it to reach the server.)
+        let count = if cfg!(target_os = "linux") {
+            700
+        } else {
+            4_000
+        };
+        let more = (0..count).map(|_| one.as_str()).collect::<String>();
+        assert!(more.len() > 100_000, "{}", more.len());
         tokio::time::timeout(Duration::from_secs(5), s.write_all(more.as_bytes()))
             .await
             .expect("the data fits the server's receive buffer")
@@ -886,7 +904,7 @@ async fn transport_returns_descriptors_keeps_alive_and_bounds_connections() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = uni_aggregator::api::transport::spawn_with(
         listener,
-        build_router(Arc::clone(&n.state)),
+        Arc::clone(&n.state),
         uni_aggregator::api::transport::TransportConfig {
             header_read_timeout: Duration::from_millis(1500),
             max_connections: 3,
@@ -1005,8 +1023,7 @@ async fn shutdown_failure_paths_do_not_claim_success_or_close_storage_under_work
     // has passed. The sequence fails and the round manager is left running (storage stays up).
     let held = n.state.batch_pool().try_acquire(0).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server =
-        uni_aggregator::api::transport::spawn(listener, build_router(Arc::clone(&n.state)));
+    let server = uni_aggregator::api::transport::spawn(listener, Arc::clone(&n.state));
     let err = drain_http(server, &n.state, limits).await.unwrap_err();
     assert!(
         matches!(err, ShutdownError::WorkersBusy { batches: 1, .. }),

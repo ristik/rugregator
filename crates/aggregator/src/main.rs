@@ -9,7 +9,6 @@ use tracing::{info, warn};
 
 use smt_store::SmtStore as _;
 use uni_aggregator::{
-    api::build_router,
     config::{Config, ConsistencyProofMode, RoundConfig},
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::{AggregatorState, WalStore},
@@ -244,7 +243,6 @@ async fn main() -> anyhow::Result<()> {
     );
     state.longpoll().set_concurrency(cfg.concurrency_limit);
 
-    let router = build_router(Arc::clone(&state));
     // let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let listener = bind_listener(&cfg.listen, 4096)?;
     info!(listen = %cfg.listen, "HTTP server ready");
@@ -256,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
     // and only then stop and join the round manager.
     let mut server = uni_aggregator::api::transport::spawn_with(
         listener,
-        router,
+        Arc::clone(&state),
         uni_aggregator::api::transport::TransportConfig {
             max_connections: cfg.max_connections.max(1),
             ..Default::default()
