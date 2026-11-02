@@ -1,0 +1,3 @@
+   Compiling unicity-token v3.0.1 (/Users/risto/uni/sync/wt/rug-lp-sdk)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running tests/interop_lp.rs (target/debug/deps/interop_lp-dbc451c2ddd5530b)

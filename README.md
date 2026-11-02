@@ -192,6 +192,9 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--sig-key-hex` | `AGGREGATOR_SIG_KEY` | | secp256k1 key for signing CRs |
 | `--uc-timeout-ms` | `AGGREGATOR_UC_TIMEOUT_MS` | `15000` | UC inactivity timeout (ms); re-sends handshake to BFT Core when no UC arrives within this period; set to ≥3× BFT Core's T2 for this partition |
 | `--fake-state-transitions` | `AGGREGATOR_FAKE_STATE_TRANSITIONS` | `false` | Use last UC's hash as PreviousHash instead of the real SMT root |
+| `--long-poll-max-wait-ms` | `AGGREGATOR_LONG_POLL_MAX_WAIT_MS` | `20000` | Longest `waitMs` honoured (see [Long-poll](#long-poll-waitms)); `0` answers every read immediately. Plus the 8 s reserve it must stay below the 30 s request budget (checked at startup) |
+| `--long-poll-max-waiters` | `AGGREGATOR_LONG_POLL_MAX_WAITERS` | `1024` | Global cap on admitted waits (parked and resuming). Over the cap a read is served immediately with a zero echo; `0` is supported |
+| `--concurrency-limit` | `AGGREGATOR_CONCURRENCY_LIMIT` | `1000` | Budget C of active HTTP/RPC requests. Exhausted: HTTP 503 + `Retry-After: 1`, `-32006 busy`, id `null`. Parked long-polls hold none. Below 2, long-polls do not park |
 | `--log-level` | `RUST_LOG` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 
 ---
@@ -253,6 +256,54 @@ tag 39033 over `[1, certificationData, inclusionCertificate, UC]`.
 An accepted request that is still being certified returns JSON-RPC error
 `-32003`; clients may poll only that status. An unknown StateID returns HTTP
 404 immediately.
+
+#### Long-poll (`waitMs`)
+
+`get_inclusion_proof.v2` and the latest form of `get_inclusion_proofs.v1` accept an optional
+`waitMs` (integer token, `0..=9007199254740991`; null, string, sign, `-0`, fraction, exponent,
+duplicates are invalid). The server then holds the request while every state asked about is
+**known pending** and answers when a certified commit (or an expiry or terminal drop) changes
+that, or after `min(waitMs, --long-poll-max-wait-ms, time left in the 30 s request budget - 8 s)`.
+It saves polling round trips; it does not make certification faster. A timeout is an ordinary
+final read (v2: the empty proof; batch: `-32008 state_pending`).
+
+* Without `waitMs` every byte is as before (including HTTP 200 for the batch method's `-32006`).
+  With it, v2 returns `{"proof","waitedMs"}` (plus `"status"` iff `includeStatus:true`); the batch
+  result gains `waitedMs`, and handled errors carry `error.data.waitedMs`. Once a params object
+  carries a `waitMs` member (valid or not) its validation errors and method-level size rejections
+  echo `0`. A present `0` returns the echo without waiting. `waitedMs` is the ceiling of the time
+  spent waiting and is unauthenticated metadata: always verify the proof.
+* A batch waits for all entries; any unknown or expired entry ends the wait at once. An exact
+  `stateRoot` with any `waitMs` is `-32602 malformed_params`. Opt-in requests are bounded to
+  64 KiB / 32 KiB params / 128-byte id (v2 included).
+* Over the cap, with `--concurrency-limit < 2`, no budget left or while draining, the ordinary read
+  is returned at once with `waitedMs:0`; never an error. A re-read that gets no capacity within
+  `min(queue entry + 2 s, request deadline - 6 s)` answers the retryable `-32006 busy/deadline`
+  with the echo as HTTP 503 + `Retry-After: 1`. The only other 503s are the global budget being
+  exhausted (refused before the body is read) and a request which outlived its 30 s lifetime.
+* **Lifetime.** A request is admitted to the budget and its 30 s lifetime starts before its body
+  is read. The body is bounded (10 s, 16 MiB), the application work ends in time for the write, and
+  the budget unit is released only when the response has been written to the socket (a reader which
+  stalls is cut at the lifetime). HTTP/1.1 only.
+* **What a wait holds.** A parked request holds no budget unit, batch slot, proof permit, pinned
+  view or encoded response: about 2.4 KiB of heap per parked v2 waiter (1,024 measured, without
+  transport buffers). Re-reads queue FIFO, at most `max(1, C/4)` at a time (batch: also at most
+  `min(B-1, S-1)`, 7 by default); every pool is reserved atomically and one unit of each stays free
+  for fresh requests. Batch and non-inclusion proof work runs on a dedicated worker which owns the
+  slots and the request's budget unit until it has stopped: a client that disconnects, or a request
+  whose deadline passes, only cancels the work (the worker stops at the next key or node read).
+* **Disconnects.** A closed connection (EOF or RST, also with a pipelined request buffered behind
+  the waiting one) drops all its requests at once. HTTP/2 is not enabled; its stream-reset
+  cancellation must be tested before it is.
+* SIGINT or a fatal certification shutdown: refuse new waits, wake all to a final read, let requests
+  finish for 30 s, then cancel and join the remaining connections and the proof workers, then stop
+  and join the round manager.
+* Queued requests (not yet in a round) whose deadline the consensus reference time has reached are
+  expired even while a round is stalled in flight; requests in a round are exempt.
+* `GET /metrics` (Prometheus text): `aggregator_longpoll_reservations`, `_resume_queued`,
+  `_resume_running`, `_requests_total{method,outcome}`, `_wakes_total{cause}`, `_rechecks_total{method}`,
+  `_notifies_total`, `_wait_seconds` (sum/count), `aggregator_http_active_requests`. No histograms.
+* Pending hints are node-local: a restart forgets all waits and hints (a client then sees `unknown`).
 
 ### `get_non_inclusion_proof.v1`
 

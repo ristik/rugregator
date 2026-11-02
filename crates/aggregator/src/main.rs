@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use smt_store::{mem, SmtStore as _};
+use smt_store::SmtStore as _;
 use uni_aggregator::{
     api::build_router,
     config::{Config, ConsistencyProofMode, RoundConfig},
@@ -138,14 +138,14 @@ async fn main() -> anyhow::Result<()> {
                 $rm
             };
             let notify = rm.shutdown_notify();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 rm.run().await;
             });
-            ($state, notify)
+            ($state, notify, handle)
         }};
     }
 
-    let (state, shutdown_notify) = if cfg.db_path.is_empty() {
+    let (state, shutdown_notify, rm_handle) = if cfg.db_path.is_empty() {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
@@ -226,25 +226,70 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Long-poll limits and the global active-work budget.
+    uni_aggregator::longpoll::validate_limits(
+        cfg.long_poll_max_wait_ms,
+        cfg.long_poll_max_waiters,
+        cfg.retention_limits().batch_timeout,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    anyhow::ensure!(
+        cfg.concurrency_limit >= 1,
+        "--concurrency-limit must be positive"
+    );
+    state.longpoll().configure(
+        cfg.long_poll_max_wait_ms,
+        cfg.long_poll_max_waiters,
+        cfg.retention_limits().batch_timeout,
+    );
+    state.longpoll().set_concurrency(cfg.concurrency_limit);
+
     let router = build_router(Arc::clone(&state));
     // let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let listener = bind_listener(&cfg.listen, 4096)?;
     info!(listen = %cfg.listen, "HTTP server ready");
 
-    // Run HTTP server until SIGINT (ctrl+c).
+    // Run the HTTP server until SIGINT or a fatal certification shutdown, then drain in order,
+    // while storage is still open: refuse new waits and wake the parked ones to a final read,
+    // let in-flight requests finish for the grace period, then really cancel and join the
+    // remaining connections, wait for the proof workers (which own their accounting) to stop,
+    // and only then stop and join the round manager.
+    let mut server = uni_aggregator::api::transport::spawn(listener, router);
     tokio::select! {
-        result = axum::serve(listener, router) => {
-            result?;
+        _ = server.wait() => {
+            warn!("HTTP accept loop ended");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, initiating graceful shutdown");
         }
+        _ = shutdown_notify.notified() => {
+            warn!("round manager requested shutdown, draining");
+        }
+    }
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+    state.longpoll().drain();
+    let cut = server.shutdown(GRACE).await;
+    if cut > 0 {
+        warn!(
+            connections = cut,
+            "drain deadline reached: connections cancelled"
+        );
+    } else {
+        info!("HTTP server drained");
+    }
+    if !state
+        .wait_workers_idle(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await
+    {
+        warn!("proof workers still running after the drain");
     }
 
-    // Signal the round manager to shut down (persists SMT state if needed).
+    // Stop the round manager (persists SMT state if needed) and join it.
     shutdown_notify.notify_one();
-    // Give the round manager a moment to persist and exit.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(20), rm_handle).await {
+        Ok(_) => info!("round manager stopped"),
+        Err(_) => warn!("round manager did not stop in time"),
+    }
 
     Ok(())
 }

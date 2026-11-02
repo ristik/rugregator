@@ -476,6 +476,7 @@ impl<S: SmtStore> RoundManager<S> {
         self.recover_pending_round().await;
         self.publish_reference_time();
         self.publish_current_certified_snapshot().await;
+        self.state.notify_waiters();
 
         let mut timer = time::interval(Duration::from_millis(self.config.round_duration_ms));
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -499,6 +500,7 @@ impl<S: SmtStore> RoundManager<S> {
                         let reference_time = *self.reference_time_rx.borrow_and_update();
                         if reference_time != 0 {
                             self.state.set_reference_time(reference_time);
+                            self.sweep_queued_expired();
                         }
                     }
                 }
@@ -857,8 +859,49 @@ impl<S: SmtStore> RoundManager<S> {
         self.republish_failures.store(0, Relaxed);
     }
 
+    /// Drop the requests which are only *queued* and whose deadline the consensus reference time
+    /// has reached: they can never be inserted in any later round (the reference time never moves
+    /// back), and with a round stalled in flight nothing else would ever look at them. Covers
+    /// `self.pending` and the speculative buffer which has not touched a tree. Requests in a
+    /// submitted batch, a prepared speculative snapshot or a proving round are in-round and exempt:
+    /// their fate is decided by the round that holds them. The tombstones and the pending
+    /// resolution are done before the waiters are woken (inside `drop_expired_requests`).
+    fn sweep_queued_expired(&mut self) {
+        let reference_time = self.state.reference_time();
+        if reference_time == 0 {
+            return;
+        }
+        let mut expired = Vec::new();
+        if self
+            .pending
+            .iter()
+            .any(|r| r.effective_timeout <= reference_time)
+        {
+            let (keep, gone) = partition_expired(std::mem::take(&mut self.pending), reference_time);
+            self.pending = keep;
+            expired.extend(gone);
+        }
+        if let Some(inf) = self.inflight.as_mut() {
+            if let SpecState::Collecting { buffer, .. } = &mut inf.spec {
+                if buffer.iter().any(|r| r.effective_timeout <= reference_time) {
+                    let (keep, gone) = partition_expired(std::mem::take(buffer), reference_time);
+                    *buffer = keep;
+                    expired.extend(gone);
+                }
+            }
+        }
+        if !expired.is_empty() {
+            info!(
+                count = expired.len(),
+                reference_time, "dropping queued requests past their deadline"
+            );
+            self.state.drop_expired_requests(&expired);
+        }
+    }
+
     /// Timer tick: either kick off a new round or prepare a speculative one.
     async fn on_timer_tick(&mut self) {
+        self.sweep_queued_expired();
         // Retry an unavailable latest view of the committed head. Only between rounds: with a
         // round in flight the committed SMT is not the state the head certified.
         if self.inflight.is_none()
@@ -867,8 +910,11 @@ impl<S: SmtStore> RoundManager<S> {
                 .republish_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            // `true` when the head was published again; the long-poll waiters are woken here.
-            let _recovered = self.publish_head(true).await;
+            // The head was published again: batch waiters (which read the retained catalog) get a
+            // fresh read. Outside every lock; a wake asserts nothing.
+            if self.publish_head(true).await {
+                self.state.notify_waiters();
+            }
         }
         match self.inflight.as_ref() {
             None => {
@@ -1723,6 +1769,12 @@ impl<S: SmtStore> RoundManager<S> {
                     }
                 }
 
+                // The whole certified attempt is done (records, block, pending resolution and
+                // the snapshot publication or its failure): ask waiters to re-read. No lock is
+                // held here, and nothing before this point (proposal, speculative insert,
+                // BFT submission, the temporary clear) ever wakes a waiter.
+                self.state.notify_waiters();
+
                 info!(
                     block   = inf.block_number,
                     root    = %root_hex,
@@ -1799,6 +1851,8 @@ impl<S: SmtStore> RoundManager<S> {
                                 self.state.resolve_state_id_hex(&record.state_id_hex);
                             }
                         }
+                        // Terminal: these states are no longer pending; waiters re-read now.
+                        self.state.notify_waiters();
                         let dropped = inf.submitted_batch.len();
                         drop(inf.submitted_batch);
                         warn!(dropped_requests = dropped, "discarded proof-invalid batch");
@@ -1834,6 +1888,8 @@ impl<S: SmtStore> RoundManager<S> {
                             SpecState::Collecting { snap, .. } => snap.discard(),
                             SpecState::Prepared { snap, .. } => snap.discard(),
                         }
+                        // Terminal: wake waiters, then shut down (the server drains the rest).
+                        self.state.notify_waiters();
                         self.shutdown_notify.notify_waiters();
                     }
                     // Transient, RequestInvalid, Ok (unreachable via Err), or
@@ -2086,7 +2142,9 @@ mod tests {
         assert!(manager.pending.is_empty());
     }
     /// A persisted block as recovery sees it: the stub UC of `new_root` for block 1.
-    async fn recovered_state(uc_cbor: Vec<u8>) -> (Arc<AggregatorState>, RoundManager<smt_store::MemSmt>) {
+    async fn recovered_state(
+        uc_cbor: Vec<u8>,
+    ) -> (Arc<AggregatorState>, RoundManager<smt_store::MemSmt>) {
         let (request_tx, request_rx) = mpsc::channel(1);
         let state = AggregatorState::new(request_tx, None);
         state
@@ -2132,10 +2190,13 @@ mod tests {
         let (state, manager) = recovered_state(uc).await;
         manager.publish_current_certified_snapshot().await;
         assert!(
-            state.get_non_inclusion_proof([7u8; 32]).await.is_ok_and(|r| matches!(
-                r,
-                crate::storage::NonInclusionProofLookup::CertifiedStateUnavailable
-            )),
+            state
+                .get_non_inclusion_proof([7u8; 32])
+                .await
+                .is_ok_and(|r| matches!(
+                    r,
+                    crate::storage::NonInclusionProofLookup::CertifiedStateUnavailable
+                )),
             "no certified-empty snapshot is served from legacy data"
         );
         // the block itself stays (v2 can still carry its unchanged UC)
@@ -2147,10 +2208,18 @@ mod tests {
         // the same block with the native null hash (canonical certified empty tree, round > 0)
         let mut value = decode_cbor_value(&empty_root_uc()).unwrap();
         {
-            let ciborium::value::Value::Tag(_, inner) = &mut value else { panic!() };
-            let ciborium::value::Value::Array(uc) = &mut **inner else { panic!() };
-            let ciborium::value::Value::Tag(_, ir) = &mut uc[1] else { panic!() };
-            let ciborium::value::Value::Array(f) = &mut **ir else { panic!() };
+            let ciborium::value::Value::Tag(_, inner) = &mut value else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(uc) = &mut **inner else {
+                panic!()
+            };
+            let ciborium::value::Value::Tag(_, ir) = &mut uc[1] else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(f) = &mut **ir else {
+                panic!()
+            };
             f[4] = ciborium::value::Value::Null;
         }
         let uc = crate::api::cbor::encode_cbor_value(&value).unwrap();
@@ -2158,10 +2227,10 @@ mod tests {
         let (state, manager) = recovered_state(uc).await;
         manager.publish_current_certified_snapshot().await;
         assert!(
-            state.get_non_inclusion_proof([7u8; 32]).await.is_ok_and(|r| matches!(
-                r,
-                crate::storage::NonInclusionProofLookup::Proof(_)
-            )),
+            state
+                .get_non_inclusion_proof([7u8; 32])
+                .await
+                .is_ok_and(|r| matches!(r, crate::storage::NonInclusionProofLookup::Proof(_))),
             "a canonical null-root snapshot is published and serves the empty-tree proof"
         );
     }
@@ -2208,13 +2277,24 @@ mod tests {
         assert!(!manager.publish_current_certified_snapshot().await);
         assert!(retry_pending(&manager));
         assert!(!serves_non_inclusion(&state).await);
+        let woken = state.longpoll().notify_count();
         manager.on_timer_tick().await; // second injected failure
         assert!(retry_pending(&manager));
         assert!(!serves_non_inclusion(&state).await);
+        assert_eq!(
+            state.longpoll().notify_count(),
+            woken,
+            "a failed retry wakes nobody"
+        );
         manager.on_timer_tick().await; // pins now
         assert!(
             serves_non_inclusion(&state).await,
             "the timer republished the head"
+        );
+        assert_eq!(
+            state.longpoll().notify_count(),
+            woken + 1,
+            "the successful retry wakes the waiters, with no further block"
         );
         assert!(!retry_pending(&manager));
         // a settled head has a fresh failure history
