@@ -1031,7 +1031,9 @@ impl UcSession {
     /// Order: peer, parse, context, sequence; only then state. Certified state (the working
     /// context, the reference time, the liveness timer) advances only on a newer certificate; a
     /// rejection (`status != 0`) is applied to the request in flight only when the certificate
-    /// it wraps is itself current, so a delayed or replayed rejection changes nothing.
+    /// it wraps is itself current, so a rejection that wraps an OLD certificate changes nothing.
+    /// There is no request binding: a delayed or replayed rejection that wraps the CURRENT
+    /// certificate can still reject a later request (the pinned root is trusted not to do that).
     fn handle_uc(
         &mut self,
         peer: &PeerId,
@@ -2014,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_advancing_rejection_is_applied_once_without_refreshing_liveness() {
+    fn a_current_rejection_resolves_the_single_pending_request_without_refreshing_liveness() {
         let (mut s, root, shared) = session();
         let t = Instant::now();
         s.handle_uc(&root, &Spec::new(50, 100).frame(), t);
