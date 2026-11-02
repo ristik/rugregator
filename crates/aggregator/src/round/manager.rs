@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::state::ProcessedRecord;
 use super::stub_uc::{self, StubUcParams};
@@ -372,6 +372,15 @@ pub struct RoundManager<S: SmtStore> {
     proof_rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
     /// Data held while a ZK proof is generating.  `None` when not proving.
     proving_data: Option<ProvingRoundData<S>>,
+    /// Pinning the committed head's certified snapshot failed (the only transient failure of the
+    /// publication): the timer retries it while no round is in flight, so the proof service does
+    /// not stay unavailable until the next block.
+    republish_pending: std::sync::atomic::AtomicBool,
+    /// Consecutive failed pins of the current head (only the first is logged loudly).
+    republish_failures: std::sync::atomic::AtomicU32,
+    /// Test hook: the next n pins fail transiently.
+    #[cfg(test)]
+    fail_pins: std::sync::atomic::AtomicU32,
 }
 
 impl RoundManager<smt_store::MemSmt> {
@@ -435,6 +444,10 @@ impl<S: SmtStore> RoundManager<S> {
             proof_tx,
             proof_rx,
             proving_data: None,
+            republish_pending: std::sync::atomic::AtomicBool::new(false),
+            republish_failures: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            fail_pins: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -531,64 +544,115 @@ impl<S: SmtStore> RoundManager<S> {
     }
 
     /// Publish the recovered committed root without routing any proof reads
-    /// through the round-manager event loop.
-    async fn publish_current_certified_snapshot(&self) {
+    /// through the round-manager event loop. Returns whether it published.
+    async fn publish_current_certified_snapshot(&self) -> bool {
+        self.publish_head(false).await
+    }
+
+    /// Pin the committed SMT root as a certified snapshot. The only step of the publication that
+    /// can fail transiently.
+    fn pin_certified_snapshot(&self) -> anyhow::Result<smt_store::CertifiedSmtSnapshot> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let remaining = self.fail_pins.load(Relaxed);
+            if remaining > 0 {
+                self.fail_pins.store(remaining - 1, Relaxed);
+                anyhow::bail!("injected pin failure");
+            }
+        }
+        self.smt.create_certified_snapshot()
+    }
+
+    /// `retry`: this is the timer's retry of a failed pin; deterministic refusals are then logged
+    /// at debug only (they were reported when the head was first published).
+    async fn publish_head(&self, retry: bool) -> bool {
         let Some(block) = self.state.latest_certified_block().await else {
-            return;
+            return false;
         };
-        if let Some(marker) = stub_uc::legacy_stub_marker(&block.uc_cbor) {
-            warn!(
-                block = block.block_number,
-                marker,
-                "recovered certificate is a legacy stub certificate (not native-valid); \
-                 native verifiers and secure batch clients reject it. Reset the stub data \
-                 directory (docs/stub-uc-migration.md)"
-            );
-        } else if let Some(partition) = stub_uc::foreign_partition(&block.uc_cbor) {
-            warn!(
-                block = block.block_number,
-                partition,
-                "recovered certificate is for partition {partition}, not the aggregation \
-                 partition {}; SDKs that accept only the aggregation partition reject it",
-                stub_uc::DEFAULT_PARTITION_ID
-            );
+        let number = block.block_number;
+        if !retry {
+            if let Some(marker) = stub_uc::legacy_stub_marker(&block.uc_cbor) {
+                warn!(
+                    block = block.block_number,
+                    marker,
+                    "recovered certificate is a legacy stub certificate (not native-valid); \
+                     native verifiers and secure batch clients reject it. Reset the stub data \
+                     directory (docs/stub-uc-migration.md)"
+                );
+            } else if let Some(partition) = stub_uc::foreign_partition(&block.uc_cbor) {
+                warn!(
+                    block = block.block_number,
+                    partition,
+                    "recovered certificate is for partition {partition}, not the aggregation \
+                     partition {}; SDKs that accept only the aggregation partition reject it",
+                    stub_uc::DEFAULT_PARTITION_ID
+                );
+            }
         }
         let uc_root = match decode_cbor_value(&block.uc_cbor)
             .and_then(|certificate| unicity_certificate_state_root(&certificate))
         {
             Ok(root) => root,
             Err(error) => {
-                error!(
-                    block = block.block_number,
-                    err = %error,
-                    "recovered Unicity Certificate is invalid; proof service unavailable"
-                );
-                self.state.clear_certified_snapshot();
-                return;
+                if retry {
+                    debug!(block = number, err = %error, "recovered Unicity Certificate is invalid");
+                } else {
+                    error!(
+                        block = number,
+                        err = %error,
+                        "recovered Unicity Certificate is invalid; proof service unavailable"
+                    );
+                }
+                self.publish_settled();
+                self.state.clear_certified_snapshot_for(number);
+                return false;
             }
         };
         if uc_root != block.root_hash
             || block.root_hash != self.current_root
             || self.smt.root_hash() != self.current_root
         {
-            warn!(
-                block = block.block_number,
-                "recovered UC, block, and committed SMT root are out of sync; proof service unavailable"
-            );
-            self.state.clear_certified_snapshot();
-            return;
+            if retry {
+                debug!(
+                    block = number,
+                    "recovered UC, block, and committed SMT root are out of sync"
+                );
+            } else {
+                warn!(
+                    block = number,
+                    "recovered UC, block, and committed SMT root are out of sync; proof service unavailable"
+                );
+            }
+            self.publish_settled();
+            self.state.clear_certified_snapshot_for(number);
+            return false;
         }
-        match self.smt.create_certified_snapshot() {
-            Ok(snapshot) => {
-                if let Err(error) = self.state.publish_certified_snapshot(block, snapshot) {
+        match self.pin_certified_snapshot() {
+            Ok(snapshot) => match self.state.publish_certified_snapshot(block, snapshot) {
+                Ok(()) => {
+                    self.publish_settled();
+                    true
+                }
+                Err(error) => {
+                    // every publication refusal is deterministic (for example a legacy
+                    // empty-root certificate): never retried
                     error!(err = %error, "failed to publish recovered certified SMT snapshot; \
                            the certified-snapshot proof service stays unavailable");
-                    self.state.clear_certified_snapshot();
+                    self.publish_settled();
+                    self.state.clear_certified_snapshot_for(number);
+                    false
                 }
-            }
+            },
             Err(error) => {
-                error!(err = %error, "failed to pin recovered certified SMT snapshot");
-                self.state.clear_certified_snapshot();
+                // a pin failure may be transient: retried by the timer between rounds
+                if self.note_pin_failure() {
+                    error!(err = %error, "failed to pin recovered certified SMT snapshot; it is retried");
+                } else {
+                    debug!(err = %error, "retry of pinning the certified SMT snapshot failed");
+                }
+                self.state.clear_certified_snapshot_for(number);
+                false
             }
         }
     }
@@ -778,8 +842,34 @@ impl<S: SmtStore> RoundManager<S> {
         }
     }
 
+    /// Records a failed pin of the committed head. Returns whether it is the first one for this
+    /// head (the caller logs it loudly; retries stay quiet).
+    fn note_pin_failure(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.republish_pending.store(true, Relaxed);
+        self.republish_failures.fetch_add(1, Relaxed) == 0
+    }
+
+    /// Nothing left to retry for the current head (published, or refused for good).
+    fn publish_settled(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.republish_pending.store(false, Relaxed);
+        self.republish_failures.store(0, Relaxed);
+    }
+
     /// Timer tick: either kick off a new round or prepare a speculative one.
     async fn on_timer_tick(&mut self) {
+        // Retry an unavailable latest view of the committed head. Only between rounds: with a
+        // round in flight the committed SMT is not the state the head certified.
+        if self.inflight.is_none()
+            && self.proving_data.is_none()
+            && self
+                .republish_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // `true` when the head was published again; the long-poll waiters are woken here.
+            let _recovered = self.publish_head(true).await;
+        }
         match self.inflight.as_ref() {
             None => {
                 if !self.pending.is_empty() {
@@ -1575,10 +1665,14 @@ impl<S: SmtStore> RoundManager<S> {
                 // The committed root has advanced. Stop new callers from
                 // selecting the old certified view, then pin the new backend
                 // view before any later round can mutate the store again.
-                self.state.clear_certified_snapshot();
-                let certified_snapshot = match self.smt.create_certified_snapshot() {
+                // The head moves to this block even if it is never published: an older block
+                // cannot become latest again.
+                self.state.clear_certified_snapshot_for(inf.block_number);
+                self.publish_settled(); // a new head: its own failure history
+                let certified_snapshot = match self.pin_certified_snapshot() {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
+                        self.note_pin_failure(); // retried by the timer between rounds
                         error!(
                             block = inf.block_number,
                             err = %error,
@@ -1625,7 +1719,7 @@ impl<S: SmtStore> RoundManager<S> {
                             err = %error,
                             "failed to publish certified SMT snapshot"
                         );
-                        self.state.clear_certified_snapshot();
+                        self.state.clear_certified_snapshot_for(inf.block_number);
                     }
                 }
 
@@ -2070,5 +2164,108 @@ mod tests {
             )),
             "a canonical null-root snapshot is published and serves the empty-tree proof"
         );
+    }
+
+    fn null_root_uc() -> Vec<u8> {
+        let mut value = decode_cbor_value(&empty_root_uc()).unwrap();
+        {
+            let ciborium::value::Value::Tag(_, inner) = &mut value else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(uc) = &mut **inner else {
+                panic!()
+            };
+            let ciborium::value::Value::Tag(_, ir) = &mut uc[1] else {
+                panic!()
+            };
+            let ciborium::value::Value::Array(f) = &mut **ir else {
+                panic!()
+            };
+            f[4] = ciborium::value::Value::Null;
+        }
+        crate::api::cbor::encode_cbor_value(&value).unwrap()
+    }
+
+    async fn serves_non_inclusion(state: &AggregatorState) -> bool {
+        state
+            .get_non_inclusion_proof([7u8; 32])
+            .await
+            .is_ok_and(|r| matches!(r, crate::storage::NonInclusionProofLookup::Proof(_)))
+    }
+
+    fn retry_pending(manager: &RoundManager<smt_store::MemSmt>) -> bool {
+        manager
+            .republish_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn a_transient_pin_failure_is_retried_between_rounds() {
+        let (state, mut manager) = recovered_state(null_root_uc()).await;
+        manager
+            .fail_pins
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        assert!(!manager.publish_current_certified_snapshot().await);
+        assert!(retry_pending(&manager));
+        assert!(!serves_non_inclusion(&state).await);
+        manager.on_timer_tick().await; // second injected failure
+        assert!(retry_pending(&manager));
+        assert!(!serves_non_inclusion(&state).await);
+        manager.on_timer_tick().await; // pins now
+        assert!(
+            serves_non_inclusion(&state).await,
+            "the timer republished the head"
+        );
+        assert!(!retry_pending(&manager));
+        // a settled head has a fresh failure history
+        assert!(manager.note_pin_failure());
+        assert!(
+            !manager.note_pin_failure(),
+            "only the first failure is loud"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retry_waits_for_the_round_in_flight() {
+        let (state, mut manager) = recovered_state(null_root_uc()).await;
+        manager
+            .fail_pins
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(!manager.publish_current_certified_snapshot().await);
+        manager.inflight = Some(InFlightRound {
+            block_number: 2,
+            reference_time: 0,
+            new_root: None,
+            proposed_snap: manager.smt.create_snapshot(),
+            spec: SpecState::Collecting {
+                snap: manager.smt.create_snapshot(),
+                buffer: vec![],
+            },
+            submitted_batch: vec![],
+            inserted: vec![],
+            dropped: 0,
+        });
+        manager.on_timer_tick().await;
+        assert!(
+            retry_pending(&manager),
+            "not retried while a round is in flight"
+        );
+        assert!(!serves_non_inclusion(&state).await);
+        let inf = manager.inflight.take().unwrap();
+        inf.proposed_snap.discard();
+        if let SpecState::Collecting { snap, .. } = inf.spec {
+            snap.discard();
+        }
+        manager.on_timer_tick().await;
+        assert!(serves_non_inclusion(&state).await);
+    }
+
+    #[tokio::test]
+    async fn a_publication_refusal_is_deterministic_and_never_retried() {
+        let (state, mut manager) = recovered_state(empty_root_uc()).await; // legacy h'' root
+        assert!(!manager.publish_current_certified_snapshot().await);
+        assert!(!retry_pending(&manager));
+        manager.on_timer_tick().await;
+        assert!(!serves_non_inclusion(&state).await);
     }
 }
