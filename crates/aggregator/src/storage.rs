@@ -223,8 +223,9 @@ struct Catalog {
     /// `None` while a newly certified root is being pinned or if publication
     /// failed: latest is then unavailable, never an older view.
     latest: Option<Arc<CertifiedProofState>>,
-    /// Highest block number ever published. Latest never moves to an older block, also not after
-    /// it was made unavailable (a late, older publication must not revive history as latest).
+    /// Highest block number ever published or made the head (unavailable). Latest never moves to
+    /// an older block, also not after it was made unavailable (a late, older publication must not
+    /// revive history as latest).
     head_block: u64,
     stats: CatalogStats,
 }
@@ -726,6 +727,15 @@ impl AggregatorState {
     /// their immutable snapshot, which remains a valid statement about its root.
     pub(crate) fn clear_certified_snapshot(&self) {
         self.catalog().latest = None;
+    }
+
+    /// Like `clear_certified_snapshot`, for a new head `block_number` that is being pinned or
+    /// could not be: the head moves to it even if it is never published, so an older block
+    /// published late cannot become latest again.
+    pub(crate) fn clear_certified_snapshot_for(&self, block_number: u64) {
+        let mut catalog = self.catalog();
+        catalog.latest = None;
+        catalog.head_block = catalog.head_block.max(block_number);
     }
 
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -1473,6 +1483,22 @@ mod tests {
             state.latest_view().is_none(),
             "no revival of history as latest"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_newer_head_also_blocks_older_blocks() {
+        let state = new_state();
+        let mut smt = MemSmt::new();
+        round(&state, &mut smt, &[0x11], 1, &[0x80]);
+        let block_1 = state.catalog().retained.front().unwrap().block.clone();
+        let snapshot_1 = smt.create_certified_snapshot().unwrap();
+        // block 2 became the head but was never published (its pin or publication failed)
+        state.clear_certified_snapshot_for(2);
+        let err = state
+            .publish_certified_snapshot(block_1, snapshot_1)
+            .unwrap_err();
+        assert!(err.to_string().contains("precedes the published head"));
+        assert!(state.latest_view().is_none());
     }
 
     #[tokio::test]
