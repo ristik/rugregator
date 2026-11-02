@@ -796,7 +796,7 @@ mod tests {
             hex::encode(&one.state_id),
             "63dc9acfb0668ac85eb773ebc811c0bb20dcd75ef933d99d5ee07ee5b5b464b3"
         );
-        for p in [zero, one] {
+        for p in [zero, one.clone()] {
             crate::validation::validate_request(
                 &p.state_id,
                 &p.predicate_cbor,
@@ -808,8 +808,37 @@ mod tests {
                 p.expires_at,
                 u64::MAX,
                 &p.witness,
+                &[0x80],
             )
             .expect("signature and state id of the Go-encoded request");
+        }
+        // A shard that excludes the state id (aggregator-go: INVALID_SHARD), checked before the
+        // signature. The first state id above starts with bit 0, the second (0x63..) too.
+        for (shard, in_shard) in [([0x40u8], true), ([0xc0u8], false)] {
+            let r = crate::validation::validate_request(
+                &one.state_id,
+                &one.predicate_cbor,
+                one.engine,
+                &one.code,
+                &one.params,
+                &one.source_state_hash,
+                &one.transaction_hash,
+                one.expires_at,
+                u64::MAX,
+                &one.witness,
+                &shard,
+            );
+            match (in_shard, r) {
+                (true, Ok(_)) => {}
+                (false, Err(e)) => {
+                    assert_eq!(e.status.to_string(), "INVALID_SHARD");
+                    assert_eq!(
+                        e.message,
+                        "state ID does not match configured BFT shard prefix"
+                    );
+                }
+                (expected, other) => panic!("shard {shard:?}: in_shard={expected}, got {other:?}"),
+            }
         }
     }
 

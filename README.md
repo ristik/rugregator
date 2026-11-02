@@ -250,9 +250,17 @@ Retrieve a certified inclusion proof.
 
 Returns hex-encoded CBOR `[blockNumber, InclusionProof]`. `InclusionProof` is
 tag 39033 over `[1, certificationData, inclusionCertificate, UC]`.
-An accepted request that is still being certified returns JSON-RPC error
-`-32003`; clients may poll only that status. An unknown StateID returns HTTP
-404 immediately.
+
+A state that is not certified yet (still pending, unknown or expired) is **not an
+error**: the answer is HTTP 200 with the *empty* proof (no certificate) under the
+latest finalized block's UC, exactly like aggregator-go. Clients poll on until the
+proof carries a certificate. With `"includeStatus": true` the result is
+`{"proof": "<hex>", "status": "included" | "pending" | "unknown" | "expired"}`;
+the status is an unauthenticated hint, never evidence about the state. Until the
+first block has been certified there is no UC to carry, and the answer is the
+retryable JSON-RPC error `-32008` (`proof_unavailable`, detail `no_finalized_view`).
+A `stateId` that is not 32 hex-encoded bytes is `-32000`. The codes `-32003` and
+`-32021` are not emitted by any method.
 
 ### `get_non_inclusion_proof.v1`
 

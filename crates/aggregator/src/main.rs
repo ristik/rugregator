@@ -11,6 +11,7 @@ use smt_store::{mem, SmtStore as _};
 use uni_aggregator::{
     api::build_router,
     config::{Config, ConsistencyProofMode, RoundConfig},
+    round::live_committer::RequestWire,
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::{AggregatorState, WalStore},
 };
@@ -91,6 +92,19 @@ async fn main() -> anyhow::Result<()> {
                 sig_key_bytes: sig_key,
                 fake_state_transitions: cfg.fake_state_transitions,
                 uc_timeout_ms: cfg.uc_timeout_ms,
+                // bft-core main decodes the 7-element request. The 8-element layout with the
+                // consistency proof exists only in the bft-core `l1` branch, and only a proof
+                // mode other than `off` has a proof to carry.
+                request_wire: if matches!(cfg.consistency_proof_mode, ConsistencyProofMode::Off) {
+                    RequestWire::Core
+                } else {
+                    warn!(
+                        "consistency-proof-mode != off sends the 8-element certification request \
+                         of the bft-core `l1` branch; bft-core main drops it. Use `off` against \
+                         bft-core main."
+                    );
+                    RequestWire::WithZkProof
+                },
             };
             Arc::new(LiveBftCommitter::start(live_cfg)?)
         }
@@ -149,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
         // Pure in-memory, no DB.
         let state = AggregatorState::new(req_tx, None);
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_shard_id(cfg.shard_id.as_bytes().to_vec());
         state.set_retention_limits(cfg.retention_limits());
         let rm = RoundManager::new(round_cfg, req_rx, Arc::clone(&state), bft);
         spawn_rm!(rm, state)
@@ -178,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
             Some(store as Arc<dyn uni_aggregator::storage::Store>),
         );
         state.set_default_request_ttl(cfg.default_request_ttl_secs);
+        state.set_shard_id(cfg.shard_id.as_bytes().to_vec());
         state.set_retention_limits(cfg.retention_limits());
         state.apply_recovered(recovered).await;
 

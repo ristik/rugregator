@@ -75,11 +75,8 @@ impl JsonRpcError {
     /// The aggregator has no record of this state id: neither certified nor
     /// pending. Maps to HTTP 404.
     pub const NOT_FOUND: i32 = -32020;
-    /// Historical: `get_inclusion_proof.v2` used to answer a pending state with this
-    /// error. It now returns aggregator-go's empty-proof result (or the typed
-    /// `no_finalized_view` before the first finalized block), so no method emits the code
-    /// any more; clients keep handling it for older servers.
-    pub const INCLUSION_PENDING: i32 = -32021;
+    // -32021 was `get_inclusion_proof.v2`'s answer for a pending state. It is not emitted by any
+    // method any more (the empty-proof result replaced it) and the number is retired.
     /// The requested state is already in the certified tree, so the requested
     /// non-inclusion relation is false.
     pub const STATE_INCLUDED: i32 = -32022;
