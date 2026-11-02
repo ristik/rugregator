@@ -148,6 +148,26 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --consistency-proof-mode rsmt
 ```
 
+#### Trust model of the live BFT feed
+
+The configured BFT Core peer (`--bft-peer-id`) is **fully trusted**: for certification, for the
+epoch and for the time. The node is experimental and is not a BFT validator.
+
+- Transport intake hardening only: just that peer may hold a connection (everyone else is denied
+  after the noise handshake), certification-response streams are refused before they are read when
+  over quota or over the concurrency bound, a stalled body is cut at a deadline, and a response is
+  used only if it names the configured partition and shard (wrapper and certificate) and is
+  consistent with the previously accepted certificate (round order, equal-round input record,
+  state-hash chain, non-regressing time).
+- There is **no unicity seal verification**: signatures, the certificate path and the network id
+  are not checked, and there is no trust base. A compromised or impersonated root key can make this
+  node persist and serve certificates that independent clients will reject.
+- There is **no authority rotation**: a changed root peer or key needs a restart with new
+  configuration.
+
+Use the live mode only against a root you control. Production use against an untrusted root needs
+seal/path/context verification against a pinned authority first.
+
 ### Configuration reference
 
 All flags are also readable from environment variables (`AGGREGATOR_*`):
