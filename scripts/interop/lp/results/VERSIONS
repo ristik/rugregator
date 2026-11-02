@@ -8,3 +8,11 @@ harness        rugregator lp/interop-matrix (this directory)
 Files: <tag>-rust.jsonl one line per check; s2lp-L7-rust.jsonl = L7 repetition 3; s2lp-L7-rep2-rust.jsonl / -rep3- = copies made by
 `cp results/s2lp-L7-rust.jsonl results/s2lp-L7-repN-rust.jsonl` after each of three `IX_SCEN=L7 IX_N=200 IX_RATE=10 run.sh s2lp` runs (repetition 1
 was overwritten, its figures are only in orchestration/interop-lp.md). *-go.jsonl: go-commitment.sh (status field added afterwards to the first run's lines).
+
+# Run of 2026-11-02: rugregator with real long-poll (PR feat/long-poll-202611020142)
+s1rug, s1rugcap0   rugregator release build, --bft-mode stub, round 1000 ms (cap0: --long-poll-max-waiters 0)
+rust driver        state-transition-sdk-rust origin/main 1860609 (scripts/interop/lp/rust/interop_lp.rs, L6 now warms the server up first)
+go                 aggregator-go origin/main 4e09b47 cmd/commitment (go1.27.3), 3 runs per mode
+js                 state-transition-sdk-js origin/main 18fe1c6 (scripts/lp-interop l2-l5), released 3.0.1 runner compat/released-3.0.1 (7/7)
+Files: s1rug-rust.jsonl (L1-L4), s1rugcap0-rust.jsonl (L6), s1rug-L7-rust.jsonl (L7, 100 states at 5/s: poll-200ms, poll-1s, long-poll), s1rug-go.jsonl, s1rug-js.json, s1rug-js301.json.
+s1lp-* above are the earlier reservation-only run.

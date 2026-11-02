@@ -10,6 +10,8 @@
 
 pub mod api;
 pub mod config;
+pub mod lifecycle;
+pub mod longpoll;
 pub mod round;
 pub mod smt;
 pub mod storage;

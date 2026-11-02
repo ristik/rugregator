@@ -121,11 +121,57 @@ impl JsonRpcError {
             data: Some(serde_json::Value::Object(data)),
         }
     }
+    /// Add the long-poll echo to a handled error: into object `data`, keeping the existing
+    /// members; non-object data is kept as `data.originalData`; absent data becomes `{waitedMs}`.
+    pub fn with_waited(mut self, waited_ms: u64) -> Self {
+        let mut obj = match self.data.take() {
+            Some(serde_json::Value::Object(o)) => o,
+            Some(other) => {
+                let mut o = serde_json::Map::new();
+                o.insert("originalData".into(), other);
+                o
+            }
+            None => serde_json::Map::new(),
+        };
+        obj.insert("waitedMs".into(), waited_ms.into());
+        self.data = Some(serde_json::Value::Object(obj));
+        self
+    }
+
+    /// aggregator-go's retryable `-32006 busy / deadline` for a resumption which got no capacity.
+    pub fn busy_deadline() -> Self {
+        Self::detailed(
+            Self::CONCURRENCY_LIMIT,
+            "Concurrency limit exceeded",
+            "busy",
+            "deadline",
+            true,
+            None,
+            None,
+        )
+    }
+
     pub fn invalid_request_detail(detail: &str) -> Self {
-        Self::detailed(Self::INVALID_PARAMS, "Invalid params", "invalid_request", detail, false, None, None)
+        Self::detailed(
+            Self::INVALID_PARAMS,
+            "Invalid params",
+            "invalid_request",
+            detail,
+            false,
+            None,
+            None,
+        )
     }
     pub fn limit_exceeded(detail: &str, limit: usize) -> Self {
-        Self::detailed(Self::LIMIT_EXCEEDED, "Limit exceeded", "limit_exceeded", detail, false, Some(limit), None)
+        Self::detailed(
+            Self::LIMIT_EXCEEDED,
+            "Limit exceeded",
+            "limit_exceeded",
+            detail,
+            false,
+            Some(limit),
+            None,
+        )
     }
 
     /// aggregator-go's `get_inclusion_proof.v2` validation error (`-32000`, no data).

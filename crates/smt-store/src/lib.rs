@@ -5,8 +5,8 @@ pub mod traits;
 pub use disk::{DiskSmt, DiskSmtSnapshot};
 pub use mem::{MemSmt, MemSmtSnapshot, PersistMode};
 pub use traits::{
-    CertifiedSmtSnapshot, InclusionBatchEntry, SmtStore, SmtStoreSnapshot, SnapshotError,
-    CERTIFIED_BATCH_MAX_KEYS, CERTIFIED_PROOF_MAX_IN_FLIGHT,
+    Cancel, CertifiedSmtSnapshot, Hold, InclusionBatchEntry, Responder, SmtStore, SmtStoreSnapshot,
+    SnapshotError, CERTIFIED_BATCH_MAX_KEYS, CERTIFIED_PROOF_MAX_IN_FLIGHT,
 };
 
 use rsmt::SmtKey;

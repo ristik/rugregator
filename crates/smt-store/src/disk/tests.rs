@@ -423,7 +423,14 @@ mod batch {
         assert_eq!(request.len(), 64);
 
         let reader = Counting(&db, AtomicUsize::new(0));
-        let entries = disk_inclusion_batch(&reader, &Overlay::new(), &request, far()).unwrap();
+        let entries = disk_inclusion_batch(
+            &reader,
+            &Overlay::new(),
+            &request,
+            far(),
+            &crate::traits::Cancel::default(),
+        )
+        .unwrap();
         assert!(entries
             .iter()
             .all(|e| matches!(e, InclusionBatchEntry::Present { .. })));
@@ -440,5 +447,69 @@ mod batch {
         );
         // And bounded by what the paths hold: at most the node count of 64 paths.
         assert!(union_reads <= per_key_reads);
+    }
+
+    /// Cancels the request after a number of node reads.
+    struct CancelAfter<'a, R: NodeReader> {
+        inner: &'a R,
+        reads: AtomicUsize,
+        after: usize,
+        cancel: crate::traits::Cancel,
+    }
+
+    impl<R: NodeReader> NodeReader for CancelAfter<'_, R> {
+        fn get_node(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.reads.fetch_add(1, Ordering::Relaxed) + 1 == self.after {
+                self.cancel.cancel();
+            }
+            self.inner.get_node(key)
+        }
+    }
+
+    /// Cancellation reaches into the materialization of the union of the paths, which finishes
+    /// before any key is answered: the worker stops at the next node read, not after the batch.
+    #[test]
+    fn cancellation_stops_materialization_between_node_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(&dir);
+        let mut disk = DiskSmt::open(Arc::clone(&db), 10_000).unwrap();
+        let ks = keys(2_000, 11);
+        commit(&mut disk, &leaf_pairs(&ks));
+        let request: Vec<SmtKey> = ks.iter().step_by(17).copied().take(100).collect();
+        // Uncancelled cost of the same batch, for comparison.
+        let full = Counting(&db, AtomicUsize::new(0));
+        disk_inclusion_batch(
+            &full,
+            &Overlay::new(),
+            &request,
+            far(),
+            &crate::traits::Cancel::default(),
+        )
+        .unwrap();
+        let full_reads = full.1.load(Ordering::Relaxed);
+
+        let cancel = crate::traits::Cancel::default();
+        let reader = CancelAfter {
+            inner: &db,
+            reads: AtomicUsize::new(0),
+            after: 5,
+            cancel: cancel.clone(),
+        };
+        let got = disk_inclusion_batch(&reader, &Overlay::new(), &request, far(), &cancel);
+        assert!(matches!(got, Err(SnapshotError::Cancelled)), "{got:?}");
+        let reads = reader.reads.load(Ordering::Relaxed);
+        assert!(
+            reads < full_reads / 2,
+            "stopped after {reads} of {full_reads} node reads"
+        );
+        // A request cancelled before it starts reads nothing at all.
+        let pre = crate::traits::Cancel::default();
+        pre.cancel();
+        let counting = Counting(&db, AtomicUsize::new(0));
+        assert!(matches!(
+            disk_inclusion_batch(&counting, &Overlay::new(), &request, far(), &pre),
+            Err(SnapshotError::Cancelled)
+        ));
+        assert_eq!(counting.1.load(Ordering::Relaxed), 0);
     }
 }
