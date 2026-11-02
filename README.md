@@ -145,8 +145,11 @@ cargo run --release -p uni-aggregator --bin aggregator -- \
   --uc-timeout-ms 15000 \
   --db-path      /var/lib/aggregator/db \
   --smt-backend  disk \
+  --bft-wire     l1 \
   --consistency-proof-mode rsmt
 ```
+
+`--bft-wire` selects the certification request layout the root decodes; proof generation does not select it. `rsmt`/`zk` need the `l1` layout, so `--bft-wire core` with them is a startup error.
 
 #### Trust model of the live BFT feed
 
@@ -179,6 +182,7 @@ All flags are also readable from environment variables (`AGGREGATOR_*`):
 | `--batch-limit` | `AGGREGATOR_BATCH_LIMIT` | `1000` | Max requests per round |
 | `--bft-mode` | `AGGREGATOR_BFT_MODE` | `stub` | `stub` or `live` |
 | `--consistency-proof-mode` | `AGGREGATOR_CONSISTENCY_PROOF_MODE` | `off` | `off`, `rsmt` (hash-based), or `zk` (SP1 ZK proof) |
+| `--bft-wire` | `AGGREGATOR_BFT_WIRE` | `core` | live mode request layout: `core` (bft-core main, 7 elements) or `l1` (bft-core `l1` branch, 8 elements with `zk_proof`, null when proof mode is `off`) |
 | `--zk-proof-kind` | `AGGREGATOR_ZK_PROOF_KIND` | `compressed` | `core`, `compressed`, `groth16`, `plonk` — only used when `--consistency-proof-mode zk` |
 | `--db-path` | `AGGREGATOR_DB_PATH` | _(empty)_ | RocksDB directory; empty = in-memory only |
 | `--smt-backend` | `AGGREGATOR_SMT_BACKEND` | _(auto)_ | `mem`, `mem-leaves`, `mem-leaves-x`, `mem-full`, or `disk` |
@@ -448,6 +452,15 @@ Three modes are available via `--consistency-proof-mode`:
 | Off | `off` | No proof attached (default) |
 | RSMT | `rsmt` | Hash-based consistency proof, O(batch) size |
 | ZK | `zk` | SP1 zkVM proof, constant size (~200 KB); requires `--features uni-aggregator/zk` build |
+
+Live-mode wire / proof matrix (`--bft-wire` x `--consistency-proof-mode`):
+
+| Wire | `off` | `rsmt` / `zk` |
+|------|-------|---------------|
+| `core` (bft-core main, 7 elements) | supported | startup error |
+| `l1` (bft-core `l1` branch, 8 elements) | supported, `zk_proof` null | supported |
+
+The `l1` branch decodes a 7-element request too, but rebuilds the 8-element signing preimage, so only the 8-element request verifies there. Since bft-core commit 62c674a1 the signature covers `zk_proof` (the earlier 1ce32648 preimage excluded it); the field exists only on `l1`, not on main.
 
 See [README-ZK.md](README-ZK.md) for full build and configuration instructions for ZK mode.
 

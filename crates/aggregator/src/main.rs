@@ -11,7 +11,6 @@ use smt_store::{mem, SmtStore as _};
 use uni_aggregator::{
     api::build_router,
     config::{Config, ConsistencyProofMode, RoundConfig},
-    round::live_committer::RequestWire,
     round::{BftCommitter, BftCommitterStub, LiveBftCommitter, LiveBftConfig, RoundManager},
     storage::{AggregatorState, WalStore},
 };
@@ -82,6 +81,12 @@ async fn main() -> anyhow::Result<()> {
             let sig_key = hex::decode(&cfg.sig_key_hex)
                 .map_err(|e| anyhow::anyhow!("invalid sig_key_hex: {e}"))?;
 
+            // The wire is chosen explicitly: proof generation does not select the root's
+            // protocol (l1 with proofs off still wants 8 elements with a null proof).
+            let request_wire = cfg
+                .bft_wire
+                .request_wire(cfg.consistency_proof_mode)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let live_cfg = LiveBftConfig {
                 partition_id: cfg.partition_id,
                 shard_id: cfg.shard_id.as_bytes().to_vec(),
@@ -92,19 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 sig_key_bytes: sig_key,
                 fake_state_transitions: cfg.fake_state_transitions,
                 uc_timeout_ms: cfg.uc_timeout_ms,
-                // bft-core main decodes the 7-element request. The 8-element layout with the
-                // consistency proof exists only in the bft-core `l1` branch, and only a proof
-                // mode other than `off` has a proof to carry.
-                request_wire: if matches!(cfg.consistency_proof_mode, ConsistencyProofMode::Off) {
-                    RequestWire::Core
-                } else {
-                    warn!(
-                        "consistency-proof-mode != off sends the 8-element certification request \
-                         of the bft-core `l1` branch; bft-core main drops it. Use `off` against \
-                         bft-core main."
-                    );
-                    RequestWire::WithZkProof
-                },
+                request_wire,
             };
             Arc::new(LiveBftCommitter::start(live_cfg)?)
         }
